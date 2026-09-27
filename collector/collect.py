@@ -377,9 +377,13 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(one, new))
     records = [r for r in results if r is not None]
-    # Everything created before the earliest run left unrecorded is complete.
+    # Everything created before the earliest run left unrecorded, or still queued or running, is
+    # complete: a run created earlier but not yet finished will appear, and be recorded, later.
     left = [r["created_at"] for r, rec in zip(new, results) if rec is None]
-    covered = min(parse_time(t) for t in left) if left else until
+    for status in ("queued", "in_progress", "waiting", "pending", "requested"):
+        active = gh.get(f"repos/{ORG}/{repo}/actions/runs", status=status, per_page=100)
+        left += [r["created_at"] for r in active.get("workflow_runs", [])]
+    covered = min([until] + [parse_time(t) for t in left])
     if left:
         print(f"{repo}: API budget reached; {len(left)} runs left for next time", file=sys.stderr)
     if not dry_run and records:
