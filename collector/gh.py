@@ -25,7 +25,7 @@ def _token() -> str:
 
 
 class GitHub:
-    def __init__(self, min_remaining: int = 100):
+    def __init__(self, min_remaining: int = int(os.environ.get("MIN_REMAINING", "100"))):
         self.token = _token()
         self.min_remaining = min_remaining
         self.calls = 0

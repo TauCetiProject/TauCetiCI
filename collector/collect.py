@@ -421,13 +421,21 @@ def main(argv=None):
     ap.add_argument("--until", default=None, help="ISO time (default now)")
     ap.add_argument("--repos", default=None, help="comma-separated repos (default: every repo in the org)")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--max-calls", type=int, default=int(os.environ.get("MAX_CALLS", "4000")),
-                    help="stop fetching jobs after this many API calls (default 4000, env MAX_CALLS)")
+    ap.add_argument("--max-calls", type=int, default=int(os.environ.get("MAX_CALLS", "4500")),
+                    help="stop after this many API calls (default 4500, env MAX_CALLS), and never "
+                         "spend more than the token has left this hour, less a reserve")
     ap.add_argument("--jobs-for", choices=["all", "build"], default="all",
                     help="fetch jobs for every run (default), or only for build workflows (backfill)")
     args = ap.parse_args(argv)
 
     gh = GitHub()
+    # /rate_limit does not count against the limit. Keep a reserve for the push and for anything
+    # else sharing the token.
+    core = gh.get("rate_limit")["resources"]["core"]
+    gh.calls = 0
+    budget = min(args.max_calls, core["remaining"] - max(200, gh.min_remaining))
+    print(f"token: {core['remaining']}/{core['limit']} calls left this hour; budget {budget}", file=sys.stderr)
+    args.max_calls = budget
     cursor = json.loads(CURSOR.read_text()) if CURSOR.exists() else {}
     since = parse_time(args.since) if args.since else None
     until = parse_time(args.until) if args.until else dt.datetime.now(UTC)

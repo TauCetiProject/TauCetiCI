@@ -47,10 +47,11 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 ## Collection
 
 [`collect.yml`](.github/workflows/collect.yml) runs hourly. It resumes from `state/cursor.json`
-with six hours of overlap for long runs, and skips runs already recorded. It spends the API budget on build workflows
-first. With `github.token` (1,000 calls an hour) it cannot keep up with the organisation's peak
-volume of about 1,500 runs an hour; setting `COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY`
-(an App installed on the organisation) lifts that.
+with six hours of overlap for long runs, and skips runs already recorded. It sizes its API budget
+from the token's live rate limit and spends it on build workflows first, leaving anything it cannot
+afford for the next hour. If `github.token` proves too small for the organisation's volume (about
+1,500 runs an hour reach a runner), set `COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY` for an
+App installed on the organisation.
 
 Backfill a period locally with, for example:
 

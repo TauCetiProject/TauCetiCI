@@ -1,0 +1,5 @@
+[
+ {"at": "2026-09-16T02:48:12Z", "text": "sandboxed builds move to Namespace (#6987)"},
+ {"at": "2026-09-25T14:22:51Z", "text": "PR builds use GitHub while slots are free (#8950)"},
+ {"at": "2026-09-27T06:13:42Z", "text": "HOSTED_RUNNER_BUDGET 16 → 20"}
+]

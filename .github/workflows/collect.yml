@@ -7,10 +7,10 @@ name: collect
 # failed push or an exhausted API budget loses nothing.
 #
 # API budget. The organisation completes about 1,500 runs an hour that reach a runner, and each
-# needs one call for its jobs. `github.token` allows 1,000 calls an hour, so without an App the
-# collector records build workflows first and leaves the rest for later hours; it cannot keep up
-# at peak. Set COLLECTOR_APP_ID / COLLECTOR_APP_PRIVATE_KEY (an App installed on the organisation,
-# `actions: read`) to lift the budget.
+# needs one call for its jobs, plus one call per 100 runs listed. The collector sizes its budget from
+# the token's live rate limit and records build workflows first, leaving the rest to later hours if
+# it runs short. If `github.token` proves too small, set COLLECTOR_APP_ID / COLLECTOR_APP_PRIVATE_KEY
+# (an App installed on the organisation) to use an installation token instead.
 
 on:
   schedule:
@@ -52,7 +52,7 @@ jobs:
       - name: Collect
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
-          MAX_CALLS: ${{ steps.app-token.outputs.token && '4500' || '850' }}
+          MAX_CALLS: "4500"
         run: |
           args=()
           [ -n "${{ inputs.since }}" ] && args+=(--since "${{ inputs.since }}")

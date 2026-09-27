@@ -12,6 +12,8 @@ Tables
   steps(job_id, n, name, conclusion, started_at, completed_at, run_s)
   main_commits(sha, committed_at, pr, subject)
   settings(repo, observed_at, rulesets_json)
+  annotations(at, text)   hand-kept notes (records/annotations.json) for changes the API cannot see,
+                          such as repository variables
 
 `runs` holds the latest attempt seen for each run; `jobs` holds every attempt's jobs, deduplicated.
 Times are ISO-8601 UTC text; durations are seconds.
@@ -52,6 +54,7 @@ CREATE TABLE steps (
 );
 CREATE TABLE main_commits (sha TEXT PRIMARY KEY, committed_at TEXT, pr INTEGER, subject TEXT);
 CREATE TABLE settings (repo TEXT, observed_at TEXT, rulesets_json TEXT);
+CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE INDEX jobs_run ON jobs(repo, run_id);
 CREATE INDEX jobs_created ON jobs(created_at);
 CREATE INDEX runs_created ON runs(created_at);
@@ -130,6 +133,10 @@ def build(out: Path):
         s = json.loads(f.read_text())
         db.execute("INSERT INTO settings VALUES (?,?,?)",
                    (s["repo"], s["observed_at"], json.dumps(s["rulesets"])))
+    notes = RECORDS / "annotations.json"
+    if notes.exists():
+        db.executemany("INSERT INTO annotations VALUES (?,?)",
+                       [(a["at"], a["text"]) for a in json.loads(notes.read_text())])
     db.commit()
     db.execute("VACUUM")
     db.close()
