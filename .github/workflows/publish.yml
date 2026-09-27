@@ -1,0 +1,38 @@
+name: publish
+
+# Daily: rebuild the SQLite database from every record and publish it as the `db` release's
+# `ci.sqlite.gz`, which the TauCeti site's CI page downloads. The database is derived; the
+# records in git are the source of truth.
+
+on:
+  schedule:
+    - cron: "40 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the database
+        run: |
+          python3 -m collector.build_db --out db/ci.sqlite
+          sqlite3 db/ci.sqlite "SELECT 'runs', COUNT(*) FROM runs UNION ALL SELECT 'jobs', COUNT(*) FROM jobs;" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          gzip -9 -k db/ci.sqlite
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view db >/dev/null 2>&1 \
+            || gh release create db --title "CI database (rebuilt daily)" \
+                 --notes "SQLite database of every recorded CI run. Rebuilt daily from records/; see README."
+          gh release upload db db/ci.sqlite.gz --clobber

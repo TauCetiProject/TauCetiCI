@@ -64,13 +64,6 @@ def parse_time(s: str) -> dt.datetime:
     return t if t.tzinfo else t.replace(tzinfo=UTC)
 
 
-def seconds(a: str | None, b: str | None) -> float | None:
-    if not a or not b:
-        return None
-    return (dt.datetime.fromisoformat(b.replace("Z", "+00:00"))
-            - dt.datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds()
-
-
 def runner_kind(labels: list[str]) -> str:
     if any(l.startswith("nscloud-") for l in labels):
         return "namespace"
@@ -79,14 +72,6 @@ def runner_kind(labels: list[str]) -> str:
     if any(l.startswith(("ubuntu-", "windows-", "macos-")) for l in labels):
         return "github"
     return "self-hosted"
-
-
-def runner_size(labels: list[str]) -> str | None:
-    for l in labels:
-        m = re.search(r"-(\d+x\d+)", l)
-        if l.startswith("nscloud-") and m:
-            return m.group(1)
-    return None
 
 
 def trigger_class(run: dict) -> str:
@@ -279,24 +264,22 @@ class Enricher:
 
 
 def job_record(job: dict, detail: bool) -> dict:
+    """A job. Durations are left to the database (wait = started - created, run = completed -
+    started); the high-volume workflows get only what occupancy and wait analyses need."""
     labels = job.get("labels") or []
     rec = {
         "id": job["id"],
         "name": job["name"],
         "run_attempt": job.get("run_attempt"),
-        "status": job["status"],
         "conclusion": job.get("conclusion"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "completed_at": job.get("completed_at"),
-        "wait_s": seconds(job.get("created_at"), job.get("started_at")),
-        "run_s": seconds(job.get("started_at"), job.get("completed_at")),
         "labels": labels,
         "runner_kind": runner_kind(labels),
-        "runner_size": runner_size(labels),
-        "runner_name": job.get("runner_name") or None,
     }
     if detail:
+        rec["runner_name"] = job.get("runner_name") or None
         rec["steps"] = [{
             "n": s["number"], "name": s["name"], "conclusion": s.get("conclusion"),
             "started_at": s.get("started_at"), "completed_at": s.get("completed_at"),
@@ -304,11 +287,14 @@ def job_record(job: dict, detail: bool) -> dict:
     return rec
 
 
-def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None) -> dict:
-    # A run skipped by its `if:` never reached a runner; its jobs carry nothing worth a call.
-    jobs = [] if run.get("conclusion") == "skipped" else list(
-        gh.paginate(f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs", key="jobs", filter="all"))
+def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs_for: str) -> dict:
     workflow = run.get("path") or run.get("name")
+    # A run skipped by its `if:` never reached a runner; its jobs carry nothing worth a call. With
+    # `jobs_for="build"` (backfills of long periods) the high-volume workflows are recorded at run
+    # level only, marked `jobs_fetched: false`.
+    fetch = run.get("conclusion") != "skipped" and (jobs_for == "all" or workflow in BUILD_WORKFLOWS)
+    jobs = list(gh.paginate(f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs", key="jobs",
+                            filter="all")) if fetch else []
     detail = enricher is not None and workflow in BUILD_WORKFLOWS
     rec = {
         "schema": SCHEMA,
@@ -316,22 +302,24 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None) -> d
         "run_id": run["id"],
         "run_attempt": run.get("run_attempt", 1),
         "workflow": workflow,
-        "workflow_name": run.get("name"),
         "event": run["event"],
         "trigger": trigger_class(run),
-        "status": run["status"],
         "conclusion": run.get("conclusion"),
         "head_sha": run["head_sha"],
-        "head_branch": run.get("head_branch"),
-        "head_repo": (run.get("head_repository") or {}).get("full_name"),
-        "title": (run.get("display_title") or "")[:200],
-        "actor": (run.get("actor") or {}).get("login"),
         "created_at": run["created_at"],
-        "run_started_at": run.get("run_started_at"),
         "updated_at": run.get("updated_at"),
         "jobs": [job_record(j, detail) for j in jobs],
     }
+    if not fetch and run.get("conclusion") != "skipped":
+        rec["jobs_fetched"] = False
     if detail:
+        rec.update({
+            "head_branch": run.get("head_branch"),
+            "head_repo": (run.get("head_repository") or {}).get("full_name"),
+            "title": (run.get("display_title") or "")[:200],
+            "actor": (run.get("actor") or {}).get("login"),
+            "run_started_at": run.get("run_started_at"),
+        })
         try:
             rec["tested"] = enricher.tested(run)
         except Exception as e:
@@ -343,7 +331,8 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None) -> d
     return rec
 
 
-def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool, max_calls: int) -> int:
+def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool, max_calls: int,
+                 jobs_for: str = "all") -> int:
     """Record the completed runs not yet recorded. Build workflows go first; once `max_calls` API
     calls are spent the rest wait for the next collection, which looks back far enough to find them."""
     key = lambda r: (r["run_id"], r["run_attempt"])
@@ -356,7 +345,7 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     def one(r):
         if gh.calls >= max_calls:
             return None
-        return run_record(gh, repo, r, enricher)
+        return run_record(gh, repo, r, enricher, jobs_for)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         records = [r for r in pool.map(one, new) if r is not None]
@@ -416,6 +405,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max-calls", type=int, default=int(os.environ.get("MAX_CALLS", "4000")),
                     help="stop fetching jobs after this many API calls (default 4000, env MAX_CALLS)")
+    ap.add_argument("--jobs-for", choices=["all", "build"], default="all",
+                    help="fetch jobs for every run (default), or only for build workflows (backfill)")
     args = ap.parse_args(argv)
 
     gh = GitHub()
@@ -433,7 +424,7 @@ def main(argv=None):
         if snapshot_settings(gh, repo, stamp, args.dry_run):
             print(f"{repo}: rulesets changed", file=sys.stderr)
     for repo in repos:
-        n = collect_runs(gh, repo, since, until, stamp, args.dry_run, args.max_calls)
+        n = collect_runs(gh, repo, since, until, stamp, args.dry_run, args.max_calls, args.jobs_for)
         print(f"{repo}: {n} new runs", file=sys.stderr)
     print(f"API calls: {gh.calls}, rate limit remaining: {gh.remaining}", file=sys.stderr)
 
