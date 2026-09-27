@@ -12,6 +12,7 @@ Tables
   steps(job_id, n, name, conclusion, started_at, completed_at, run_s)
   main_commits(sha, committed_at, pr, subject)
   settings(repo, observed_at, rulesets_json)
+  coverage(repo, complete_to)   every run of `repo` created before `complete_to` is recorded
   annotations(at, text)   hand-kept notes (records/annotations.json) for changes the API cannot see,
                           such as repository variables
 
@@ -55,6 +56,7 @@ CREATE TABLE steps (
 CREATE TABLE main_commits (sha TEXT PRIMARY KEY, committed_at TEXT, pr INTEGER, subject TEXT);
 CREATE TABLE settings (repo TEXT, observed_at TEXT, rulesets_json TEXT);
 CREATE TABLE annotations (at TEXT, text TEXT);
+CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
 CREATE INDEX jobs_run ON jobs(repo, run_id);
 CREATE INDEX jobs_created ON jobs(created_at);
 CREATE INDEX runs_created ON runs(created_at);
@@ -133,6 +135,9 @@ def build(out: Path):
         s = json.loads(f.read_text())
         db.execute("INSERT INTO settings VALUES (?,?,?)",
                    (s["repo"], s["observed_at"], json.dumps(s["rulesets"])))
+    cursor = ROOT / "state" / "cursor.json"
+    if cursor.exists():
+        db.executemany("INSERT INTO coverage VALUES (?,?)", json.loads(cursor.read_text()).items())
     notes = RECORDS / "annotations.json"
     if notes.exists():
         db.executemany("INSERT INTO annotations VALUES (?,?)",

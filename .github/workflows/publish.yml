@@ -1,12 +1,12 @@
 name: publish
 
-# Daily: rebuild the SQLite database from every record and publish it as the `db` release's
+# Every three hours: rebuild the SQLite database from every record and publish it as the `db` release's
 # `ci.sqlite.gz`, which the TauCeti site's CI page downloads. The database is derived; the
 # records in git are the source of truth.
 
 on:
   schedule:
-    - cron: "40 1 * * *"
+    - cron: "50 */3 * * *"
   workflow_dispatch:
 
 permissions:

@@ -33,7 +33,7 @@ waits unbiased at a quarter of the API cost.
 
 ## Querying
 
-A SQLite database is rebuilt daily from the records and published as `ci.sqlite.gz` on the
+A SQLite database is rebuilt every three hours from the records and published as `ci.sqlite.gz` on the
 [`db` release](https://github.com/TauCetiProject/TauCetiCI/releases/tag/db):
 
 ```bash
