@@ -357,7 +357,9 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     enricher = Enricher(gh, repo) if repo in DETAIL_REPOS else None
 
     def one(r):
-        if gh.calls >= max_calls:
+        needs_calls = r.get("conclusion") != "skipped" and (
+            jobs_for == "all" or r.get("path") in BUILD_WORKFLOWS)
+        if needs_calls and gh.calls >= max_calls:
             return None
         return run_record(gh, repo, r, enricher, jobs_for)
 
