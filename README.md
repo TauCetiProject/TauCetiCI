@@ -46,8 +46,8 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 
 ## Collection
 
-[`collect.yml`](.github/workflows/collect.yml) runs hourly. It looks back 72 hours, so a missed
-hour is recovered, and skips runs already recorded. It spends the API budget on build workflows
+[`collect.yml`](.github/workflows/collect.yml) runs hourly. It resumes from `state/cursor.json`
+with six hours of overlap for long runs, and skips runs already recorded. It spends the API budget on build workflows
 first. With `github.token` (1,000 calls an hour) it cannot keep up with the organisation's peak
 volume of about 1,500 runs an hour; setting `COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY`
 (an App installed on the organisation) lifts that.

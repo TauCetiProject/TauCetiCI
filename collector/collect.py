@@ -13,8 +13,13 @@ schema/run.v1.json.
 Main-branch history and merge-queue settings are recorded alongside, in records/main/ and
 records/settings/, because the analyses join against both.
 
-    python -m collector.collect --since 72h            # the hourly job
+    python -m collector.collect                        # the hourly job: resume from state/cursor.json
     python -m collector.collect --since 2026-09-01 --until 2026-09-02   # a backfill window
+
+Listing runs costs one API call per 100 runs, and TauCeti creates over 2,000 runs an hour, so the
+hourly job does not re-list a fixed look-back. It resumes from a per-repository cursor, minus
+OVERLAP to catch long runs that completed since. The cursor advances only past runs actually
+recorded, so a collection that runs out of API budget leaves the rest for the next one.
 """
 
 from __future__ import annotations
@@ -40,6 +45,10 @@ SCHEMA = "tauceti-ci.run/v1"
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
 MAX_LOGS_PER_COLLECTION = 300
+CURSOR = ROOT / "state" / "cursor.json"
+# Longer than any workflow's timeout (nightly-verify's is 4 hours), so a run created before the
+# cursor but completed after it is still listed.
+OVERLAP = dt.timedelta(hours=6)
 
 # Steps, commits tested and failure excerpts are kept only for these workflows. The label,
 # notification and merge-bot workflows fire thousands of times a day and need only their jobs.
@@ -332,13 +341,18 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
 
 
 def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool, max_calls: int,
-                 jobs_for: str = "all") -> int:
+                 jobs_for: str = "all") -> tuple[int, dt.datetime]:
     """Record the completed runs not yet recorded. Build workflows go first; once `max_calls` API
     calls are spent the rest wait for the next collection, which looks back far enough to find them."""
     key = lambda r: (r["run_id"], r["run_attempt"])
     have = seen_keys("runs", repo, since, until, key)
-    new = [r for r in list_completed_runs(gh, repo, since, until)
-           if (r["id"], r.get("run_attempt", 1)) not in have]
+    new = []
+    for r in list_completed_runs(gh, repo, since, until):
+        if gh.calls >= max_calls:
+            print(f"{repo}: API budget reached while listing runs", file=sys.stderr)
+            return 0, since
+        if (r["id"], r.get("run_attempt", 1)) not in have:
+            new.append(r)
     new.sort(key=lambda r: (r.get("path") not in BUILD_WORKFLOWS, r["created_at"]))
     enricher = Enricher(gh, repo) if repo in DETAIL_REPOS else None
 
@@ -348,13 +362,16 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
         return run_record(gh, repo, r, enricher, jobs_for)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        records = [r for r in pool.map(one, new) if r is not None]
-    if len(records) < len(new):
-        print(f"{repo}: API budget reached; {len(new) - len(records)} runs left for next time",
-              file=sys.stderr)
+        results = list(pool.map(one, new))
+    records = [r for r in results if r is not None]
+    # Everything created before the earliest run left unrecorded is complete.
+    left = [r["created_at"] for r, rec in zip(new, results) if rec is None]
+    covered = min(parse_time(t) for t in left) if left else until
+    if left:
+        print(f"{repo}: API budget reached; {len(left)} runs left for next time", file=sys.stderr)
     if not dry_run and records:
         write_records("runs", repo, records, "created_at", stamp)
-    return len(records)
+    return len(records), covered
 
 
 def collect_main(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool) -> int:
@@ -399,7 +416,8 @@ def snapshot_settings(gh: GitHub, repo: str, stamp: str, dry_run: bool) -> bool:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--since", default="72h", help="ISO time or NNh/NNd ago (default 72h)")
+    ap.add_argument("--since", default=None,
+                    help="ISO time or NNh/NNd ago (default: each repository's cursor, minus overlap)")
     ap.add_argument("--until", default=None, help="ISO time (default now)")
     ap.add_argument("--repos", default=None, help="comma-separated repos (default: every repo in the org)")
     ap.add_argument("--dry-run", action="store_true")
@@ -410,7 +428,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     gh = GitHub()
-    since = parse_time(args.since)
+    cursor = json.loads(CURSOR.read_text()) if CURSOR.exists() else {}
+    since = parse_time(args.since) if args.since else None
     until = parse_time(args.until) if args.until else dt.datetime.now(UTC)
     stamp = dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     repos = args.repos.split(",") if args.repos else [
@@ -418,14 +437,27 @@ def main(argv=None):
     # The detail repositories first, so a tight API budget is spent where it matters most.
     repos.sort(key=lambda r: r not in DETAIL_REPOS)
 
+    def since_for(repo):
+        if since:
+            return since
+        c = cursor.get(repo)
+        return parse_time(c) - OVERLAP if c else until - dt.timedelta(hours=24)
+
     for repo in DETAIL_REPOS & set(repos):
-        n = collect_main(gh, repo, since, until, stamp, args.dry_run)
+        n = collect_main(gh, repo, since_for(repo), until, stamp, args.dry_run)
         print(f"{repo} main: {n} new commits", file=sys.stderr)
         if snapshot_settings(gh, repo, stamp, args.dry_run):
             print(f"{repo}: rulesets changed", file=sys.stderr)
     for repo in repos:
-        n = collect_runs(gh, repo, since, until, stamp, args.dry_run, args.max_calls, args.jobs_for)
-        print(f"{repo}: {n} new runs", file=sys.stderr)
+        n, covered = collect_runs(gh, repo, since_for(repo), until, stamp, args.dry_run,
+                                  args.max_calls, args.jobs_for)
+        print(f"{repo}: {n} new runs, complete up to {iso(covered)}", file=sys.stderr)
+        # Only the scheduled (cursor-driven) mode moves the cursor; backfill windows leave it alone.
+        if not since and not args.dry_run:
+            cursor[repo] = max(cursor.get(repo, ""), iso(covered))
+    if not since and not args.dry_run:
+        CURSOR.parent.mkdir(exist_ok=True)
+        CURSOR.write_text(json.dumps(cursor, indent=1, sort_keys=True) + "\n")
     print(f"API calls: {gh.calls}, rate limit remaining: {gh.remaining}", file=sys.stderr)
 
 

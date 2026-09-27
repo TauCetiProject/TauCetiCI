@@ -2,8 +2,9 @@ name: collect
 
 # Hourly: record every GitHub Actions run that completed in the organisation since the last
 # collection, and push the new record files. Records are append-only: each collection writes new
-# files and never rewrites old ones, so a failed or overlapping push loses nothing that the next
-# collection (which looks back 72 hours) will not recover.
+# files and never rewrites old ones. Each collection resumes from state/cursor.json (minus six
+# hours of overlap for long runs), and the cursor moves only past runs actually recorded, so a
+# failed push or an exhausted API budget loses nothing.
 #
 # API budget. The organisation completes about 1,500 runs an hour that reach a runner, and each
 # needs one call for its jobs. `github.token` allows 1,000 calls an hour, so without an App the
@@ -16,7 +17,7 @@ on:
     - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
-      since: { description: "Look back (e.g. 72h, or an ISO time)", required: false, default: "72h" }
+      since: { description: "Backfill from (e.g. 72h, or an ISO time); empty resumes from the cursor", required: false, default: "" }
       until: { description: "Until (ISO time; default now)", required: false, default: "" }
 
 permissions:
@@ -53,7 +54,8 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           MAX_CALLS: ${{ steps.app-token.outputs.token && '4500' || '850' }}
         run: |
-          args=(--since "${{ inputs.since || '72h' }}")
+          args=()
+          [ -n "${{ inputs.since }}" ] && args+=(--since "${{ inputs.since }}")
           [ -n "${{ inputs.until }}" ] && args+=(--until "${{ inputs.until }}")
           python3 -m collector.collect "${args[@]}" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -61,7 +63,7 @@ jobs:
         run: |
           git config user.name "tauceti-ci-collector"
           git config user.email "tauceti-ci-collector@users.noreply.github.com"
-          git add records
+          git add records state
           if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
           git commit -qm "records: $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3 4 5; do
