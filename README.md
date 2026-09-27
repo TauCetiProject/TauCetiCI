@@ -27,7 +27,9 @@ once per attempt; a re-run adds a record for the new attempt.
 Every run carries its jobs. Runs of TauCeti's build workflows (`pr-build`, `ci`, `nightly-verify`,
 `pr-profile`, `lint-full`, `pages`) also carry steps, `tested` (the commits), and a `failure`
 object on each failed job. The high-volume label, notification and merge-bot workflows are
-recorded with jobs only. Long backfills may record those at run level only (`jobs_fetched: false`).
+recorded with jobs only, and only for one run in four (chosen by run id); the rest, and all of them
+in long backfills, are recorded at run level (`jobs_fetched: false`). The sample keeps their queue
+waits unbiased at a quarter of the API cost.
 
 ## Querying
 

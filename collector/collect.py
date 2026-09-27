@@ -56,6 +56,11 @@ BUILD_WORKFLOWS = {".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
                    ".github/workflows/nightly-verify.yml", ".github/workflows/pr-profile.yml",
                    ".github/workflows/lint-full.yml", ".github/workflows/pages.yml"}
 
+# Of the high-volume workflows' runs, fetch jobs for one in SAMPLE_SHORT (chosen by run id, so
+# deterministically) and record the rest at run level. That keeps an unbiased sample of their
+# queue waits while cutting the collector's API cost by about three quarters.
+SAMPLE_SHORT = 4
+
 UTC = dt.timezone.utc
 
 
@@ -296,12 +301,19 @@ def job_record(job: dict, detail: bool) -> dict:
     return rec
 
 
+def needs_jobs(run: dict, jobs_for: str) -> bool:
+    if (run.get("path") or run.get("name")) in BUILD_WORKFLOWS:
+        return True
+    return jobs_for == "all" and run["id"] % SAMPLE_SHORT == 0
+
+
 def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs_for: str) -> dict:
     workflow = run.get("path") or run.get("name")
     # A run skipped by its `if:` never reached a runner; its jobs carry nothing worth a call. With
     # `jobs_for="build"` (backfills of long periods) the high-volume workflows are recorded at run
-    # level only, marked `jobs_fetched: false`.
-    fetch = run.get("conclusion") != "skipped" and (jobs_for == "all" or workflow in BUILD_WORKFLOWS)
+    # level only, and otherwise a sample of them is (SAMPLE_SHORT); either way marked
+    # `jobs_fetched: false`.
+    fetch = run.get("conclusion") != "skipped" and needs_jobs(run, jobs_for)
     jobs = list(gh.paginate(f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs", key="jobs",
                             filter="all")) if fetch else []
     detail = enricher is not None and workflow in BUILD_WORKFLOWS
@@ -357,8 +369,7 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     enricher = Enricher(gh, repo) if repo in DETAIL_REPOS else None
 
     def one(r):
-        needs_calls = r.get("conclusion") != "skipped" and (
-            jobs_for == "all" or r.get("path") in BUILD_WORKFLOWS)
+        needs_calls = r.get("conclusion") != "skipped" and needs_jobs(r, jobs_for)
         if needs_calls and gh.calls >= max_calls:
             return None
         return run_record(gh, repo, r, enricher, jobs_for)
