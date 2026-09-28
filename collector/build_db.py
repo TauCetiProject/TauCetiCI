@@ -6,6 +6,10 @@ Tables
   runs(repo, run_id, run_attempt, workflow, event, trigger, conclusion, head_sha, created_at,
        updated_at, pr, queue_pr, base_sha, group_position, group_prs, merge_base, behind_by,
        ahead_by, diff_files, diff_additions, diff_deletions, patch_fingerprint, landed,
+       queue_position, queue_chain, ahead_failed: a merge-queue build's place in the queue, the PRs
+       built together (front first), and whether an entry ahead of it failed; see
+       derive_queue_chains. (group_prs/group_position from the records are superseded: they list
+       only the entry's own PR.)
        jobs_fetched: 0 when a backfill recorded the run without its jobs)
   jobs(repo, run_id, job_id, run_attempt, name, conclusion, created_at, started_at, completed_at,
        wait_s, run_s, runner_kind, runner_size, labels, failure_class, failed_step, excerpt)
@@ -43,6 +47,7 @@ CREATE TABLE runs (
   merge_base TEXT, behind_by INTEGER, ahead_by INTEGER,
   diff_files INTEGER, diff_additions INTEGER, diff_deletions INTEGER, patch_fingerprint TEXT,
   landed INTEGER, jobs_fetched INTEGER,
+  queue_position INTEGER, queue_chain TEXT, ahead_failed INTEGER,
   PRIMARY KEY (repo, run_id)
 );
 CREATE TABLE jobs (
@@ -90,6 +95,35 @@ def records(kind: str):
                 yield json.loads(line)
 
 
+def derive_queue_chains(db: sqlite3.Connection):
+    """Reconstruct each merge-queue build's place in the queue.
+
+    GitHub names a merge-queue branch gh-readonly-queue/main/pr-<N>-<sha>, where <sha> is the commit
+    the entry was built on: main's tip for the front entry, and otherwise the head of the entry
+    ahead of it, which itself contains every entry ahead. Walking those links back while the entry
+    ahead was still being built gives the entry's position (1 at the front), the PRs it
+    was built together with (`queue_chain`, front first, this PR last), and whether any entry ahead
+    of it failed, which fails this one too whatever its own PR does (`ahead_failed`)."""
+    mq = {}
+    for run_id, head, base, pr, created, updated, concl in db.execute("""
+            SELECT run_id, head_sha, base_sha, queue_pr, created_at, updated_at, conclusion FROM runs
+            WHERE trigger = 'merge_queue' AND base_sha IS NOT NULL"""):
+        mq[head] = (run_id, base, pr, created, updated, concl)
+    for head, (run_id, base, pr, created, _, concl) in mq.items():
+        chain, failed, cur, seen = [pr], 0, base, {head}
+        # An entry is ahead only while its own build is still running: once it has finished it has
+        # either landed (and is simply main) or been removed. A merge-queue commit's committer date
+        # is when GitHub made it, not when main moved to it, so it cannot answer this.
+        while cur in mq and cur not in seen and mq[cur][4] > created:
+            seen.add(cur)
+            _, cur_base, cur_pr, _, _, cur_concl = mq[cur]
+            chain.insert(0, cur_pr)
+            failed |= cur_concl == "failure"
+            cur = cur_base
+        db.execute("UPDATE runs SET queue_position = ?, queue_chain = ?, ahead_failed = ? WHERE run_id = ?",
+                   (len(chain), json.dumps(chain), int(failed), run_id))
+
+
 def build(out: Path):
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
@@ -109,7 +143,7 @@ def build(out: Path):
         prev = db.execute("SELECT run_attempt FROM runs WHERE repo=? AND run_id=?",
                           (r["repo"], r["run_id"])).fetchone()
         if not prev or prev[0] <= r["run_attempt"]:
-            db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)", (
                 r["repo"], r["run_id"], r["run_attempt"], r["workflow"], r["event"], r["trigger"],
                 r.get("conclusion"), r["head_sha"], r["created_at"], r.get("updated_at"),
                 t.get("pr"), t.get("queue_pr"), t.get("base_sha"), t.get("group_position"),
@@ -139,6 +173,8 @@ def build(out: Path):
                 db.execute("INSERT OR REPLACE INTO steps VALUES (?,?,?,?,?,?,?)", (
                     j["id"], s["n"], s["name"], s.get("conclusion"), s.get("started_at"),
                     s.get("completed_at"), seconds(s.get("started_at"), s.get("completed_at"))))
+
+    derive_queue_chains(db)
 
     for f in sorted((RECORDS / "settings").rglob("*.json")):
         s = json.loads(f.read_text())
