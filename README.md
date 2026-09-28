@@ -63,3 +63,10 @@ python3 -m collector.collect --since 2026-09-01 --until 2026-09-08 --jobs-for bu
 
 Job logs are kept by GitHub for 90 days, so failure excerpts can be backfilled only that far.
 Run and job metadata do not expire.
+
+## Analysis
+
+[`analysis/report.py`](analysis/report.py) models failure rates, rebase and merge-queue risk,
+GitHub-hosted runner capacity, merge-queue settings (by simulation) and the economics of batching
+PR builds, from the database. The publish workflow regenerates it with the database, as the `db`
+release's `REPORT.md`.

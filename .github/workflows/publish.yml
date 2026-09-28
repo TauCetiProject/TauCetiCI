@@ -28,6 +28,7 @@ jobs:
           sqlite3 db/ci.sqlite "SELECT 'runs', COUNT(*) FROM runs UNION ALL SELECT 'jobs', COUNT(*) FROM jobs;" \
             | tee -a "$GITHUB_STEP_SUMMARY"
           gzip -9 -k db/ci.sqlite
+          python3 -m analysis.report --db db/ci.sqlite --out db/REPORT.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,4 +36,4 @@ jobs:
           gh release view db >/dev/null 2>&1 \
             || gh release create db --title "CI database (rebuilt daily)" \
                  --notes "SQLite database of every recorded CI run. Rebuilt daily from records/; see README."
-          gh release upload db db/ci.sqlite.gz --clobber
+          gh release upload db db/ci.sqlite.gz db/REPORT.md --clobber
