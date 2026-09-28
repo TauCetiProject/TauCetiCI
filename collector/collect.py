@@ -416,8 +416,12 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     # Everything created before the earliest run left unrecorded, or still queued or running, is
     # complete: a run created earlier but not yet finished will appear, and be recorded, later.
     left = [r["created_at"] for r, rec in zip(new, results) if rec is None]
+    # Only runs created in this window: an ancient run stuck `waiting` (there is one from August)
+    # would otherwise pin the watermark forever, and one created before the window cannot be
+    # recorded by this collection anyway.
     for status in ("queued", "in_progress", "waiting", "pending", "requested"):
-        active = gh.get(f"repos/{ORG}/{repo}/actions/runs", status=status, per_page=100)
+        active = gh.get(f"repos/{ORG}/{repo}/actions/runs", status=status, per_page=100,
+                        created=f"{iso(since)}..{iso(until)}")
         left += [r["created_at"] for r in active.get("workflow_runs", [])]
     covered = min([until] + [parse_time(t) for t in left])
     if left:
