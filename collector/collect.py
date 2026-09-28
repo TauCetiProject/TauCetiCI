@@ -459,7 +459,11 @@ def snapshot_settings(gh: GitHub, repo: str, stamp: str, dry_run: bool) -> bool:
     rules = []
     for rs in gh.get(f"repos/{ORG}/{repo}/rulesets"):
         full = gh.get(f"repos/{ORG}/{repo}/rulesets/{rs['id']}")
-        rules.append({k: full.get(k) for k in ("id", "name", "enforcement", "rules", "updated_at")})
+        entry = {k: full.get(k) for k in ("id", "name", "enforcement", "rules")}
+        # GitHub renders this in the token owner's timezone; normalise so tokens agree.
+        if full.get("updated_at"):
+            entry["updated_at"] = iso(dt.datetime.fromisoformat(full["updated_at"].replace("Z", "+00:00")))
+        rules.append(entry)
     d = RECORDS / "settings" / repo
     previous = sorted(d.glob("*.json")) if d.is_dir() else []
     if previous and json.loads(previous[-1].read_text()).get("rulesets") == rules:
