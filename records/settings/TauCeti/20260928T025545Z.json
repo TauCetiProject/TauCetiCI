@@ -1,0 +1,42 @@
+{
+ "observed_at": "20260928T025545Z",
+ "repo": "TauCeti",
+ "rulesets": [
+  {
+   "enforcement": "active",
+   "id": 17824807,
+   "name": "merge-queue-main",
+   "rules": [
+    {
+     "parameters": {
+      "check_response_timeout_minutes": 360,
+      "grouping_strategy": "ALLGREEN",
+      "max_entries_to_build": 5,
+      "max_entries_to_merge": 2,
+      "merge_method": "SQUASH",
+      "min_entries_to_merge": 1,
+      "min_entries_to_merge_wait_minutes": 0
+     },
+     "type": "merge_queue"
+    },
+    {
+     "parameters": {
+      "do_not_enforce_on_create": false,
+      "required_status_checks": [
+       {
+        "context": "build"
+       },
+       {
+        "context": "bump-guard"
+       }
+      ],
+      "strict_required_status_checks_policy": false
+     },
+     "type": "required_status_checks"
+    }
+   ],
+   "updated_at": "2026-09-16T08:42:37Z"
+  }
+ ],
+ "schema": "tauceti-ci.settings/v1"
+}
