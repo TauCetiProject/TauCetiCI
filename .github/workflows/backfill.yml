@@ -1,0 +1,57 @@
+name: backfill
+
+# Record the build workflows' runs for a past date range, newest day first, committing each day.
+# Runs on this repository's own `github.token`, whose API budget is separate from any person's: a
+# backfill from a personal token competes with everything else that person runs. The collector
+# waits out its hourly limit and keeps going, so a long range simply takes longer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from: { description: "First UTC day (YYYY-MM-DD)", required: true }
+      to: { description: "Last UTC day (YYYY-MM-DD)", required: true }
+      jobs_for: { description: "build-only, build or all", required: false, default: "build-only" }
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backfill, newest day first
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+          JOBS_FOR: ${{ inputs.jobs_for }}
+          MIN_REMAINING: "300"
+        run: |
+          set -uo pipefail
+          git config user.name "tauceti-ci-collector"
+          git config user.email "tauceti-ci-collector@users.noreply.github.com"
+          case "$JOBS_FOR" in build-only|build|all) ;; *) echo "bad jobs_for"; exit 1 ;; esac
+          day=$(date -u -d "$TO" +%F) || exit 1
+          first=$(date -u -d "$FROM" +%F) || exit 1
+          while [[ ! "$day" < "$first" ]]; do
+            for attempt in 1 2 3 4 5 6; do
+              out=$(python3 -m collector.collect --since "${day}T00:00:00Z" --until "${day}T23:59:59Z" \
+                      --repos TauCeti --jobs-for "$JOBS_FOR" 2>&1 | grep -v "^compare\|unavailable")
+              echo "$day attempt $attempt: $(echo "$out" | grep -E 'new runs|budget|API calls' | tr '\n' ' ')" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              git add records
+              if ! git diff --cached --quiet; then
+                git commit -qm "records: backfill $day ($JOBS_FOR)"
+                for i in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep $((i*10)); done
+              fi
+              echo "$out" | grep -q "runs left for next time" || break
+            done
+            day=$(date -u -d "$day - 1 day" +%F)
+          done
