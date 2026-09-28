@@ -28,11 +28,13 @@ import argparse
 import datetime as dt
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
 import sys
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -136,16 +138,19 @@ def write_records(kind: str, repo: str | None, records: list[dict], date_field: 
 # --- listing ------------------------------------------------------------------------------------
 
 
-def list_completed_runs(gh: GitHub, repo: str, since: dt.datetime, until: dt.datetime):
-    """All completed runs created in [since, until]. The search behind this endpoint returns at
-    most 1000 runs per query, so a window holding more is split in half until each part fits."""
-    path = f"repos/{ORG}/{repo}/actions/runs"
+def list_completed_runs(gh: GitHub, repo: str, since: dt.datetime, until: dt.datetime,
+                        workflow: str | None = None):
+    """All completed runs created in [since, until], optionally of one workflow file. The search
+    behind this endpoint returns at most 1000 runs per query, so a window holding more is split in
+    half until each part fits."""
+    path = (f"repos/{ORG}/{repo}/actions/workflows/{workflow}/runs" if workflow
+            else f"repos/{ORG}/{repo}/actions/runs")
     q = f"{iso(since)}..{iso(until)}"
     total = gh.get(path, created=q, status="completed", per_page=1)["total_count"]
     if total >= 1000 and until - since > dt.timedelta(minutes=5):
         mid = since + (until - since) / 2
-        yield from list_completed_runs(gh, repo, since, mid)
-        yield from list_completed_runs(gh, repo, mid + dt.timedelta(seconds=1), until)
+        yield from list_completed_runs(gh, repo, since, mid, workflow)
+        yield from list_completed_runs(gh, repo, mid + dt.timedelta(seconds=1), until, workflow)
         return
     if total:
         yield from gh.paginate(path, key="workflow_runs", created=q, status="completed")
@@ -253,6 +258,24 @@ class Enricher:
                         out["diff"] = self.diff_summary(mb)
         return out
 
+    def telemetry(self, run: dict) -> dict | None:
+        """The `ci-telemetry` artifact pr-build uploads (TauCeti's scripts/ci_telemetry.py): phase
+        timings and module counts from inside the sandbox. Statistics only; kept for 30 days."""
+        try:
+            arts = self.gh.get(f"repos/{ORG}/{self.repo}/actions/runs/{run['id']}/artifacts",
+                               name="ci-telemetry")
+            for a in arts.get("artifacts", []):
+                if a.get("expired"):
+                    continue
+                data = self.gh.raw(f"repos/{ORG}/{self.repo}/actions/artifacts/{a['id']}/zip")
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    record = json.loads(z.read("telemetry.json"))
+                if record.get("schema", "").startswith("tauceti-ci.telemetry/"):
+                    return record
+        except Exception as e:
+            print(f"telemetry for run {run['id']} unavailable: {e}", file=sys.stderr)
+        return None
+
     def failure(self, job: dict) -> dict | None:
         if job.get("conclusion") in (None, "success", "skipped", "neutral"):
             return None
@@ -304,6 +327,8 @@ def job_record(job: dict, detail: bool) -> dict:
 def needs_jobs(run: dict, jobs_for: str) -> bool:
     if (run.get("path") or run.get("name")) in BUILD_WORKFLOWS:
         return True
+    if jobs_for != "all":
+        return False
     return jobs_for == "all" and run["id"] % SAMPLE_SHORT == 0
 
 
@@ -345,6 +370,10 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
             rec["tested"] = enricher.tested(run)
         except Exception as e:
             print(f"enrich run {run['id']} failed: {e}", file=sys.stderr)
+        if workflow == ".github/workflows/pr-build.yml" and run.get("conclusion") != "skipped":
+            t = enricher.telemetry(run)
+            if t:
+                rec["telemetry"] = t
         for j, jr in zip(jobs, rec["jobs"]):
             f = enricher.failure(j)
             if f:
@@ -358,8 +387,15 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     calls are spent the rest wait for the next collection, which looks back far enough to find them."""
     key = lambda r: (r["run_id"], r["run_attempt"])
     have = seen_keys("runs", repo, since, until, key)
+    # Backfilling only the build workflows lists them through their own endpoints: listing every
+    # run costs a call per hundred, and TauCeti creates tens of thousands a day.
+    if jobs_for == "build-only":
+        sources = [list_completed_runs(gh, repo, since, until, w.rsplit("/", 1)[1])
+                   for w in sorted(BUILD_WORKFLOWS)]
+    else:
+        sources = [list_completed_runs(gh, repo, since, until)]
     new = []
-    for r in list_completed_runs(gh, repo, since, until):
+    for r in (r for src in sources for r in src):
         if gh.calls >= max_calls:
             print(f"{repo}: API budget reached while listing runs", file=sys.stderr)
             return 0, since
@@ -441,8 +477,10 @@ def main(argv=None):
     ap.add_argument("--max-calls", type=int, default=int(os.environ.get("MAX_CALLS", "4500")),
                     help="stop after this many API calls (default 4500, env MAX_CALLS), and never "
                          "spend more than the token has left this hour, less a reserve")
-    ap.add_argument("--jobs-for", choices=["all", "build"], default="all",
-                    help="fetch jobs for every run (default), or only for build workflows (backfill)")
+    ap.add_argument("--jobs-for", choices=["all", "build", "build-only"], default="all",
+                    help="all: every workflow, sampling the high-volume ones (default); build: every "
+                         "run listed, jobs only for build workflows; build-only: record only the "
+                         "build workflows (cheapest backfill)")
     args = ap.parse_args(argv)
 
     gh = GitHub()
@@ -474,6 +512,8 @@ def main(argv=None):
         if snapshot_settings(gh, repo, stamp, args.dry_run):
             print(f"{repo}: rulesets changed", file=sys.stderr)
     for repo in repos:
+        if args.jobs_for == "build-only" and repo not in DETAIL_REPOS:
+            continue
         n, covered = collect_runs(gh, repo, since_for(repo), until, stamp, args.dry_run,
                                   args.max_calls, args.jobs_for)
         print(f"{repo}: {n} new runs, complete up to {iso(covered)}", file=sys.stderr)

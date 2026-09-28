@@ -97,8 +97,12 @@ class GitHub:
             url = m.group(1) if m else None
 
     def text(self, path: str) -> str:
-        """Fetch a job log. The API answers with a redirect to signed blob storage, which must be
-        followed WITHOUT the Authorization header."""
+        """Fetch a job log (see `raw`)."""
+        return self.raw(path).decode("utf-8", errors="replace")
+
+    def raw(self, path: str) -> bytes:
+        """Fetch a log or artifact archive. The API answers with a redirect to signed blob storage,
+        which must be followed WITHOUT the Authorization header."""
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a, **k):
                 return None
@@ -108,10 +112,10 @@ class GitHub:
         self._count()
         try:
             with opener.open(req, timeout=60) as resp:
-                return resp.read().decode("utf-8", errors="replace")
+                return resp.read()
         except urllib.error.HTTPError as e:
             if e.code not in (301, 302, 303, 307, 308):
                 raise
             location = e.headers["location"]
         with urllib.request.urlopen(location, timeout=120) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            return resp.read()
