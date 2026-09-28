@@ -12,6 +12,8 @@ Tables
   steps(job_id, n, name, conclusion, started_at, completed_at, run_s)
   main_commits(sha, committed_at, pr, subject)
   settings(repo, observed_at, rulesets_json)
+  telemetry(repo, run_id, phases_json, build_json, meta_json)   pr-build's in-sandbox phase timings
+       and module counts (statistics only: written where candidate code runs)
   coverage(repo, complete_to)   every run of `repo` created before `complete_to` is recorded
   annotations(at, text)   hand-kept notes (records/annotations.json) for changes the API cannot see,
                           such as repository variables
@@ -57,6 +59,8 @@ CREATE TABLE main_commits (sha TEXT PRIMARY KEY, committed_at TEXT, pr INTEGER, 
 CREATE TABLE settings (repo TEXT, observed_at TEXT, rulesets_json TEXT);
 CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
+CREATE TABLE telemetry (repo TEXT, run_id INTEGER, phases_json TEXT, build_json TEXT, meta_json TEXT,
+  PRIMARY KEY (repo, run_id));
 CREATE INDEX jobs_run ON jobs(repo, run_id);
 CREATE INDEX jobs_created ON jobs(created_at);
 CREATE INDEX runs_created ON runs(created_at);
@@ -115,6 +119,11 @@ def build(out: Path):
                 (1 if r["head_sha"] in main else 0) if r["trigger"] == "merge_queue" else None,
                 0 if r.get("jobs_fetched") is False else 1,
             ))
+        t = r.get("telemetry")
+        if t:
+            db.execute("INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?,?)", (
+                r["repo"], r["run_id"], json.dumps(t.get("phases") or []),
+                json.dumps(t.get("build") or {}), json.dumps(t.get("meta") or {})))
         for j in r["jobs"]:
             f = j.get("failure") or {}
             db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
