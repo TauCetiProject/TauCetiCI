@@ -423,10 +423,16 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
     # Only runs created in this window: an ancient run stuck `waiting` (there is one from August)
     # would otherwise pin the watermark forever, and one created before the window cannot be
     # recorded by this collection anyway.
+    # Nor a run active for longer than OVERLAP, which is longer than any workflow's timeout: that
+    # run is stuck, not running. One `waiting` run of PR status, created 2026-10-01T01:55Z, never
+    # finished (GitHub would not even cancel it) and held TauCeti's watermark, and with it the CI
+    # charts, at its creation time.
+    stuck_before = until - OVERLAP
     for status in ("queued", "in_progress", "waiting", "pending", "requested"):
         active = gh.get(f"repos/{ORG}/{repo}/actions/runs", status=status, per_page=100,
                         created=f"{iso(since)}..{iso(until)}")
-        left += [r["created_at"] for r in active.get("workflow_runs", [])]
+        left += [r["created_at"] for r in active.get("workflow_runs", [])
+                 if parse_time(r["created_at"]) >= stuck_before]
     covered = min([until] + [parse_time(t) for t in left])
     if left:
         print(f"{repo}: API budget reached; {len(left)} runs left for next time", file=sys.stderr)
