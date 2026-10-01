@@ -63,6 +63,10 @@ BUILD_WORKFLOWS = {".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
 # queue waits while cutting the collector's API cost by about three quarters.
 SAMPLE_SHORT = 4
 
+# The repositories other than DETAIL_REPOS may spend at most 1/OTHERS_SHARE of a collection's API
+# budget between them (see `main`), so they always get some, and never more than that.
+OTHERS_SHARE = 4
+
 UTC = dt.timezone.utc
 
 
@@ -505,8 +509,12 @@ def main(argv=None):
     stamp = dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     repos = args.repos.split(",") if args.repos else [
         r["name"] for r in gh.paginate(f"orgs/{ORG}/repos") if not r.get("archived")]
-    # The detail repositories first, so a tight API budget is spent where it matters most.
-    repos.sort(key=lambda r: r not in DETAIL_REPOS)
+    # The other repositories first, from a reserved share of the budget, then the detail
+    # repositories with everything left. The others need little (a few dozen calls an hour between
+    # them), but collected last they got nothing whenever TauCeti's backlog spent the whole budget:
+    # from 2026-09-28 to 2026-10-01 five of them recorded no runs at all, and since the CI charts end
+    # where the least complete repository does, those charts stopped too.
+    repos.sort(key=lambda r: r in DETAIL_REPOS)
 
     def since_for(repo):
         if since:
@@ -519,11 +527,13 @@ def main(argv=None):
         print(f"{repo} main: {n} new commits", file=sys.stderr)
         if snapshot_settings(gh, repo, stamp, args.dry_run):
             print(f"{repo}: rulesets changed", file=sys.stderr)
+    others_cap = gh.calls + args.max_calls // OTHERS_SHARE
     for repo in repos:
         if args.jobs_for == "build-only" and repo not in DETAIL_REPOS:
             continue
+        cap = args.max_calls if repo in DETAIL_REPOS else others_cap
         n, covered = collect_runs(gh, repo, since_for(repo), until, stamp, args.dry_run,
-                                  args.max_calls, args.jobs_for)
+                                  cap, args.jobs_for)
         print(f"{repo}: {n} new runs, complete up to {iso(covered)}", file=sys.stderr)
         # Only the scheduled (cursor-driven) mode moves the cursor; backfill windows leave it alone.
         if not since and not args.dry_run:
