@@ -7,10 +7,18 @@ import urllib.request
 URL = "https://bors.taucetiproject.org/api/merge-observations"
 
 
+def read_json(url, timeout):
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "TauCetiCI/1.0", "Accept": "application/json",
+        "Cache-Control": "no-cache",
+    })
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
 def batch_members(batch_id, head):
     url = f"https://bors.taucetiproject.org/repositories/1/active-batches?base=main&batch_id={int(batch_id)}"
-    with urllib.request.urlopen(url, timeout=10) as response:
-        data = json.load(response)
+    data = read_json(url, timeout=10)
     batch = data.get("requested_batch")
     if (data.get("repo") != "TauCetiProject/TauCeti" or data.get("base") != "main"
             or not batch or batch.get("id") != batch_id or batch.get("head_sha") != head):
@@ -26,8 +34,7 @@ def read_days(since, until):
             query = {"day": day.isoformat()}
             if cursor:
                 query["cursor"] = cursor
-            with urllib.request.urlopen(URL + "?" + urllib.parse.urlencode(query), timeout=30) as r:
-                page = json.load(r)
+            page = read_json(URL + "?" + urllib.parse.urlencode(query), timeout=30)
             for obs in page["observations"]:
                 when = dt.datetime.fromisoformat(obs["observed_at"].replace("Z", "+00:00"))
                 if since <= when <= until:
