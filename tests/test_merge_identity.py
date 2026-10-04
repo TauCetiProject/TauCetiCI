@@ -7,7 +7,7 @@ import tempfile
 from unittest.mock import patch
 from collector import build_db
 from analysis.report import Report
-from collector.merge_identity import apply_telemetry, identity
+from collector.merge_identity import apply_telemetry, identity, apply_dispatch_title
 from collector.build_db import seconds
 
 
@@ -56,6 +56,17 @@ class IdentityTests(unittest.TestCase):
             report.merge_backends()
             self.assertIn("| bors | 3 | 1 | 3.0 | 3.0 | 1 | 0 |", "\n".join(report.parts))
             db.close()
+
+    def test_title_preserves_main_cost_identity_without_an_artifact_and_excludes_pilots(self):
+        r = {"event": "repository_dispatch", "workflow": ".github/workflows/pr-build.yml", "head_sha": "a" * 40}
+        apply_dispatch_title(r, f"bors branch=main batch=7 head={'b' * 40} base={'c' * 40}")
+        self.assertEqual(identity(r), ("bors", "b" * 40, "c" * 40, 7, []))
+        apply_dispatch_title(r, f"bors branch=pilot batch=7 head={'b' * 40} base={'c' * 40}")
+        self.assertIsNone(identity(r))
+        self.assertEqual(r["trigger"], "bors_pilot")
+        apply_dispatch_title(r, "pr-build")
+        self.assertIsNone(identity(r))
+        self.assertEqual(r["trigger"], "bors_unknown")
 
     def test_missing_dispatch_identity_stays_unknown(self):
         r = {"event": "repository_dispatch", "trigger": "repository_dispatch", "head_sha": "a" * 40}

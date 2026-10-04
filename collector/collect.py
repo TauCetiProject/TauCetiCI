@@ -39,8 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import classify
-from .merge_identity import apply_telemetry
-from .observations import read_days
+from .merge_identity import apply_telemetry, apply_dispatch_title
+from .observations import read_days, batch_members
 from .gh import GitHub
 
 ORG = "TauCetiProject"
@@ -376,11 +376,21 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
             rec["tested"] = enricher.tested(run)
         except Exception as e:
             print(f"enrich run {run['id']} failed: {e}", file=sys.stderr)
+        apply_dispatch_title(rec, run.get("display_title"))
         if workflow == ".github/workflows/pr-build.yml" and run.get("conclusion") != "skipped":
             t = enricher.telemetry(run)
             if t:
                 rec["telemetry"] = t
                 apply_telemetry(rec, t)
+            if rec.get("merge_metadata_pending") and rec["tested"].get("batch_id"):
+                try:
+                    tested = rec["tested"]
+                    members = batch_members(tested["batch_id"], tested["head_sha"])
+                    apply_telemetry(rec, {"meta": {"merge_engine": "bors", "head_sha": tested["head_sha"],
+                        "base_sha": tested["base_sha"], "batch_id": str(tested["batch_id"]),
+                        "batch_members": json.dumps(members)}})
+                except Exception as e:
+                    print(f"batch metadata for run {run['id']} unavailable: {e}", file=sys.stderr)
         for j, jr in zip(jobs, rec["jobs"]):
             f = enricher.failure(j)
             if f:
@@ -392,7 +402,7 @@ def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool,
                  jobs_for: str = "all") -> tuple[int, dt.datetime]:
     """Record the completed runs not yet recorded. Build workflows go first; once `max_calls` API
     calls are spent the rest wait for the next collection, which looks back far enough to find them."""
-    key = lambda r: (r["run_id"], r["run_attempt"])
+    key = lambda r: (r["run_id"] if not r.get("merge_metadata_pending") else -r["run_id"], r["run_attempt"])
     have = seen_keys("runs", repo, since, until, key)
     # Backfilling only the build workflows lists them through their own endpoints: listing every
     # run costs a call per hundred, and TauCeti creates tens of thousands a day.
@@ -534,9 +544,20 @@ def main(argv=None):
     for repo in DETAIL_REPOS & set(repos):
         if repo == "TauCeti":
             try:
-                observations = list(read_days(since_for(repo), until))
+                observation_cursor = ROOT / "state" / "observations-cursor.json"
+                observed_to = json.loads(observation_cursor.read_text()) if observation_cursor.exists() else {}
+                observation_since = since if since else parse_time(observed_to[repo]) - dt.timedelta(minutes=2) if repo in observed_to else until - dt.timedelta(days=1)
+                if not args.dry_run and repo not in observed_to:
+                    observed_to[repo] = iso(observation_since)
+                    observation_cursor.parent.mkdir(parents=True, exist_ok=True)
+                    observation_cursor.write_text(json.dumps(observed_to, indent=1) + "\n")
+                observations = list(read_days(observation_since, until))
                 if not args.dry_run and observations:
                     write_records("observations", repo, observations, "observed_at", stamp)
+                if not args.dry_run:
+                    observed_to[repo] = max(observed_to.get(repo, ""), iso(until))
+                    observation_cursor.parent.mkdir(parents=True, exist_ok=True)
+                    observation_cursor.write_text(json.dumps(observed_to, indent=1) + "\n")
                 print(f"{repo}: {len(observations)} merge observations", file=sys.stderr)
             except Exception as e:
                 print(f"{repo}: merge observations unavailable: {e}", file=sys.stderr)

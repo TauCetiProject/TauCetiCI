@@ -77,7 +77,7 @@ The collector also reads the minute observations archived by the hosted bors Wor
 Engine identity comes from merge_group or trusted staging telemetry, never MERGE_BACKEND
 at collection time. A bors repository_dispatch run's head_sha names the workflow source;
 merge_builds stores its actual tested head/base, batch ID, approved members, and whether
-that tested commit reached main. Older dispatches without this metadata stay unattributed.
+that tested commit reached main. Older dispatches still contribute bors CI cost, with unknown tested heads explicitly excluded from merge counts.
 
 The modelling report includes total validation job minutes per actually merged PR, all
 recorded attempts and failures, ordinary PR CI separately, runner sizes, cache counters,

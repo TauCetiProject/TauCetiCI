@@ -35,7 +35,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from .merge_identity import identity
+from .merge_identity import identity, apply_dispatch_title
 
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
@@ -143,6 +143,10 @@ def build(out: Path):
                    [(c["sha"], c["committed_at"], c.get("pr"), c.get("subject")) for c in main.values()])
 
     for r in records("runs"):
+        # Historical bors runs without an artifact still contribute their
+        # cost. Unknown tested heads never count as landed workflow-source SHAs.
+        if r.get("trigger") == "repository_dispatch":
+            apply_dispatch_title(r, r.get("title"))
         t = r.get("tested") or {}
         d = t.get("diff") or {}
         prev = db.execute("SELECT run_attempt FROM runs WHERE repo=? AND run_id=?",

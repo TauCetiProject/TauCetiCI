@@ -7,6 +7,17 @@ import urllib.request
 URL = "https://bors.taucetiproject.org/api/merge-observations"
 
 
+def batch_members(batch_id, head):
+    url = f"https://bors.taucetiproject.org/repositories/1/active-batches?base=main&batch_id={int(batch_id)}"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        data = json.load(response)
+    batch = data.get("requested_batch")
+    if (data.get("repo") != "TauCetiProject/TauCeti" or data.get("base") != "main"
+            or not batch or batch.get("id") != batch_id or batch.get("head_sha") != head):
+        raise RuntimeError("batch observation does not match the actual tested head")
+    return batch["members"]
+
+
 def read_days(since, until):
     day = since.date()
     while day <= until.date():
