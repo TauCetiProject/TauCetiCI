@@ -66,6 +66,135 @@ class Report:
     def p(self, text: str):
         self.parts.append(text + "\n")
 
+    def merge_backends(self):
+        self.h("Observed merge backend experiments")
+        self.p("Engine identity follows the build event, never the setting at collection time. "
+               "CI minutes include all jobs and attempts of merge validation (including publication, "
+               "failures and cancellations). Ordinary PR validation is reported separately. "
+               "Merged PRs are deduplicated from tested commits that actually reached main; "
+               "a successful build alone does not count as a merge.")
+        rows = []
+        for engine in ("queue", "bors"):
+            builds = self.db.execute("""SELECT m.run_id,m.members_json,m.landed,r.created_at,r.conclusion,
+                m.head_sha FROM merge_builds m JOIN runs r USING(repo,run_id)
+                WHERE m.engine=? AND r.workflow IN (?,?)""", (engine, PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
+            landed_prs = {m["pr"] for _, members, landed, *_ in builds if landed
+                          for m in json.loads(members) if m.get("pr")}
+            minutes = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
+                JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
+                WHERE m.engine=? AND r.workflow IN (?,?)""", (engine, PR_BUILD, ".github/workflows/pr-profile.yml")).fetchone()[0]
+            rows.append([engine, len(builds), len(landed_prs), f"{minutes:.1f}",
+                         f"{minutes / len(landed_prs):.1f}" if landed_prs else "n/a",
+                         sum(b[4] == "failure" for b in builds), sum(b[4] == "cancelled" for b in builds)])
+        self.p(table(["Engine", "Runs", "Merged PRs", "CI minutes", "Minutes / merged PR", "Failed", "Cancelled"], rows))
+        ordinary = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
+            JOIN runs r USING(repo,run_id) WHERE r.workflow IN (?,?) AND r.trigger='pr'""", (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchone()[0]
+        self.p(f"Ordinary PR CI: {ordinary:.1f} job minutes (excluded from both engines' cost).")
+        sizes = self.db.execute("""SELECT m.engine,COALESCE(j.runner_kind,'unknown'),
+            COALESCE(j.runner_size,'unknown'),COUNT(*),SUM(j.run_s)/60 FROM jobs j
+            JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
+            WHERE r.workflow IN (?,?) GROUP BY 1,2,3 ORDER BY 1,2,3""", (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
+        self.p(table(["Engine", "Runner", "Size", "Jobs", "CI minutes"],
+                     [[*s[:4], f"{s[4] or 0:.1f}"] for s in sizes]))
+        cache_rows = []
+        for engine in ("queue", "bors"):
+            verbs = defaultdict(int)
+            for (payload,) in self.db.execute("""SELECT t.build_json FROM telemetry t JOIN merge_builds m
+                USING(repo,run_id) WHERE m.engine=?""", (engine,)):
+                for verb, count in json.loads(payload).get("jobs_by_verb", {}).items():
+                    verbs[verb] += count
+            cache_rows.append([engine, verbs["Built"], verbs["Unpacked"], verbs["Replayed"]])
+        self.p(table(["Engine", "Lake built", "Cache unpacked", "Replayed"], cache_rows))
+        self.p("Cache counters cover available latest-attempt telemetry; missing artifacts and earlier "
+               "attempts reduce this coverage. Runner job minutes above include all recorded attempts.")
+        unknown_minutes = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
+            JOIN runs r USING(repo,run_id) WHERE r.trigger='bors_unknown'""").fetchone()[0]
+        self.p(f"Legacy dispatches without known target branch: {unknown_minutes:.1f} CI minutes. "
+               "These may be isolated pilots; they are reported separately from production main comparisons.")
+        obs = self.db.execute("""SELECT observed_at,backend,setting_updated_at,github_count,bors_count,
+            pending,overlap,eligible_json,reason FROM merge_observations ORDER BY observed_at""").fetchall()
+        if not obs:
+            self.p("No minute observations collected yet; switch delays, arrival rates and latency are unavailable.")
+            return
+        first_ready, selections, prev = {}, [], None
+        for at, mode, updated, github, bors, pending, overlap, eligible, reason in obs:
+            for p in json.loads(eligible):
+                first_ready.setdefault((p["pr"], p["head_sha"]), ts(at))
+            key = (mode, updated)
+            if key != prev:
+                selections.append([updated or at, mode, at, reason])
+                prev = key
+        duration = (ts(obs[-1][0]) - ts(obs[0][0])) / 3600
+        self.p(f"{len(obs)} minute observations over {duration:.2f} hours; "
+               f"{len(first_ready)} distinct eligible PR heads first observed "
+               f"({len(first_ready) / duration:.2f}/hour)" if duration else f"{len(obs)} observations.")
+        self.p("Eligibility here is the existing ready-to-merge label, a wake-up hint; admission still "
+               "rechecks exact-head CI, review and scope. Latency is measured from first observed eligibility, "
+               "so the minute sampling error and initial backlog affect it. Missing observations are gaps, "
+               "not proof that queues were empty.")
+        self.p(f"Maximum pending eligible heads: {max(o[5] or 0 for o in obs)}; "
+               f"observed queue overlap: {sum(bool(o[6]) for o in obs)} samples.")
+        switch_rows = []
+        window_rows = []
+        validation_jobs = self.db.execute("""SELECT m.engine,j.started_at,j.completed_at
+            FROM jobs j JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
+            WHERE r.workflow IN (?,?) AND j.started_at IS NOT NULL AND j.completed_at IS NOT NULL""",
+            (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
+        landings = self.db.execute("""SELECT m.engine,m.members_json,c.committed_at FROM merge_builds m
+            JOIN main_commits c ON c.sha=m.head_sha WHERE m.landed=1""").fetchall()
+        for index, (requested, mode, noticed, reason) in enumerate(selections):
+            end = selections[index + 1][0] if index + 1 < len(selections) else None
+            drained = next((o[0] for o in obs if o[0] >= noticed and (end is None or o[0] < end) and o[1] == mode and
+                            (o[4] == 0 if mode == 'queue' else o[3] == 0)), None)
+            started = self.db.execute("""SELECT MIN(r.created_at) FROM merge_builds m
+                JOIN runs r USING(repo,run_id) WHERE m.engine=? AND r.created_at>=?
+                AND (? IS NULL OR r.created_at<?)""", (mode, requested, end, end)).fetchone()[0]
+            switch_rows.append([requested, mode, noticed, drained or "pending", started or "pending"])
+            lo = max(ts(requested), ts(obs[0][0]))
+            hi = ts(end) if end else ts(obs[-1][0])
+            if hi <= lo:
+                continue
+            for engine in ("queue", "bors"):
+                minutes = sum(max(0, min(ts(b), hi) - max(ts(a), lo)) / 60
+                              for e, a, b in validation_jobs if e == engine)
+                merged = {p["pr"] for e, members, at in landings if e == engine and lo <= ts(at) < hi
+                          for p in json.loads(members) if p.get("pr")}
+                hours = (hi - lo) / 3600
+                window_rows.append([requested, mode, "closed" if end else "open", engine,
+                    f"{hours:.2f}", len(merged), f"{len(merged) / hours:.2f}", f"{minutes:.1f}",
+                    f"{minutes / len(merged):.1f}" if merged else "n/a"])
+        self.p(table(["Setting updated", "Selected", "Observed", "Outgoing empty", "First incoming build"], switch_rows))
+        self.p("Window costs split each running job's elapsed time at the requested switch timestamp. "
+               "Outgoing drain work retains its original engine. The first window is clipped to observation "
+               "coverage and the final open window is incomplete; compare closed windows after startup backlog drains. "
+               "Both merge build and performance workflows contribute cost.")
+        self.p(table(["Requested", "Selected", "Window", "Actual engine", "Hours", "Merged PRs", "PRs/hour",
+                      "CI minutes", "Minutes/PR"], window_rows))
+        incomplete = self.db.execute("SELECT COUNT(*) FROM merge_builds WHERE engine='bors' AND (head_sha IS NULL OR members_json='[]')").fetchone()[0]
+        self.p(f"Bors runs with incomplete tested-head/member metadata: {incomplete}. Their minutes are included; "
+               "unknown merges cannot enter the denominator.")
+        latencies = defaultdict(list)
+        sampled_prs = set()
+        eligible_by_pr = defaultdict(list)
+        for (pr, head), ready in first_ready.items():
+            eligible_by_pr[pr].append((ready, head))
+        for engine, members, committed in self.db.execute("""SELECT m.engine,m.members_json,c.committed_at
+            FROM merge_builds m JOIN main_commits c ON c.sha=m.head_sha WHERE m.landed=1 ORDER BY c.committed_at"""):
+            for p in json.loads(members):
+                pr = p.get("pr")
+                if pr in sampled_prs:
+                    continue
+                ready = first_ready.get((pr, p.get("head_sha")))
+                if ready is None and engine == "queue":
+                    eligible = [at for at, _ in eligible_by_pr[pr] if at <= ts(committed)]
+                    ready = max(eligible) if eligible else None
+                if ready is not None and ts(committed) >= ready:
+                    latencies[engine].append((ts(committed) - ready) / 60)
+                    sampled_prs.add(pr)
+        self.p(table(["Engine", "Heads with latency", "Median minutes", "p95 minutes"],
+                     [[e, len(v), f"{quantile(v, .5):.1f}", f"{quantile(v, .95):.1f}"]
+                      for e, v in sorted(latencies.items())]))
+
     # --- coverage ---------------------------------------------------------------------------
 
     def coverage(self):
@@ -447,6 +576,7 @@ def main(argv=None):
     params = r.queue()
     r.simulate(params)
     r.capacity()
+    r.merge_backends()
     n, k = db.execute(f"""SELECT COUNT(*), SUM(j.conclusion = 'failure') FROM runs r JOIN jobs j USING (repo, run_id)
                           WHERE r.workflow = '{PR_BUILD}' AND r.trigger = 'pr' AND j.name = '{BUILD}'
                             AND j.conclusion IN ('success', 'failure')""").fetchone()
