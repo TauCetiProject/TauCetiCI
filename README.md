@@ -70,3 +70,21 @@ Run and job metadata do not expire.
 GitHub-hosted runner capacity, merge-queue settings (by simulation) and the economics of batching
 PR builds, from the database. The publish workflow regenerates it with the database, as the `db`
 release's `REPORT.md`.
+
+## Merge backend experiments
+
+The collector also reads the minute observations archived by the hosted bors Worker.
+Engine identity comes from merge_group or trusted staging telemetry, never MERGE_BACKEND
+at collection time. A bors repository_dispatch run's head_sha names the workflow source;
+merge_builds stores its actual tested head/base, batch ID, approved members, and whether
+that tested commit reached main. Older dispatches without this metadata stay unattributed.
+
+The modelling report includes total validation job minutes per actually merged PR, all
+recorded attempts and failures, ordinary PR CI separately, runner sizes, cache counters,
+observed arrival/backlog and switches/overlaps. The records are observational and never
+authorize admission. Missing minute samples/artifacts are gaps. Eligibility is the existing
+ready-to-merge label and latency begins when a head is first observed eligible; the trusted
+review sweep independently revalidates every admission.
+
+Deploy the bors endpoint and trusted TauCeti workflow telemetry before interpreting these
+comparisons. Keep manual switching until several normal batches have drained in both directions.

@@ -39,6 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import classify
+from .merge_identity import apply_telemetry
+from .observations import read_days
 from .gh import GitHub
 
 ORG = "TauCetiProject"
@@ -378,6 +380,7 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
             t = enricher.telemetry(run)
             if t:
                 rec["telemetry"] = t
+                apply_telemetry(rec, t)
         for j, jr in zip(jobs, rec["jobs"]):
             f = enricher.failure(j)
             if f:
@@ -529,6 +532,14 @@ def main(argv=None):
         return parse_time(c) - OVERLAP if c else until - dt.timedelta(hours=24)
 
     for repo in DETAIL_REPOS & set(repos):
+        if repo == "TauCeti":
+            try:
+                observations = list(read_days(since_for(repo), until))
+                if not args.dry_run and observations:
+                    write_records("observations", repo, observations, "observed_at", stamp)
+                print(f"{repo}: {len(observations)} merge observations", file=sys.stderr)
+            except Exception as e:
+                print(f"{repo}: merge observations unavailable: {e}", file=sys.stderr)
         n = collect_main(gh, repo, since_for(repo), until, stamp, args.dry_run)
         print(f"{repo} main: {n} new commits", file=sys.stderr)
         if snapshot_settings(gh, repo, stamp, args.dry_run):

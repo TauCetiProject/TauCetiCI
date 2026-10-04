@@ -35,6 +35,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
+from .merge_identity import identity
 
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
@@ -66,6 +67,10 @@ CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
 CREATE TABLE telemetry (repo TEXT, run_id INTEGER, phases_json TEXT, build_json TEXT, meta_json TEXT,
   PRIMARY KEY (repo, run_id));
+CREATE TABLE merge_builds (repo TEXT, run_id INTEGER, engine TEXT, head_sha TEXT, base_sha TEXT,
+  batch_id INTEGER, members_json TEXT, landed INTEGER, PRIMARY KEY(repo, run_id));
+CREATE TABLE merge_observations (observed_at TEXT PRIMARY KEY, backend TEXT, setting_updated_at TEXT,
+  github_count INTEGER, bors_count INTEGER, pending INTEGER, overlap INTEGER, eligible_json TEXT, reason TEXT);
 CREATE INDEX jobs_run ON jobs(repo, run_id);
 CREATE INDEX jobs_created ON jobs(created_at);
 CREATE INDEX runs_created ON runs(created_at);
@@ -153,6 +158,11 @@ def build(out: Path):
                 (1 if r["head_sha"] in main else 0) if r["trigger"] == "merge_queue" else None,
                 0 if r.get("jobs_fetched") is False else 1,
             ))
+        merge = identity(r)
+        if merge:
+            engine, head, base, batch, members = merge
+            db.execute("INSERT OR REPLACE INTO merge_builds VALUES (?,?,?,?,?,?,?,?)", (
+                r["repo"], r["run_id"], engine, head, base, batch, json.dumps(members), int(head in main)))
         t = r.get("telemetry")
         if t:
             db.execute("INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?,?)", (
@@ -175,6 +185,18 @@ def build(out: Path):
                     s.get("completed_at"), seconds(s.get("started_at"), s.get("completed_at"))))
 
     derive_queue_chains(db)
+
+    # Queue chains are reconstructed after all runs are read. Never sum their
+    # overlapping prefixes to count merged PRs.
+    for repo, run_id, chain in db.execute("SELECT repo,run_id,queue_chain FROM runs WHERE trigger='merge_queue'").fetchall():
+        members = [{"pr": n} for n in json.loads(chain or "[]") if n is not None]
+        db.execute("UPDATE merge_builds SET members_json=? WHERE repo=? AND run_id=?",
+                   (json.dumps(members), repo, run_id))
+    for obs in records("observations"):
+        db.execute("INSERT OR REPLACE INTO merge_observations VALUES (?,?,?,?,?,?,?,?,?)", (
+            obs["observed_at"], obs.get("backend"), obs.get("updated_at"), obs.get("github_count"),
+            obs.get("bors_count"), obs.get("pending"), int(bool(obs.get("overlap"))),
+            json.dumps(obs.get("eligible") or []), obs.get("reason")))
 
     for f in sorted((RECORDS / "settings").rglob("*.json")):
         s = json.loads(f.read_text())
