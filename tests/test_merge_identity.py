@@ -2,6 +2,7 @@ import copy
 import json
 import unittest
 from collector.merge_identity import apply_telemetry, identity
+from collector.build_db import seconds
 
 
 class IdentityTests(unittest.TestCase):
@@ -19,6 +20,10 @@ class IdentityTests(unittest.TestCase):
             before = copy.deepcopy(r)
             apply_telemetry(r, {"meta": {"merge_engine": "bors"}})
             self.assertEqual(r, before)
+
+    def test_skipped_job_timestamp_order_never_creates_negative_cost(self):
+        self.assertEqual(seconds("2026-10-04T01:00:01Z", "2026-10-04T01:00:00Z"), 0)
+        self.assertEqual(seconds("2026-10-04T01:00:00Z", "2026-10-04T01:01:00Z"), 60)
 
     def test_missing_dispatch_identity_stays_unknown(self):
         r = {"event": "repository_dispatch", "trigger": "repository_dispatch", "head_sha": "a" * 40}

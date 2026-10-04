@@ -82,7 +82,7 @@ def seconds(a, b):
     if not a or not b:
         return None
     f = lambda s: dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-    return (f(b) - f(a)).total_seconds()
+    return max(0, (f(b) - f(a)).total_seconds())
 
 
 def runner_size(labels):

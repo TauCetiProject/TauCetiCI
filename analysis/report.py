@@ -131,11 +131,13 @@ class Report:
         self.p(f"Maximum pending eligible heads: {max(o[5] or 0 for o in obs)}; "
                f"observed queue overlap: {sum(bool(o[6]) for o in obs)} samples.")
         switch_rows = []
-        for requested, mode, noticed, reason in selections:
-            drained = next((o[0] for o in obs if o[0] >= noticed and o[1] == mode and
+        for index, (requested, mode, noticed, reason) in enumerate(selections):
+            end = selections[index + 1][2] if index + 1 < len(selections) else None
+            drained = next((o[0] for o in obs if o[0] >= noticed and (end is None or o[0] < end) and o[1] == mode and
                             (o[4] == 0 if mode == 'queue' else o[3] == 0)), None)
             started = self.db.execute("""SELECT MIN(r.created_at) FROM merge_builds m
-                JOIN runs r USING(repo,run_id) WHERE m.engine=? AND r.created_at>=?""", (mode, noticed)).fetchone()[0]
+                JOIN runs r USING(repo,run_id) WHERE m.engine=? AND r.created_at>=?
+                AND (? IS NULL OR r.created_at<?)""", (mode, noticed, end, end)).fetchone()[0]
             switch_rows.append([requested, mode, noticed, drained or "pending", started or "pending"])
         self.p(table(["Setting updated", "Selected", "Observed", "Outgoing empty", "First incoming build"], switch_rows))
         latencies = defaultdict(list)
