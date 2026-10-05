@@ -283,13 +283,21 @@ class Report:
                 samples = [o for o in observations if lo <= ts(o[0]) < hi]
                 arrivals = sum(lo <= at < hi for at in first_ready.values())
                 pending = [o[1] for o in samples if o[1] is not None]
-                maximum_gap = max([ts(b[0])-ts(a[0]) for a, b in zip(samples, samples[1:])] or [0])
+                ready_counts = [len(json.loads(o[2])) for o in samples]
+                gaps = [ts(b[0])-ts(a[0]) for a, b in zip(samples, samples[1:])]
+                gaps += [ts(samples[0][0])-lo, hi-ts(samples[-1][0])] if samples else [hi-lo]
+                maximum_gap = max(gaps)
                 self.p(f"{phase}: {arrivals} newly observed eligible PR heads "
-                       f"({arrivals*3600/(hi-lo):.2f}/hour); pending heads at first/last sample "
+                       f"({arrivals*3600/(hi-lo):.2f}/hour); eligible backlog heads at first/last sample "
+                       f"{ready_counts[0] if ready_counts else 'unknown'}/{ready_counts[-1] if ready_counts else 'unknown'}, "
+                       f"maximum {max(ready_counts) if ready_counts else 'unknown'}; "
+                       "pending heads at first/last sample "
                        f"{pending[0] if pending else 'unknown'}/{pending[-1] if pending else 'unknown'}, "
                        f"maximum {max(pending) if pending else 'unknown'}; {len(samples)} samples, "
-                       f"largest internal observation gap {maximum_gap/60:.1f} minutes. "
-                       "First-observed arrivals include any backlog present when coverage begins.")
+                       f"largest observation gap including phase boundaries {maximum_gap/60:.1f} minutes. "
+                       "Pending means eligible heads awaiting admission, whose definition differs by backend; "
+                       "use total eligible heads for backlog comparisons. First-observed arrivals include "
+                       "any backlog present when coverage begins.")
                 for engine in ('bors', 'queue'):
                     validation = minutes([(a, b) for mode, a, b in validation_jobs if mode == engine], lo, hi)
                     post = minutes([(a, b) for mode, a, b in post_jobs if mode == engine], lo, hi)
