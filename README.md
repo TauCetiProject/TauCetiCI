@@ -88,3 +88,27 @@ review sweep independently revalidates every admission.
 
 Deploy the bors endpoint and trusted TauCeti workflow telemetry before interpreting these
 comparisons. Keep manual switching until several normal batches have drained in both directions.
+
+### Merge-backend comparison accounting
+
+The backend report includes recorded merge-validation jobs and all main-push jobs,
+including publication, failed/cancelled jobs and reruns. Ordinary PR validation
+is shared cost and is shown separately. Post-merge runs are attributed only when
+their actual main head matches a tested head with an unambiguous engine; unknown
+or ambiguous pushes remain separate. Runner-size breakdowns identify validation
+cost; phase totals also include post-merge and shared costs.
+
+Landing timing uses the earliest collected main-push workflow creation time
+proving a tested commit reached main, including recorded parent ancestry for
+coalesced pushes. This is an upper bound, subject to notification and collection
+gaps. Staging commit creation dates are never used as landing times. Landed
+heads without push evidence remain in aggregate merge counts but are excluded
+from timed denominators and latency calculations.
+
+Timed experiment snapshots in minute observations produce separate handoff,
+bors and queue phases, splitting jobs that cross phase boundaries. The report
+shows arrivals of newly observed eligible heads, pending backlog, sample gaps,
+throughput, and shared/all-recorded CI costs. Collection does not fetch every
+auxiliary workflow's jobs; missing-job counts explicitly flag incomplete totals.
+Compare closed windows with similar arrival rates and workload/runner settings;
+first-observed arrivals include backlog when observation coverage begins.

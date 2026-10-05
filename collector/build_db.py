@@ -15,6 +15,11 @@ Tables
        wait_s, run_s, runner_kind, runner_size, labels, failure_class, failed_step, excerpt)
   steps(job_id, n, name, conclusion, started_at, completed_at, run_s)
   main_commits(sha, committed_at, pr, subject)
+  main_landings(repo, head_sha, landed_at, source, push_run_id): earliest recorded
+       main-push workflow event proving a commit was on main. This is a notification
+       upper bound, never the staging commit's committer timestamp.
+  post_merge_runs(repo, run_id, engine): main-push jobs attributed once by tested SHA;
+       engine is NULL when merge identity is absent or ambiguous.
   settings(repo, observed_at, rulesets_json)
   telemetry(repo, run_id, phases_json, build_json, meta_json)   pr-build's in-sandbox phase timings
        and module counts (statistics only: written where candidate code runs)
@@ -62,6 +67,10 @@ CREATE TABLE steps (
   run_s REAL, PRIMARY KEY (job_id, n)
 );
 CREATE TABLE main_commits (sha TEXT PRIMARY KEY, committed_at TEXT, pr INTEGER, subject TEXT);
+CREATE TABLE main_landings (repo TEXT, head_sha TEXT, landed_at TEXT, source TEXT,
+  push_run_id INTEGER, PRIMARY KEY(repo, head_sha));
+CREATE TABLE post_merge_runs (repo TEXT, run_id INTEGER, engine TEXT, PRIMARY KEY(repo, run_id));
+CREATE TABLE merge_experiments (id TEXT PRIMARY KEY, observed_at TEXT, payload_json TEXT);
 CREATE TABLE settings (repo TEXT, observed_at TEXT, rulesets_json TEXT);
 CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
@@ -127,6 +136,39 @@ def derive_queue_chains(db: sqlite3.Connection):
             cur = cur_base
         db.execute("UPDATE runs SET queue_position = ?, queue_chain = ?, ahead_failed = ? WHERE run_id = ?",
                    (len(chain), json.dumps(chain), int(failed), run_id))
+
+
+def derive_main_landings(db, main):
+    """Use main-push evidence, including coalesced pushes containing tested prefixes.
+
+    A cancelled post-merge run still proves a push occurred. Earliest events are
+    retained across reruns. Parent links propagate that proof to ancestors, with
+    an explicit source identifying the weaker ancestor upper bound. Missing
+    parent/history data stays missing; commit dates are never a timing fallback.
+    """
+    pushes = db.execute("""SELECT repo,run_id,head_sha,created_at FROM runs
+        WHERE repo='TauCeti' AND event='push' AND trigger='main'
+        ORDER BY created_at,run_id""").fetchall()
+    seen = set()
+    for repo, run_id, head, at in pushes:
+        pending = [head]
+        while pending:
+            sha = pending.pop()
+            if (repo, sha) in seen:
+                continue
+            seen.add((repo, sha))
+            source = 'main-push-workflow' if sha == head else 'main-push-ancestor-bound'
+            db.execute('INSERT INTO main_landings VALUES (?,?,?,?,?)',
+                       (repo, sha, at, source, run_id))
+            pending.extend(main.get(sha, {}).get('parents', []))
+    db.execute("""UPDATE merge_builds SET landed=1 WHERE EXISTS
+        (SELECT 1 FROM main_landings l WHERE l.repo=merge_builds.repo
+         AND l.head_sha=merge_builds.head_sha)""")
+    db.execute("""INSERT INTO post_merge_runs
+        SELECT r.repo,r.run_id,CASE WHEN COUNT(DISTINCT m.engine)=1 THEN MIN(m.engine) END
+        FROM runs r LEFT JOIN merge_builds m ON m.repo=r.repo AND m.head_sha=r.head_sha
+        WHERE r.repo='TauCeti' AND r.event='push' AND r.trigger='main'
+        GROUP BY r.repo,r.run_id""")
 
 
 def build(out: Path):
@@ -196,11 +238,18 @@ def build(out: Path):
         members = [{"pr": n} for n in json.loads(chain or "[]") if n is not None]
         db.execute("UPDATE merge_builds SET members_json=? WHERE repo=? AND run_id=?",
                    (json.dumps(members), repo, run_id))
+    derive_main_landings(db, main)
     for obs in records("observations"):
         db.execute("INSERT OR REPLACE INTO merge_observations VALUES (?,?,?,?,?,?,?,?,?)", (
             obs["observed_at"], obs.get("backend"), obs.get("updated_at"), obs.get("github_count"),
             obs.get("bors_count"), obs.get("pending"), int(bool(obs.get("overlap"))),
             json.dumps(obs.get("eligible") or []), obs.get("reason")))
+        experiment = obs.get("experiment")
+        if isinstance(experiment, dict) and experiment.get("id"):
+            db.execute("""INSERT INTO merge_experiments VALUES (?,?,?)
+                ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at,
+                payload_json=excluded.payload_json WHERE excluded.observed_at>observed_at""",
+                       (experiment["id"], obs["observed_at"], json.dumps(experiment)))
 
     for f in sorted((RECORDS / "settings").rglob("*.json")):
         s = json.loads(f.read_text())

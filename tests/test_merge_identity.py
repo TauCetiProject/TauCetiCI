@@ -54,7 +54,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT head_sha FROM merge_builds WHERE run_id=2").fetchone()[0], tested)
             report = Report(db)
             report.merge_backends()
-            self.assertIn("| bors | 3 | 1 | 3.0 | 3.0 | 1 | 0 |", "\n".join(report.parts))
+            self.assertIn("| bors | 3 | 1 | 3.0 | 0.0 | 3.0 | 3.0 | 1 | 0 |", "\n".join(report.parts))
             db.close()
 
     def test_title_preserves_main_cost_identity_without_an_artifact_and_excludes_pilots(self):
