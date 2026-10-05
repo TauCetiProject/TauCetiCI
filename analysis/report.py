@@ -69,8 +69,9 @@ class Report:
     def merge_backends(self):
         self.h("Observed merge backend experiments")
         self.p("Engine identity follows the build event, never the setting at collection time. "
-               "CI minutes include all jobs and attempts of merge validation (including publication, "
-               "failures and cancellations). Ordinary PR validation is reported separately. "
+               "CI minutes include all recorded jobs and attempts of merge validation and main-push "
+               "workflows, including publication, failures, cancellations and reruns. Ordinary PR "
+               "validation is reported separately as shared cost. "
                "Merged PRs are deduplicated from tested commits that actually reached main; "
                "a successful build alone does not count as a merge.")
         rows = []
@@ -83,10 +84,24 @@ class Report:
             minutes = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
                 JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
                 WHERE m.engine=? AND r.workflow IN (?,?)""", (engine, PR_BUILD, ".github/workflows/pr-profile.yml")).fetchone()[0]
+            post_minutes = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
+                JOIN post_merge_runs p USING(repo,run_id) WHERE p.engine=?""", (engine,)).fetchone()[0]
+            total = minutes + post_minutes
             rows.append([engine, len(builds), len(landed_prs), f"{minutes:.1f}",
-                         f"{minutes / len(landed_prs):.1f}" if landed_prs else "n/a",
+                         f"{post_minutes:.1f}", f"{total:.1f}",
+                         f"{total / len(landed_prs):.1f}" if landed_prs else "n/a",
                          sum(b[4] == "failure" for b in builds), sum(b[4] == "cancelled" for b in builds)])
-        self.p(table(["Engine", "Runs", "Merged PRs", "CI minutes", "Minutes / merged PR", "Failed", "Cancelled"], rows))
+        self.p(table(["Engine", "Validation runs", "Merged PRs", "Validation minutes", "Post-merge minutes",
+                      "Total minutes", "Total minutes / merged PR", "Failed", "Cancelled"], rows))
+        unknown_post = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
+            JOIN post_merge_runs p USING(repo,run_id) WHERE p.engine IS NULL""").fetchone()[0]
+        missing_jobs = self.db.execute("""SELECT COUNT(*) FROM runs r WHERE r.repo='TauCeti'
+            AND r.jobs_fetched=0 AND (r.trigger='main' OR EXISTS
+              (SELECT 1 FROM merge_builds m WHERE m.repo=r.repo AND m.run_id=r.run_id))""").fetchone()[0]
+        self.p(f"Unattributed or ambiguous main-push cost: {unknown_post:.1f} job minutes "
+               f"(shown separately, never assigned from MERGE_BACKEND). "
+               f"Merge/main runs without fetched jobs: {missing_jobs}; costs are recorded lower bounds "
+               "when job coverage is incomplete. These are elapsed job minutes, not CPU minutes or prices.")
         ordinary = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
             JOIN runs r USING(repo,run_id) WHERE r.workflow IN (?,?) AND r.trigger='pr'""", (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchone()[0]
         self.p(f"Ordinary PR CI: {ordinary:.1f} job minutes (excluded from both engines' cost).")
@@ -94,7 +109,7 @@ class Report:
             COALESCE(j.runner_size,'unknown'),COUNT(*),SUM(j.run_s)/60 FROM jobs j
             JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
             WHERE r.workflow IN (?,?) GROUP BY 1,2,3 ORDER BY 1,2,3""", (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
-        self.p(table(["Engine", "Runner", "Size", "Jobs", "CI minutes"],
+        self.p(table(["Engine", "Runner", "Size", "Validation jobs", "Validation minutes"],
                      [[*s[:4], f"{s[4] or 0:.1f}"] for s in sizes]))
         cache_rows = []
         for engine in ("queue", "bors"):
@@ -140,8 +155,11 @@ class Report:
             FROM jobs j JOIN merge_builds m USING(repo,run_id) JOIN runs r USING(repo,run_id)
             WHERE r.workflow IN (?,?) AND j.started_at IS NOT NULL AND j.completed_at IS NOT NULL""",
             (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
-        landings = self.db.execute("""SELECT m.engine,m.members_json,c.committed_at FROM merge_builds m
-            JOIN main_commits c ON c.sha=m.head_sha WHERE m.landed=1""").fetchall()
+        post_jobs = self.db.execute("""SELECT p.engine,j.started_at,j.completed_at FROM jobs j
+            JOIN post_merge_runs p USING(repo,run_id)
+            WHERE j.started_at IS NOT NULL AND j.completed_at IS NOT NULL""").fetchall()
+        landings = self.db.execute("""SELECT m.engine,m.members_json,l.landed_at FROM merge_builds m
+            JOIN main_landings l ON l.repo=m.repo AND l.head_sha=m.head_sha WHERE m.landed=1""").fetchall()
         for index, (requested, mode, noticed, reason) in enumerate(selections):
             end = selections[index + 1][0] if index + 1 < len(selections) else None
             drained = next((o[0] for o in obs if o[0] >= noticed and (end is None or o[0] < end) and o[1] == mode and
@@ -157,19 +175,23 @@ class Report:
             for engine in ("queue", "bors"):
                 minutes = sum(max(0, min(ts(b), hi) - max(ts(a), lo)) / 60
                               for e, a, b in validation_jobs if e == engine)
+                post_minutes = sum(max(0, min(ts(b), hi) - max(ts(a), lo)) / 60
+                                   for e, a, b in post_jobs if e == engine)
+                total = minutes + post_minutes
                 merged = {p["pr"] for e, members, at in landings if e == engine and lo <= ts(at) < hi
                           for p in json.loads(members) if p.get("pr")}
                 hours = (hi - lo) / 3600
                 window_rows.append([requested, mode, "closed" if end else "open", engine,
                     f"{hours:.2f}", len(merged), f"{len(merged) / hours:.2f}", f"{minutes:.1f}",
-                    f"{minutes / len(merged):.1f}" if merged else "n/a"])
+                    f"{post_minutes:.1f}", f"{total:.1f}",
+                    f"{total / len(merged):.1f}" if merged else "n/a"])
         self.p(table(["Setting updated", "Selected", "Observed", "Outgoing empty", "First incoming build"], switch_rows))
         self.p("Window costs split each running job's elapsed time at the requested switch timestamp. "
                "Outgoing drain work retains its original engine. The first window is clipped to observation "
                "coverage and the final open window is incomplete; compare closed windows after startup backlog drains. "
                "Both merge build and performance workflows contribute cost.")
         self.p(table(["Requested", "Selected", "Window", "Actual engine", "Hours", "Merged PRs", "PRs/hour",
-                      "CI minutes", "Minutes/PR"], window_rows))
+                      "Validation minutes", "Post-merge minutes", "Total minutes", "Total minutes/PR"], window_rows))
         incomplete = self.db.execute("SELECT COUNT(*) FROM merge_builds WHERE engine='bors' AND (head_sha IS NULL OR members_json='[]')").fetchone()[0]
         self.p(f"Bors runs with incomplete tested-head/member metadata: {incomplete}. Their minutes are included; "
                "unknown merges cannot enter the denominator.")
@@ -178,8 +200,9 @@ class Report:
         eligible_by_pr = defaultdict(list)
         for (pr, head), ready in first_ready.items():
             eligible_by_pr[pr].append((ready, head))
-        for engine, members, committed in self.db.execute("""SELECT m.engine,m.members_json,c.committed_at
-            FROM merge_builds m JOIN main_commits c ON c.sha=m.head_sha WHERE m.landed=1 ORDER BY c.committed_at"""):
+        for engine, members, committed in self.db.execute("""SELECT m.engine,m.members_json,l.landed_at
+            FROM merge_builds m JOIN main_landings l ON l.repo=m.repo AND l.head_sha=m.head_sha
+            WHERE m.landed=1 ORDER BY l.landed_at"""):
             for p in json.loads(members):
                 pr = p.get("pr")
                 if pr in sampled_prs:
@@ -191,9 +214,108 @@ class Report:
                 if ready is not None and ts(committed) >= ready:
                     latencies[engine].append((ts(committed) - ready) / 60)
                     sampled_prs.add(pr)
-        self.p(table(["Engine", "Heads with latency", "Median minutes", "p95 minutes"],
+        missing_times = self.db.execute("""SELECT COUNT(DISTINCT m.head_sha) FROM merge_builds m
+            LEFT JOIN main_landings l ON l.repo=m.repo AND l.head_sha=m.head_sha
+            WHERE m.landed=1 AND l.head_sha IS NULL""").fetchone()[0]
+        self.p("Landing time is the earliest recorded main-push workflow creation time proving the "
+               "tested commit reached main, including ancestry for coalesced pushes. It is an upper "
+               "bound subject to notification/collection gaps, not the staging commit date. "
+               f"Landed tested heads without push timing evidence: {missing_times}; excluded from "
+               "window merge counts and latency, retained in aggregate merge counts.")
+        self.p(table(["Engine", "PRs with landing evidence", "Median minutes (upper bound)", "p95 minutes (upper bound)"],
                      [[e, len(v), f"{quantile(v, .5):.1f}", f"{quantile(v, .95):.1f}"]
                       for e, v in sorted(latencies.items())]))
+        self.timed_experiments(validation_jobs, post_jobs, landings)
+
+    def timed_experiments(self, validation_jobs, post_jobs, landings):
+        experiments = self.db.execute('SELECT id,observed_at,payload_json FROM merge_experiments').fetchall()
+        if not experiments:
+            return
+        self.h("Timed experiment phases")
+        ordinary = self.db.execute("""SELECT j.started_at,j.completed_at FROM jobs j
+            JOIN runs r USING(repo,run_id) WHERE r.repo='TauCeti' AND r.trigger='pr'
+            AND r.workflow IN (?,?) AND j.started_at IS NOT NULL AND j.completed_at IS NOT NULL""",
+            (PR_BUILD, ".github/workflows/pr-profile.yml")).fetchall()
+        all_jobs = self.db.execute("""SELECT j.started_at,j.completed_at FROM jobs j
+            WHERE j.repo='TauCeti' AND j.started_at IS NOT NULL AND j.completed_at IS NOT NULL""").fetchall()
+        def minutes(jobs, lo, hi):
+            return sum(max(0, min(ts(b), hi) - max(ts(a), lo)) / 60 for a, b in jobs)
+        observations = self.db.execute("""SELECT observed_at,pending,eligible_json,github_count,bors_count
+            FROM merge_observations ORDER BY observed_at""").fetchall()
+        first_ready = {}
+        ready_by_pr = defaultdict(list)
+        for at, _, eligible, _, _ in observations:
+            for pr in json.loads(eligible):
+                key = (pr['pr'], pr['head_sha'])
+                if key not in first_ready:
+                    first_ready[key] = ts(at)
+                    ready_by_pr[pr['pr']].append(ts(at))
+        landed_times = {}
+        for engine, members, at in sorted(landings, key=lambda row: ts(row[2])):
+            for member in json.loads(members):
+                pr = member.get('pr')
+                if not pr or pr in landed_times:
+                    continue
+                ready = first_ready.get((pr, member.get('head_sha')))
+                if ready is None and engine == 'queue':
+                    prior = [t for t in ready_by_pr[pr] if t <= ts(at)]
+                    ready = max(prior) if prior else None
+                landed_times[pr] = (engine, ts(at), ready)
+        for experiment_id, observed, payload in experiments:
+            e = json.loads(payload)
+            self.p(f"Experiment `{experiment_id}`: {e.get('phase', 'unknown')}; "
+                   f"last archived observation {observed}. {e.get('reason', '')}")
+            fields = [('draining to bors', 'requested_at', 'bors_started_at'),
+                      ('bors', 'bors_started_at', 'bors_ended_at'),
+                      ('draining to queue', 'queue_requested_at', 'queue_started_at'),
+                      ('queue', 'queue_started_at', 'queue_ended_at')]
+            rows = []
+            for phase, start, end in fields:
+                if not e.get(start):
+                    continue
+                lo = ts(e[start])
+                endpoint = e.get(end) or e.get('finished_at') or observed
+                hi = ts(endpoint)
+                if hi <= lo:
+                    continue
+                incomplete = self.db.execute("""SELECT COUNT(*) FROM runs WHERE repo='TauCeti'
+                    AND jobs_fetched=0 AND created_at>=? AND created_at<?""", (e[start], endpoint)).fetchone()[0]
+                samples = [o for o in observations if lo <= ts(o[0]) < hi]
+                arrivals = sum(lo <= at < hi for at in first_ready.values())
+                pending = [o[1] for o in samples if o[1] is not None]
+                maximum_gap = max([ts(b[0])-ts(a[0]) for a, b in zip(samples, samples[1:])] or [0])
+                self.p(f"{phase}: {arrivals} newly observed eligible PR heads "
+                       f"({arrivals*3600/(hi-lo):.2f}/hour); pending heads at first/last sample "
+                       f"{pending[0] if pending else 'unknown'}/{pending[-1] if pending else 'unknown'}, "
+                       f"maximum {max(pending) if pending else 'unknown'}; {len(samples)} samples, "
+                       f"largest internal observation gap {maximum_gap/60:.1f} minutes. "
+                       "First-observed arrivals include any backlog present when coverage begins.")
+                for engine in ('bors', 'queue'):
+                    validation = minutes([(a, b) for mode, a, b in validation_jobs if mode == engine], lo, hi)
+                    post = minutes([(a, b) for mode, a, b in post_jobs if mode == engine], lo, hi)
+                    merged = {member['pr'] for mode, members, at in landings
+                              if mode == engine and lo <= ts(at) < hi
+                              for member in json.loads(members) if member.get('pr')}
+                    latency = [(at-ready)/60 for pr, (mode, at, ready) in landed_times.items()
+                               if mode == engine and lo <= at < hi and ready is not None and at >= ready]
+                    total = validation + post
+                    rows.append([phase, 'closed' if e.get(end) or e.get('finished_at') else 'open', engine,
+                                 f'{(hi-lo)/3600:.2f}', len(merged), f'{len(merged)*3600/(hi-lo):.2f}',
+                                 f'{validation:.1f}', f'{post:.1f}', f'{total:.1f}',
+                                 f'{total/len(merged):.1f}' if merged else 'n/a', len(latency),
+                                 f'{quantile(latency, .5):.1f}' if latency else 'n/a',
+                                 f'{quantile(latency, .95):.1f}' if latency else 'n/a'])
+                self.p(f"{phase}: shared ordinary PR CI {minutes(ordinary, lo, hi):.1f} minutes; "
+                       f"all recorded TauCeti CI {minutes(all_jobs, lo, hi):.1f} minutes; "
+                       f"{incomplete} runs with uncollected jobs (incomplete total when nonzero).")
+            self.p(table(['Phase', 'Window', 'Actual engine', 'Hours', 'Landed PRs', 'PRs/hour',
+                          'Validation minutes', 'Post-merge minutes', 'Total minutes', 'Minutes/PR',
+                          'Latency samples', 'Median minutes (upper bound)', 'p95 minutes (upper bound)'], rows))
+        self.p("Handoffs are separate phases. Jobs crossing a boundary are split by execution time "
+               "and keep their actual engine; unfinished jobs and missing records leave open windows "
+               "incomplete. Compare the closed bors and queue phases together with arrivals, backlog, "
+               "runner sizes and coverage. Totals include observed shared/auxiliary costs separately; "
+               "unfetched jobs are never silently estimated as zero-cost work.")
 
     # --- coverage ---------------------------------------------------------------------------
 
