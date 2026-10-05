@@ -123,6 +123,8 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("| draining to queue | closed | bors | 0.02 | 1 | 60.00 | 1.0 | 1.0 | 2.0 |", result)
         self.assertIn("| queue | open | bors | 0.03 | 0 | 0.00 | 0.0 | 1.0 | 1.0 |", result)
         self.assertIn("pending heads at first/last sample 3/3", result)
+        self.assertIn("eligible backlog heads at first/last sample 1/1", result)
+        self.assertIn("including phase boundaries 2.0 minutes", result)
 
     def test_other_repository_push_never_changes_tauceti_landing_or_cost(self):
         push = run(2, "b" * 40, "main")
