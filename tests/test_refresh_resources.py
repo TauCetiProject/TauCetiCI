@@ -34,7 +34,7 @@ class RefreshTests(unittest.TestCase):
         self.addCleanup(self.output.stop)
 
     @staticmethod
-    def record(gh, repo, value, *args):
+    def record(gh, repo, value, *args, **kwargs):
         return {'repo': repo, 'run_id': value['id'], 'run_attempt': 1,
                 'created_at': value['created_at'], 'observations': {
                     'resources': {'coverage': 'present', 'payload': {'samples': 2}}}}
@@ -54,6 +54,7 @@ class RefreshTests(unittest.TestCase):
                 patch.object(collect, 'run_record', side_effect=self.record) as record:
             value = refresh.refresh(self.gh, now=self.now)
         self.assertEqual(record.call_count, 1)
+        self.assertFalse(record.call_args.kwargs['batch_fallback'])
         self.assertEqual([r['run_id'] for r in self.snapshots()], [2])
         self.assertTrue(value['listings'][0]['truncated'])
         self.assertEqual(value['already_recorded'], 1)

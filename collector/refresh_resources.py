@@ -84,7 +84,9 @@ def refresh(gh, run_ids=(), max_runs=20, now=None):
                 receipt['deferred'] = 'run limit reached'
                 break
             receipt['attempted'] += 1
-            record = collect.run_record(gh, 'TauCeti', run, enricher, 'all')
+            # This path budgets GitHub requests. Defer the separate Bors API
+            # fallback to broad collection rather than bypassing that budget.
+            record = collect.run_record(gh, 'TauCeti', run, enricher, 'all', batch_fallback=False)
             if not any(o.get('coverage') == 'present' for o in record.get('observations', {}).values()):
                 receipt['without_artifacts'] += 1
                 receipt['gaps'].append({'run_id': key[0], 'run_attempt': key[1],
