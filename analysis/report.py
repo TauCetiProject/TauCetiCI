@@ -649,7 +649,9 @@ class Report:
     # --- 4. queue policy simulation -----------------------------------------------------------
 
     def simulate(self, params: dict):
-        self.h("4. Merge-queue settings, simulated")
+        self.h("4. Historical merge-queue illustration (not current batching advice)")
+        self.p("This legacy independent-arrival model is not calibrated to current bors admissions. "
+               "Use the captured-workload advisory replay below for current sensitivity comparisons.")
         p, durs, lam = params["p_own"], params["build_min"], params["arrivals_per_hour"]
         if not durs or math.isnan(p):
             self.p("Not enough merge-queue data yet.")
@@ -660,7 +662,7 @@ class Report:
                "between PRs, which section 3 tests.\n")
         rows = []
         for policy, depth, merge in [("GitHub queue, build 1", 1, 1), ("GitHub queue, build 3", 3, 1),
-                                     ("GitHub queue, build 5 (current)", 5, 2), ("GitHub queue, build 8", 8, 2),
+                                     ("GitHub queue, build 5", 5, 2), ("GitHub queue, build 8", 8, 2),
                                      ("bors batch of 4, bisect on failure", 4, "bors"),
                                      ("bors batch of 8, bisect on failure", 8, "bors")]:
             r = simulate_queue(lam, p, durs, depth, merge, hours=24 * 30, seed=1)
@@ -865,6 +867,8 @@ def main(argv=None):
     r.capacity()
     r.merge_backends()
     r.resources()
+    from .replay import report_section
+    r.parts.append(report_section(db))
     n, k = db.execute(f"""SELECT COUNT(*), SUM(j.conclusion = 'failure') FROM runs r JOIN jobs j USING (repo, run_id)
                           WHERE r.workflow = '{PR_BUILD}' AND r.trigger = 'pr' AND j.name = '{BUILD}'
                             AND j.conclusion IN ('success', 'failure')""").fetchone()

@@ -77,6 +77,9 @@ CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
 CREATE TABLE telemetry (repo TEXT, run_id INTEGER, phases_json TEXT, build_json TEXT, meta_json TEXT,
   PRIMARY KEY (repo, run_id));
+CREATE TABLE replay_features (repo TEXT, run_id INTEGER, run_attempt INTEGER, pr INTEGER,
+  head_sha TEXT, available_at TEXT, payload_json TEXT, PRIMARY KEY(repo,run_id,run_attempt));
+CREATE INDEX replay_features_head ON replay_features(repo,pr,head_sha,available_at);
 CREATE TABLE resource_observations (repo TEXT, run_id INTEGER, run_attempt INTEGER,
   kind TEXT, coverage TEXT, artifact_id INTEGER, payload_json TEXT,
   PRIMARY KEY(repo, run_id, run_attempt, kind));
@@ -204,6 +207,13 @@ def build(out: Path):
             apply_dispatch_title(r, r.get("title"))
         t = r.get("tested") or {}
         d = t.get("diff") or {}
+        if r["repo"] == "TauCeti" and t.get("pr") and t.get("head_sha"):
+            # Use completion/collection availability, never the run's start, to
+            # avoid lending a replay features which arrived in the future.
+            db.execute("INSERT OR REPLACE INTO replay_features VALUES (?,?,?,?,?,?,?)", (
+                r["repo"], r["run_id"], r["run_attempt"], t["pr"], t["head_sha"],
+                r.get("updated_at"), json.dumps({"diff": d, "behind_by": t.get("behind_by"),
+                    "build": (r.get("telemetry") or {}).get("build") or {}})))
         prev = db.execute("SELECT run_attempt FROM runs WHERE repo=? AND run_id=?",
                           (r["repo"], r["run_id"])).fetchone()
         if not prev or prev[0] <= r["run_attempt"]:

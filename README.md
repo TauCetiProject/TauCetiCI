@@ -180,3 +180,64 @@ unknown until a trusted producer designates speculative attempts. Raw resource
 and pressure/device payloads remain queryable for matching workload cohorts.
 Candidate-written fine-grained phase/module telemetry remains **untrusted** and
 separate. No metrics feed correctness, admission, merge or cache-trust decisions.
+
+### Advisory batching replay
+
+The published `REPORT.md` includes deterministic replay of the latest captured
+24 hours of eligibility snapshots. It compares caps 8/16/32 with a FIFO cap-128
+reference for the [configured production cap](https://github.com/TauCetiProject/TauCeti/blob/main/bors.toml).
+The count-only reference uses the same serial model as the alternatives; it is
+not an exact reproduction of bors' parallelism, priorities, speculative train or
+promotion process. Observed validation cost and actual main-push acceptance are
+reported separately, with their collection gaps.
+
+```bash
+python3 -m analysis.replay --db db/ci.sqlite --out replay.json --trace
+```
+
+This writes versioned inputs, model parameters, coverage, input/trace hashes and
+the complete sensitivity matrix. Repeating it against the same database produces
+identical bytes. `--hours` changes the captured window; it does not generate a
+new arrival process. Initial backlog age is left censored. New exact heads arrive
+between their preceding and first eligibility observations; both endpoints are
+replayed. Missing snapshots are gaps, and missing metadata is explicitly counted
+and imputed. A new observed head or explicit loss of readiness expires the old
+one. Disappearance from an incomplete snapshot does not prove withdrawal.
+
+`replay_features` retains completed PR snapshots with exact head, diff paths and
+staleness; only features available before the **earlier** arrival bound are used.
+The build model fits successful ordinary staging jobs completed before the window
+to candidate-written built-module counts. Insufficient or constant inputs use
+explicit fallback parameters. Dependency/unknown cohorts and cancelled/failed
+jobs do not train successful duration. Mixed runner sizes and module statistics
+limit the fit; these are advisory hints, never trusted proof or cache evidence.
+Per-head work uses prior module counts when available, otherwise a median work
+estimate (at least the changed-module count). Changed paths are only an overlap
+proxy: downstream dependency rebuilds and cache warmth are unknown.
+
+Work/risk formation uses a 20-minute estimated work budget, changed-path overlap,
+and an unvalidated dependency/staleness risk ordering. Every batch starts with
+its oldest eligible atomic unit; units waiting an hour bypass the work budget.
+The cap counts PR heads. Oversized bundles run alone and retries never split a
+bundle or admit new work. Finite backlogs cannot be bypassed indefinitely; elapsed
+starvation bounds require bounded service times and arrival rates. Unknown
+historical bundles are counted separately from the synthetic atomic-pair stress
+case. No bundle metadata is inferred from overlapping staging batches.
+
+Low/high proof-failure scenarios use stable SHA-256 draws per exact head. These
+are injected outcomes, not attribution of observed batch failures to members.
+Infrastructure retries keep frozen membership and stop after two retries with
+an unresolved infrastructure result; they never reject a head as a proof failure.
+Isolation, infrastructure and stale-work costs are shown separately (these can
+overlap). Dependency bumps, stale bases, unknown telemetry, work scale and overlap
+also have explicit stress comparisons. Runner minutes mean wall time, not CPU,
+dollars or measured network cost. Head versions are separate replay arrivals,
+so simulated head throughput is not a count of unique accepted PRs.
+
+The advisory recommendation is to retain the current production policy while
+improving coverage, then require matched replay and canary benefit before any
+adaptive scheduling. `adaptive_scheduling_enabled` is always false: this module
+has no live scheduling integration or write capability. No optimum, automatic
+enablement, 24-hour baseline gate, admission decision, cache producer change or
+publication credential access is introduced. The older independent-arrival
+simulator is retained and labelled as a historical illustration.
