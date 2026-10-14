@@ -1,9 +1,9 @@
 name: Benchmark harness tests
 on:
   push:
-    paths: [benchmarks/**, tests/test_benchmark.py, .github/workflows/runner-benchmark.yml, .github/workflows/benchmark-tests.yml]
+    paths: [README.md, benchmarks/**, tests/test_benchmark.py, .github/workflows/runner-benchmark.yml, .github/workflows/benchmark-tests.yml]
   pull_request:
-    paths: [benchmarks/**, tests/test_benchmark.py, .github/workflows/runner-benchmark.yml, .github/workflows/benchmark-tests.yml]
+    paths: [README.md, benchmarks/**, tests/test_benchmark.py, .github/workflows/runner-benchmark.yml, .github/workflows/benchmark-tests.yml]
 permissions:
   contents: read
 jobs:
