@@ -193,6 +193,11 @@ download store, network, nested user namespaces and writes to trusted tooling ar
 unavailable. Full trusted build, lint and axiom audits remain enabled. Uploaded
 artifacts contain statistics/logs only, never compiled output or publishable maps.
 
+The existing GitHub-hosted collector tests remain enabled. A supplemental
+Namespace validation job runs the same complete suite; the two experimental
+control jobs also use Namespace to avoid the GitHub-hosted queue. These jobs do
+not execute the representative TauCeti workloads or consume benchmark slots.
+
 The immutable plan is `benchmarks/plan.json`: fixed landed source commits and one tooling commit, pinned
 Lean and manifest digest, three workloads, three shapes, two repetitions (18
 slots). Warm/light restores published batch 730 and compiles the next landed PR (6 changed files); warm/heavy
@@ -233,7 +238,7 @@ samplers cover setup, Mathlib, root restore, trusted drivers and sandbox separat
 they report CPU, largest-process RSS (not simultaneous process-tree memory), host
 memory/CPU pressure and device I/O. Incomplete descendant accounting stays visibly
 partial. Candidate phase timestamps/build logs are separately labelled untrusted
-statistics. Raw samples, CPU model, actual memory/CPU count, cgroup limits and
+statistics. Sample counts, CPU model, actual memory/CPU count, cgroup limits and
 lineage remain in each result. Setup/command costs are estimated unit-minutes,
 with prepaid/overage USD ranges using the dated public Namespace rates in the plan.
 They exclude checkout/provisioning/artifact overhead; use the final jobs API start

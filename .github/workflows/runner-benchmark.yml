@@ -13,7 +13,7 @@ concurrency:
 jobs:
   budget:
     if: github.repository == 'TauCetiProject/TauCetiCI' && github.ref == 'refs/heads/main' && github.run_attempt == 1
-    runs-on: ubuntu-latest
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16-with-features, 'namespace-features:container.privileged=true']
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -77,7 +77,7 @@ jobs:
   report:
     needs: [budget, benchmark]
     if: always() && needs.budget.result == 'success' && github.run_attempt == 1
-    runs-on: ubuntu-latest
+    runs-on: [nscloud-ubuntu-24.04-amd64-8x16-with-features, 'namespace-features:container.privileged=true']
     steps:
       - uses: actions/checkout@v4
         with:
