@@ -1,0 +1,24 @@
+{
+  "already_recorded": 0,
+  "api_calls": 16,
+  "api_limit": 150,
+  "attempted": 2,
+  "deferred": null,
+  "error": null,
+  "explicit_run_ids": [
+    38569292331,
+    38570201359
+  ],
+  "gaps": [],
+  "list_limit_per_workflow": 100,
+  "listings": [],
+  "max_runs": 20,
+  "mode": "selected-runs",
+  "recorded": 2,
+  "request_attempts": 16,
+  "request_start_budget_seconds": 300,
+  "since": null,
+  "until": "2026-10-14T22:10:41Z",
+  "unverified_producers": 0,
+  "without_artifacts": 0
+}
