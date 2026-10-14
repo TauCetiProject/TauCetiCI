@@ -182,6 +182,7 @@ def capture(db, hours=24):
 
 
 def observed_baseline(db, since, until):
+    covered = db.execute("SELECT complete_to FROM coverage WHERE repo='TauCeti'").fetchone()
     runs = db.execute("""SELECT r.run_id,r.conclusion,r.jobs_fetched FROM runs r
         JOIN merge_builds m USING(repo,run_id) WHERE m.repo='TauCeti' AND m.engine='bors'
         AND r.created_at>=? AND r.created_at<=? ORDER BY r.run_id""", (since, until)).fetchall()
@@ -195,7 +196,9 @@ def observed_baseline(db, since, until):
         members.update(item['pr'] for item in json.loads(payload or "[]") if item.get('pr'))
     return {"attempted_runs": len(runs), "missing_job_runs": sum(not r[2] for r in runs),
             "recorded_validation_runner_minutes": minutes, "accepted_distinct_prs": len(members),
-            "accepted_prs_per_hour": len(members) * 3600 / max(1, timestamp(until) - timestamp(since)),
+            "recorded_accepted_prs_per_hour": len(members) * 3600 / max(1, timestamp(until) - timestamp(since)),
+            "collection_complete_to": covered[0] if covered else None,
+            "full_window_covered": bool(covered and timestamp(covered[0]) >= timestamp(until)),
             "run_ids": [r[0] for r in runs],
             "limitation": "Recorded attempts/all jobs, actual main-push landing bounds; incomplete collection. "
                           "Attempt and landing windows differ, so no causal cost/PR ratio. Observed PRs differ from replay heads."}
@@ -272,6 +275,15 @@ def replay(heads, model, *, cap=128, policy="fifo", bound="hi", proof_rate=.02,
         if retries:
             batch, retry = retries.pop(0)
             isolation = True
+            viable = []
+            for unit in batch:
+                if any(h.stale_at is not None and h.stale_at <= now for h in unit):
+                    expired.update(h.key for h in unit)
+                else:
+                    viable.append(unit)
+            batch = viable
+            if not batch:
+                continue
         else:
             viable = []
             for unit in pending:
@@ -302,14 +314,6 @@ def replay(heads, model, *, cap=128, policy="fifo", bound="hi", proof_rate=.02,
                 retries.insert(0, (batch, retry + 1))
             else:
                 deferred.update(members)
-        elif any(draw("proof/" + h.key) < proof_rate for u in batch for h in u):
-            verdict = "proof-scenario"
-            proof_failures += 1
-            if len(batch) == 1:
-                rejected.update(members)  # an atomic bundle is never split
-            else:
-                middle = len(batch) // 2
-                retries[0:0] = [(batch[:middle], 0), (batch[middle:], 0)]
         elif any(h.stale_at is not None and h.stale_at <= now for u in batch for h in u):
             verdict = "stale"
             costs["stale_s"] += seconds
@@ -318,6 +322,14 @@ def replay(heads, model, *, cap=128, policy="fifo", bound="hi", proof_rate=.02,
                     expired.update(h.key for h in unit)
                 else:
                     pending.append(unit)
+        elif any(draw("proof/" + h.key) < proof_rate for u in batch for h in u):
+            verdict = "proof-scenario"
+            proof_failures += 1
+            if len(batch) == 1:
+                rejected.update(members)  # an atomic bundle is never split
+            else:
+                middle = len(batch) // 2
+                retries[0:0] = [(batch[:middle], 0), (batch[middle:], 0)]
         else:
             verdict = "success-scenario"
             landed.update(members)
@@ -374,7 +386,7 @@ def compare(heads, model, coverage):
             "input_sha256": hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest(),
             "assumptions": [
                 "Single serial validation lane; no speculative promotion, parallelism or exact bors queue parity.",
-                "FIFO cap128 is a count-only comparator for current configured cap, not measured production throughput.",
+                "FIFO cap128 references the production configuration captured 2026-10-14; it is not a live setting lookup or measured production throughput.",
                 "No fill delay; oldest atomic unit anchors each batch, overdue units bypass the advisory work budget.",
                 "Finite-backlog bypass bound only; elapsed starvation bound requires bounded service and arrivals.",
                 "Unknown bundles treated as singletons; unknown modules get calibrated median work.",

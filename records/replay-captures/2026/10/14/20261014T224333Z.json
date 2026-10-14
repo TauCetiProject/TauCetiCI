@@ -1,0 +1,9 @@
+{
+  "source": "https://bors.taucetiproject.org/api/merge-observations",
+  "since_exclusive": "2026-10-14T08:16:49.201630Z",
+  "requests": 14,
+  "snapshots": 854,
+  "until": "2026-10-14T22:42:38.768414Z",
+  "collected_at": "2026-10-14T22:43:33.203668+00:00",
+  "cursor_advanced": false
+}

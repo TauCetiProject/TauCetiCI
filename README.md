@@ -185,7 +185,7 @@ separate. No metrics feed correctness, admission, merge or cache-trust decisions
 
 The published `REPORT.md` includes deterministic replay of the latest captured
 24 hours of eligibility snapshots. It compares caps 8/16/32 with a FIFO cap-128
-reference for the [configured production cap](https://github.com/TauCetiProject/TauCeti/blob/main/bors.toml).
+reference for the [production cap captured on Oct 14](https://github.com/TauCetiProject/TauCeti/blob/4f1a681d10b8371c56bc49158b0481d18bd949f5/bors.toml).
 The count-only reference uses the same serial model as the alternatives; it is
 not an exact reproduction of bors' parallelism, priorities, speculative train or
 promotion process. Observed validation cost and actual main-push acceptance are
@@ -237,7 +237,7 @@ so simulated head throughput is not a count of unique accepted PRs.
 The advisory recommendation is to retain the current production policy while
 improving coverage, then require matched replay and canary benefit before any
 adaptive scheduling. `adaptive_scheduling_enabled` is always false: this module
-has no live scheduling integration or write capability. No optimum, automatic
+has no live scheduling or service-write integration. No optimum, automatic
 enablement, 24-hour baseline gate, admission decision, cache producer change or
 publication credential access is introduced. The older independent-arrival
 simulator is retained and labelled as a historical illustration.

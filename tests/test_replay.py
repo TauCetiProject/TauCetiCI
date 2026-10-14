@@ -55,6 +55,19 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(r["landed"], 1)
         self.assertGreater(r["costs"]["stale_s"], 0)
 
+    def test_stale_proof_result_cannot_reject_changed_head(self):
+        r = replay([head(1, stale_at=5), head(2)], Model(fixed_s=10),
+                   proof_rate=1, infra_rate=0)
+        self.assertEqual(r["expired"], 1)
+        self.assertEqual(r["rejected"], 1)
+        self.assertEqual(r["trace"][0]["verdict"], "stale")
+
+    def test_head_expiring_during_infra_retry_never_reaches_proof_isolation(self):
+        r = replay([head(1, stale_at=5)], Model(fixed_s=10), proof_rate=1, infra_rate=1)
+        self.assertEqual(r["expired"], 1)
+        self.assertEqual(r["attempts"], 1)
+        self.assertEqual(r["rejected"], 0)
+
     def test_fairness_oldest_expensive_unit_anchors_and_overdue_bypass(self):
         old = replace(head(1, behind=500), work=10000)
         new = [replace(head(i), lo=10, hi=10) for i in range(2, 10)]
