@@ -383,7 +383,8 @@ class Report:
         self.p(table(['Observation', 'Coverage', 'Attempts'],
                      [[*key, value] for key, value in sorted(coverage.items())]))
         if rows:
-            self.p(f"Cohort span: {self.db.execute('SELECT MIN(created_at),MAX(created_at) FROM runs WHERE repo=\'TauCeti\'').fetchone()}; "
+            span = self.db.execute("SELECT MIN(created_at),MAX(created_at) FROM runs WHERE repo='TauCeti'").fetchone()
+            self.p(f"Cohort span: {span}; "
                    f"{len({row[6] for row in rows})} workflow-source revisions. Source revisions, "
                    "attempts and raw pressure/device counters are retained in SQLite for matching comparisons. "
                    "Historical resource gaps are explicit; no 24-hour baseline is required.")
