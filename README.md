@@ -112,3 +112,45 @@ throughput, and shared/all-recorded CI costs. Collection does not fetch every
 auxiliary workflow's jobs; missing-job counts explicitly flag incomplete totals.
 Compare closed windows with similar arrival rates and workload/runner settings;
 first-observed arrivals include backlog when observation coverage begins.
+
+### Trusted resource observations
+
+`pr-build` can publish `ci-host-resources-<attempt>` from a workflow-pinned
+sampler running **outside** bwrap; `ci-publication-<attempt>` comes from the
+secret-isolated publisher after the key-bearing step. TauCetiCI reads these as
+bounded JSON data. Attempt naming and run/attempt validation prevent reruns from
+borrowing earlier measurements. Missing, expired, partial and invalid telemetry
+is nonfatal and visible. Deploy the TauCeti producer first to populate new metrics;
+historical cohorts are available immediately without a 24-hour baseline gate.
+
+The derived tables are `run_attempts` (cohort, CI conclusion, workflow source),
+`resource_observations` (coverage and payload per attempt), and `phase_boundaries`
+(trusted API step start/end, including failure/cancel/partial jobs). `jobs.api_status`
+preserves queued/in_progress/completed from the jobs API; jobs are fetched
+through attempt-specific API paths so earlier execution cannot be mislabeled
+as a retry. Historical missing attempt identity is excluded from retry attribution.
+Earlier attempts without a collected snapshot have explicit coverage gaps; a queued job does not
+contribute execution time. Historical unknown API states remain unknown.
+
+The report separates dependency bumps (cache warmth unknown), ordinary changes
+and unknown/truncated diffs, plus trigger, runner size and conclusion. Command
+CPU is wait4 user+system time, including reaped descendants. Peak process RSS is
+the largest process, **not** simultaneous tree RSS. Host utilization, sampled
+used-memory peak, pressure and per-device I/O include other machine activity;
+stacked devices can overlap and must not be summed as unique transfer volume.
+Sampling reads at most 64 KiB per proc file every five seconds, capped at 2880
+samples, retaining only endpoints and peaks. Sampler CPU time is reported.
+A SIGTERM/SIGINT flushes partial observations when the host survives; hard kills
+and lost runners leave visible gaps. Producer setup and artifact upload are
+best-effort; build/audit exit codes and publication gates remain authoritative.
+
+Publication bytes/objects describe the staged payload including its revision
+map, **not** actual network transfer or deduplicated object writes. Public-map
+confirmation, CI success and tested-head landing are recorded separately.
+Accepted PR throughput requires main-push evidence and deduplicates overlapping
+batches/reruns. Retry cost and failed/cancelled cost overlap; success without
+landing is not necessarily waste. Speculation attribution remains explicitly
+unknown until a trusted producer designates speculative attempts. Raw resource
+and pressure/device payloads remain queryable for matching workload cohorts.
+Candidate-written fine-grained phase/module telemetry remains **untrusted** and
+separate. No metrics feed correctness, admission, merge or cache-trust decisions.
