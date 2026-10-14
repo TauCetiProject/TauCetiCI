@@ -30,15 +30,22 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inventory(root)
             (root / 'artifacts').mkdir()
-            f = root / 'artifacts/a.ltar'
+            (root / 'outputs/TauCeti').mkdir(parents=True)
+            mapping = root / 'outputs/TauCeti/aaaaaaaaaaaaaaaa.json'
+            mapping.write_text('{"data":"bbbbbbbbbbbbbbbb.ltar"}')
+            f = root / 'artifacts/bbbbbbbbbbbbbbbb.ltar'
             f.write_bytes(b'a')
             one = inventory(root)
             f.with_suffix('.ltar.hash').write_text('ignored sidecar')
             self.assertEqual(one, inventory(root))
             f.write_bytes(b'b')
             self.assertNotEqual(one, inventory(root))
-            (root / 'outputs').mkdir()
-            (root / 'outputs/map.json').write_text('{}')
+            (root / 'artifacts/unrelated.ltar').write_text('unrelated dependency build')
+            (root / 'outputs/Mathlib').mkdir()
+            (root / 'outputs/Mathlib/tool.json').write_text('{}')
+            before = inventory(root)
+            (root / 'artifacts/unrelated.ltar').write_text('different local tool build')
+            self.assertEqual(inventory(root), before)
             self.assertEqual(inventory(root)[1], 2)
 
     def records(self):

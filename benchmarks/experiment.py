@@ -4,6 +4,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import statistics
 import subprocess
@@ -47,14 +48,18 @@ def verify_mappings(root, map_file):
 
 def inventory(root):
     """Content identity for the verified root cache, not a proof of correctness."""
-    rows = []
-    for name in ('outputs', 'artifacts'):
-        for path in sorted((root / name).rglob('*')):
-            if path.is_file() and not path.name.endswith('.hash'):
-                with path.open('rb') as handle:
-                    rows.append([str(path.relative_to(root)), hashlib.file_digest(handle, 'sha256').hexdigest()])
-    if not rows:
+    paths = set()
+    for mapping in (root / 'outputs/TauCeti').glob('*.json'):
+        archive = json.loads(mapping.read_text()).get('data')
+        if not isinstance(archive, str) or not re.fullmatch(r'[0-9a-f]{16}\.ltar', archive):
+            raise ValueError('invalid root archive mapping')
+        paths.update((mapping, root / 'artifacts' / archive))
+    if not paths:
         raise ValueError('warm root cache is missing; refusing a cold substitution')
+    rows = []
+    for path in sorted(paths):
+        with path.open('rb') as handle:
+            rows.append([str(path.relative_to(root)), hashlib.file_digest(handle, 'sha256').hexdigest()])
     return hashlib.sha256(json.dumps(rows, separators=(',', ':')).encode()).hexdigest(), len(rows)
 
 
