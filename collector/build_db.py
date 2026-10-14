@@ -23,6 +23,8 @@ Tables
   settings(repo, observed_at, rulesets_json)
   telemetry(repo, run_id, phases_json, build_json, meta_json)   pr-build's in-sandbox phase timings
        and module counts (statistics only: written where candidate code runs)
+  replay_features(repo, run_id, run_attempt, pr, head_sha, available_at, payload_json)
+       completed exact-head PR snapshots for advisory replay; untrusted work hints
   coverage(repo, complete_to)   every run of `repo` created before `complete_to` is recorded
   annotations(at, text)   hand-kept notes (records/annotations.json) for changes the API cannot see,
                           such as repository variables
@@ -208,7 +210,7 @@ def build(out: Path):
         t = r.get("tested") or {}
         d = t.get("diff") or {}
         if r["repo"] == "TauCeti" and t.get("pr") and t.get("head_sha"):
-            # Use completion/collection availability, never the run's start, to
+            # Use completion availability, never the run's start, to
             # avoid lending a replay features which arrived in the future.
             db.execute("INSERT OR REPLACE INTO replay_features VALUES (?,?,?,?,?,?,?)", (
                 r["repo"], r["run_id"], r["run_attempt"], t["pr"], t["head_sha"],
