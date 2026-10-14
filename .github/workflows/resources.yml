@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: collect-resources
@@ -23,9 +24,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Check for the collector App
+        id: app
+        env:
+          APP_ID: ${{ secrets.COLLECTOR_APP_ID }}
+        run: echo "present=$([ -n "$APP_ID" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        id: app-token
+        if: steps.app.outputs.present == 'true'
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.COLLECTOR_APP_ID }}
+          private-key: ${{ secrets.COLLECTOR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
       - name: Collect bounded resource sample
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           RESOURCE_RUN_IDS: ${{ inputs.runs }}
         run: |
           set -o pipefail
