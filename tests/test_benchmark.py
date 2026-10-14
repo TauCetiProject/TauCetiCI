@@ -112,3 +112,54 @@ class WholeJobTests(unittest.TestCase):
         rows[2]['status'] = 'failed'
         report = summarize(plan(), rows)
         self.assertEqual(report['recommendations'][0]['shape'], '8x16')
+
+class FailureEvidenceTests(unittest.TestCase):
+    def test_truncated_result_is_accounted_without_losing_report(self):
+        from benchmarks.experiment import read_results
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cell = root / ('benchmark-' + slots(plan())[0]['slot'])
+            cell.mkdir()
+            (cell / 'result.json').write_text('{')
+            report = summarize(plan(), read_results(root, plan()))
+            self.assertEqual(report['slots'][0]['status'], 'corrupt-result')
+            self.assertEqual(sum(r['status'] == 'missing' for r in report['slots']), 17)
+
+    def test_job_failure_cannot_look_successful(self):
+        rows = BenchmarkTests().records()
+        jobs = [dict(name=rows[0]['slot'], status='completed', conclusion='failure')]
+        report = summarize(plan(), rows, jobs)
+        self.assertEqual(report['slots'][0]['status'], 'failed-job')
+        self.assertFalse(report['complete'])
+
+    def test_worker_failure_writes_result_and_filters_credentials(self):
+        import hashlib
+        import os
+        from unittest.mock import patch
+        from benchmarks import worker
+        p = copy.deepcopy(plan())
+        mem = int(next(l.split()[1] for l in Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemTotal:'))) * 1024
+        p['shapes']['8x16']['memory_gb'] = mem / 10**9
+        p['manifest_sha256'] = hashlib.sha256(b'{}').hexdigest()
+        env = dict(SLOT=slots(p)[0]['slot'], GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='1',
+                   HARNESS_SHA='a' * 40, GH_TOKEN='test-token', ACTIONS_RUNTIME_TOKEN='test-runtime')
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                os.chdir(d)
+                Path('pr').mkdir()
+                Path('pr/lake-manifest.json').write_text('{}')
+                Path('pr/lean-toolchain').write_text(p['toolchain'])
+                with patch.dict(os.environ, env), patch.object(worker, 'plan', return_value=p), \
+                        patch.object(worker.os, 'sched_getaffinity', return_value=set(range(8))), \
+                        patch.object(worker.subprocess, 'call', return_value=7) as call:
+                    self.assertEqual(worker.main(), 1)
+                sent = call.call_args.kwargs['env']
+                self.assertNotIn('GH_TOKEN', sent)
+                self.assertNotIn('ACTIONS_RUNTIME_TOKEN', sent)
+                result = json.loads(Path('results/result.json').read_text())
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['exit_code'], 7)
+                self.assertGreaterEqual(result['estimated_unit_minutes'], 0)
+            finally:
+                os.chdir(previous)

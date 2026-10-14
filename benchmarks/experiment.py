@@ -47,6 +47,23 @@ def inventory(root):
     return hashlib.sha256(json.dumps(rows, separators=(',', ':')).encode()).hexdigest(), len(rows)
 
 
+def read_results(directory, p):
+    results = []
+    expected = {s['slot'] for s in slots(p)}
+    for f in directory.rglob('result.json'):
+        try:
+            row = json.loads(f.read_text())
+            if not isinstance(row, dict) or row.get('slot') not in expected:
+                raise ValueError('invalid slot record')
+        except (ValueError, OSError) as error:
+            slot = f.parent.name.removeprefix('benchmark-')
+            if slot not in expected:
+                raise ValueError(f'cannot attribute corrupt result: {f}') from error
+            row = dict(slot=slot, status='corrupt-result', error=str(error))
+        results.append(row)
+    return results
+
+
 def attach_jobs(rows, jobs, p):
     for row in rows:
         matches = [j for j in jobs if row['slot'] in j.get('name', '')]
@@ -132,7 +149,7 @@ def main():
         digest, count = inventory(args.directory)
         print(json.dumps({'sha256': digest, 'files': count}))
     else:
-        results = [json.loads(f.read_text()) for f in args.directory.rglob('result.json')]
+        results = read_results(args.directory, p)
         pages = json.loads(args.jobs.read_text()) if args.jobs else None
         jobs = [j for page in pages for j in page['jobs']] if pages is not None else None
         report = summarize(p, results, jobs)
