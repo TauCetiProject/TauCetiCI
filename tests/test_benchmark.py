@@ -1,0 +1,114 @@
+import copy
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from benchmarks.experiment import authorize, inventory, plan, slots, summarize
+
+
+class BenchmarkTests(unittest.TestCase):
+    def test_budget_and_unique_cells(self):
+        p = plan()
+        self.assertEqual(len(slots(p)), 18)
+        self.assertEqual(len({s['slot'] for s in slots(p)}), 18)
+        for w in p['workloads']:
+            for shape in p['shapes']:
+                self.assertEqual(sum(s['workload'] == w and s['shape'] == shape for s in slots(p)), 2)
+
+    def test_cap_rejects_rerun_later_dispatch_and_branch(self):
+        runs = [{'id': 12}, {'id': 11}]
+        authorize(runs, 11, 1, 'refs/heads/main')
+        for args in [(runs, 12, 1, 'refs/heads/main'), (runs, 11, 2, 'refs/heads/main'),
+                     (runs, 11, 1, 'refs/heads/experiment'), ([], 11, 1, 'refs/heads/main')]:
+            with self.assertRaises(ValueError):
+                authorize(*args)
+
+    def test_cache_inventory_detects_byte_and_mapping_drift(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with self.assertRaises(ValueError):
+                inventory(root)
+            (root / 'artifacts').mkdir()
+            f = root / 'artifacts/a.ltar'
+            f.write_bytes(b'a')
+            one = inventory(root)
+            f.with_suffix('.ltar.hash').write_text('ignored sidecar')
+            self.assertEqual(one, inventory(root))
+            f.write_bytes(b'b')
+            self.assertNotEqual(one, inventory(root))
+            (root / 'outputs').mkdir()
+            (root / 'outputs/map.json').write_text('{}')
+            self.assertEqual(inventory(root)[1], 2)
+
+    def records(self):
+        return [{**s, 'status': 'success', 'elapsed_s': 60, 'cache_identity': s['workload']} for s in slots(plan())]
+
+    def test_missing_and_failed_stay_in_denominator(self):
+        rows = self.records()
+        rows.pop()
+        rows[0]['status'] = 'failed'
+        report = summarize(plan(), rows)
+        self.assertFalse(report['complete'])
+        self.assertEqual(len(report['slots']), 18)
+        self.assertEqual(sum(r['status'] == 'missing' for r in report['slots']), 1)
+        self.assertEqual(sum(g['successful'] for g in report['groups']), 16)
+
+    def test_drift_invalidates_entire_workload(self):
+        rows = self.records()
+        rows[0]['cache_identity'] = 'changed'
+        report = summarize(plan(), rows)
+        self.assertFalse(report['complete'])
+        self.assertEqual(sum(r['status'] == 'incomparable-cache' for r in report['slots']), 6)
+
+    def test_cost_and_duplicate_accounting(self):
+        rows = self.records()
+        report = summarize(plan(), rows)
+        self.assertTrue(report['complete'])
+        self.assertEqual([g['median_unit_minutes'] for g in report['groups'][:3]], [8, 16, 16])
+        with self.assertRaises(ValueError):
+            summarize(plan(), rows + [rows[0]])
+        with self.assertRaises(ValueError):
+            summarize(plan(), [{'slot': 'unknown'}])
+
+    def test_workflow_has_no_production_writers_and_both_attempt_guards(self):
+        workflow = Path('.github/workflows/runner-benchmark.yml').read_text()
+        self.assertNotIn('write', workflow.replace('cache-save or publication authority.', ''))
+        self.assertNotIn('secrets.', workflow)
+        self.assertNotIn('actions/cache', workflow)
+        self.assertGreaterEqual(workflow.count('github.run_attempt == 1'), 3)
+        script = Path('benchmarks/run.sh').read_text()
+        self.assertIn('--setenv STAGE_LAKE_CACHE 0', script)
+        self.assertIn('LAKE_CACHE_MAX_REVS=1', script)
+        self.assertNotIn('cache put', script)
+        self.assertIn('sandbox-build.sh', script)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+class WholeJobTests(unittest.TestCase):
+    def test_job_state_cost_and_queue_failures(self):
+        p = plan()
+        rows = BenchmarkTests().records()
+        jobs = [dict(name='benchmark (' + s['slot'] + ')', id=i, status='completed', conclusion='success',
+                     started_at='2026-10-14T01:00:00Z', completed_at='2026-10-14T01:02:00Z') for i, s in enumerate(slots(p))]
+        report = summarize(p, rows, jobs)
+        self.assertEqual(report['groups'][0]['median_unit_minutes'], 16)
+        self.assertEqual(report['groups'][1]['median_unit_minutes'], 32)
+        self.assertEqual(report['groups'][0]['median_job_elapsed_s'], 120)
+        report = summarize(p, [], jobs)
+        self.assertFalse(report['complete'])
+        self.assertEqual(report['slots'][0]['job']['conclusion'], 'success')
+        self.assertEqual(report['slots'][0]['status'], 'missing')
+
+    def test_recommendation_requires_complete_pair_and_cost_threshold(self):
+        rows = BenchmarkTests().records()
+        for row in rows:
+            if row['shape'] == '16x32':
+                row['elapsed_s'] = 30
+        report = summarize(plan(), rows)
+        self.assertTrue(all(r['shape'] == '16x32' for r in report['recommendations']))
+        rows[2]['status'] = 'failed'
+        report = summarize(plan(), rows)
+        self.assertEqual(report['recommendations'][0]['shape'], '8x16')

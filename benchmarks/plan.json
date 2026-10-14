@@ -1,0 +1,47 @@
+{
+  "experiment": "16245-v1",
+  "repository": "TauCetiProject/TauCeti",
+  "tooling_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
+  "head_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
+  "toolchain": "leanprover/lean4:v4.35.0-rc3",
+  "workloads": {
+    "warm-light": {
+      "cache_sha": "40f0da53982df59adadc3775ea72ead0136daa88",
+      "description": "One landed PR, 4 source files changed"
+    },
+    "warm-heavy": {
+      "cache_sha": "fe6c4a0697ca07392a89078f6dece139d66949a1",
+      "description": "12 landed PRs, 36 source files changed"
+    },
+    "cold-bump": {
+      "cache_sha": null,
+      "description": "Full root-package rebuild on the fixed post-bump pins; official Mathlib remains warm"
+    }
+  },
+  "shapes": {
+    "8x16": {
+      "cpu": 8,
+      "memory_gb": 16,
+      "units_per_minute": 8
+    },
+    "8x32": {
+      "cpu": 8,
+      "memory_gb": 32,
+      "units_per_minute": 16
+    },
+    "16x32": {
+      "cpu": 16,
+      "memory_gb": 32,
+      "units_per_minute": 16
+    }
+  },
+  "repetitions": 2,
+  "cap": 18,
+  "pricing": {
+    "source": "https://namespace.so/pricing",
+    "checked_utc": "2026-10-14",
+    "prepaid_usd_per_unit_minute": 0.001,
+    "overage_usd_per_unit_minute": 0.0015
+  },
+  "manifest_sha256": "d2cc624cfe9ec5ac6f21940c79dca2c55413ac6cd2ea0ce3666ce348c4e4cee5"
+}

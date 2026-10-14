@@ -1,0 +1,103 @@
+name: Runner benchmark 16245
+run-name: runner experiment 16245 (18 slots; no reruns)
+on:
+  workflow_dispatch:
+
+# No status, PR, approval, repository, cache-save or publication authority.
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: runner-benchmark-16245
+  cancel-in-progress: false
+jobs:
+  budget:
+    if: github.repository == 'TauCetiProject/TauCetiCI' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Claim the only allowed dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m benchmarks.experiment gate
+      - id: plan
+        run: echo "matrix=$(python3 -m benchmarks.experiment matrix)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-plan
+          path: benchmarks/plan.json
+          retention-days: 30
+  benchmark:
+    needs: budget
+    if: github.run_attempt == 1
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.budget.outputs.matrix) }}
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-${{ matrix.shape }}-with-features
+      - namespace-features:container.privileged=true
+    timeout-minutes: 175
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCeti
+          ref: 4f1a681d10b8371c56bc49158b0481d18bd949f5
+          path: gate
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCeti
+          ref: 4f1a681d10b8371c56bc49158b0481d18bd949f5
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run the fixed workload once
+        env:
+          SLOT: ${{ matrix.slot }}
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: python3 -m benchmarks.worker
+      - name: Retain statistics only (never compiled files)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.slot }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
+  report:
+    needs: [budget, benchmark]
+    if: always() && needs.budget.result == 'success' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-*
+          path: results
+      - name: Retain final worker job states and whole-job cost durations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --paginate --slurp "repos/TauCetiProject/TauCetiCI/actions/runs/${{ github.run_id }}/attempts/1/jobs?per_page=100" > results/jobs.json
+      - run: python3 -m benchmarks.experiment report --jobs results/jobs.json
+      - run: cat results/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            results/report.json
+            results/REPORT.md
+            results/jobs.json
+          retention-days: 30
