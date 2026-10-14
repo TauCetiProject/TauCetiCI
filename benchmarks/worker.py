@@ -8,6 +8,12 @@ import time
 from .experiment import plan, slots
 
 
+def without_credentials(environment):
+    return {name: value for name, value in environment.items()
+            if not any(word in name for word in ('TOKEN', 'SECRET', 'PASSWORD'))
+            and not name.startswith('ACTIONS_')}
+
+
 def main():
     p = plan()
     cell = next(s for s in slots(p) if s['slot'] == os.environ['SLOT'])
@@ -46,9 +52,7 @@ def main():
                'CACHE_MAP_URL': p['workloads'][cell['workload']].get('cache_map_url', ''),
                'CACHE_MAP_SHA256': p['workloads'][cell['workload']].get('cache_map_sha256', '')}
         # No caller credentials in dependency tooling; bwrap has its own empty environment.
-        for name in list(env):
-            if 'TOKEN' in name or 'SECRET' in name or 'PASSWORD' in name or name.startswith('ACTIONS_'):
-                del env[name]
+        env = without_credentials(env)
         code = subprocess.call(['bash', 'benchmarks/run.sh'], env=env)
         record['exit_code'] = code
         record['status'] = 'success' if code == 0 else 'failed'

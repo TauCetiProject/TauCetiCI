@@ -105,6 +105,11 @@ policy=(env -i /usr/bin/bwrap --tmpfs /
   test ! -e "$HOST_CACHE"
   touch .lake/sandbox-canary
 '
+if [ "${1:-}" = prepare-only ]; then
+  "${policy[@]}" -- bash -euo pipefail -c 'lake env "$WATCHDOG_TOOLCHAIN/bin/lean" --version'
+  echo 'Preparation and sandbox readiness passed; no TauCeti build executed.'
+  exit 0
+fi
 phase sandbox "${policy[@]}" -- bash ../gate/scripts/sandbox-build.sh
 # Candidate-written statistics stay distinct from the host observations.
 cp pr/.lake/telemetry/phases.tsv results/candidate-phases.tsv

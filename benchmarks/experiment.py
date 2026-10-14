@@ -91,11 +91,14 @@ def attach_jobs(rows, jobs, p):
         row['job_coverage'] = job['status']
         if row['status'] == 'success' and (job['status'] != 'completed' or job.get('conclusion') != 'success'):
             row['status'] = 'failed-job'
-        if job.get('started_at') and job.get('completed_at'):
+        starts = [s['started_at'] for s in job.get('steps', []) if s.get('started_at')]
+        if job.get('runner_name') and starts and job.get('completed_at'):
             seconds = (datetime.fromisoformat(job['completed_at'].replace('Z', '+00:00')) -
-                       datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))).total_seconds()
+                       min(datetime.fromisoformat(t.replace('Z', '+00:00')) for t in starts)).total_seconds()
             row['job_elapsed_s'] = seconds
             row['job_estimated_unit_minutes'] = seconds / 60 * p['shapes'][row['shape']]['units_per_minute']
+        else:
+            row['job_timing_coverage'] = 'unallocated-or-timing-unavailable'
 
 
 def summarize(p, results, jobs=None):
