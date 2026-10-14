@@ -53,6 +53,11 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(observations(self.gh, 'TauCeti', self.run)['resources']['coverage'], 'invalid-or-unavailable')
         self.gh.raw.assert_not_called()
 
+    def test_bad_counter_shapes_are_nonfatal(self):
+        for value in (42, {'cpu': []}, {'cpu': {'some': -1}}, {'cpu': {'some': float('nan')}}):
+            self.gh.raw.return_value = archive({**self.payload, 'host_pressure_stall_us': value})
+            self.assertEqual(observations(self.gh, 'TauCeti', self.run)['resources']['coverage'], 'invalid-or-unavailable')
+
     def test_cohorts_never_claim_warm_cache_and_truncated_diff_is_unknown(self):
         self.assertEqual(cohort({'tested': {'diff': {'paths': ['lean-toolchain']}}}), 'dependency-bump (warmth unknown)')
         self.assertEqual(cohort({'tested': {'diff': {'paths': ['TauCeti/A.lean']}}}), 'ordinary')

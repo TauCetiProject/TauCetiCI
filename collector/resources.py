@@ -1,6 +1,7 @@
 """Additive resource observations: never imported by merge or admission tooling."""
 import io
 import json
+import math
 import zipfile
 
 LIMIT = 1024 * 1024
@@ -8,6 +9,30 @@ ARTIFACTS = {
     'resources': ('ci-host-resources', 'ci-host-resources.json', 'tauceti-ci.host-resources/v1', 'host'),
     'publication': ('ci-publication', 'ci-publication.json', 'tauceti-ci.publication/v1', 'publisher-host'),
 }
+
+
+def validate(payload, kind):
+    if kind == 'resources':
+        if 'missing' in payload and (not isinstance(payload['missing'], list)
+                or any(not isinstance(item, str) for item in payload['missing'])):
+            raise ValueError('invalid missing-counter coverage')
+        for field in ('host_pressure_stall_us', 'host_device_io_bytes'):
+            counters = payload.get(field, {})
+            if not isinstance(counters, dict):
+                raise ValueError('invalid host counters')
+            for name, values in counters.items():
+                if not isinstance(name, str) or not isinstance(values, dict):
+                    raise ValueError('invalid counter shape')
+                for value in values.values():
+                    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                        raise ValueError('invalid counter value')
+    else:
+        for field in ('complete', 'uploaded', 'confirmed'):
+            if type(payload.get(field)) is not bool:
+                raise ValueError('invalid publication outcome')
+        for field in ('staged_bytes', 'staged_objects'):
+            if type(payload.get(field)) is not int or payload[field] < 0:
+                raise ValueError('invalid publication size')
 
 
 def observations(gh, repo, run):
@@ -44,8 +69,10 @@ def observations(gh, repo, run):
                 payload = json.loads(archive.read(info))
             if (payload.get('schema') != schema or payload.get('trust') != trust
                     or str(payload.get('run_id')) != str(run['id'])
+                    or type(payload.get('run_attempt')) is not int
                     or payload.get('run_attempt') != run.get('run_attempt', 1)):
                 raise ValueError('observation provenance mismatch')
+            validate(payload, key)
             result[key] = {'coverage': 'present', 'artifact_id': artifact['id'], 'payload': payload}
         except Exception:
             result[key]['coverage'] = 'invalid-or-unavailable'
