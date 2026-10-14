@@ -140,6 +140,10 @@ used-memory peak, pressure and per-device I/O include other machine activity;
 stacked devices can overlap and must not be summed as unique transfer volume.
 Sampling reads at most 64 KiB per proc file every five seconds, capped at 2880
 samples, retaining only endpoints and peaks. Sampler CPU time is reported.
+The host wrapper must subreap bubblewrap's orphaned PID-namespace init to account
+for sandbox CPU/RSS. Only `command_accounting_scope: reaped-descendants` contributes
+command totals. Older/direct-child artifacts have explicit incomplete command
+coverage; their host counters remain usable.
 A SIGTERM/SIGINT flushes partial observations when the host survives; hard kills
 and lost runners leave visible gaps. Producer setup and artifact upload are
 best-effort; build/audit exit codes and publication gates remain authoritative.

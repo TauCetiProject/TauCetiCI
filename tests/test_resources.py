@@ -90,7 +90,7 @@ class ResourceReportTests(unittest.TestCase):
             value['jobs'][0].update(conclusion=conclusion, status='completed')
         runs[1]['observations'] = {
             'resources': {'coverage': 'present', 'artifact_id': 7,
-                'payload': {'dependency_bump': '1', 'samples': 2, 'command_cpu_user_s': 3,
+                'payload': {'command_accounting_scope': 'reaped-descendants', 'dependency_bump': '1', 'samples': 2, 'command_cpu_user_s': 3,
                             'command_cpu_system_s': 1, 'command_max_process_rss_bytes': 2**20}},
             'publication': {'coverage': 'present', 'payload': {'complete': True, 'staged_objects': 3,
                              'staged_bytes': 40, 'uploaded': True, 'confirmed': False}}}
@@ -109,6 +109,26 @@ class ResourceReportTests(unittest.TestCase):
         self.assertIn('retry execution: 1.0 minutes', result)
         self.assertIn('Speculation waste is unknown', result)
         self.assertEqual(db.execute('SELECT COUNT(*) FROM main_landings').fetchone()[0], 0)
+
+    def test_direct_child_or_legacy_accounting_does_not_claim_sandbox_cost(self):
+        for scope in (None, 'direct-child-only', 'reaped-descendants'):
+            value = run(1, 'b'*40)
+            value['observations'] = {'resources': {'coverage': 'present', 'payload': {
+                'command_accounting_scope': scope, 'command_cpu_user_s': 100,
+                'command_cpu_system_s': 1, 'command_max_process_rss_bytes': 123 * 2**20,
+                'host_cpu_busy_fraction': .25}}}
+            report = Report(self.database([value]))
+            report.resources()
+            output = '\n'.join(report.parts)
+            self.assertIn('25.0%', output)
+            if scope == 'reaped-descendants':
+                self.assertIn('101.0', output)
+                self.assertIn('123.0', output)
+                self.assertIn('Incomplete command accounting: 0', output)
+            else:
+                self.assertNotIn('101.0', output)
+                self.assertNotIn('123.0', output)
+                self.assertIn('Incomplete command accounting: 1', output)
 
     def test_prior_jobs_without_an_attempt_snapshot_have_explicit_gaps(self):
         value = run(1, 'b'*40, attempt=2)

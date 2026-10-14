@@ -328,7 +328,8 @@ class Report:
     def resources(self):
         """Observed costs, coverage and cohorts; no decisions consume this report."""
         self.h("Resource use and accepted throughput (observations only)")
-        self.p("Command CPU time is wait4 user+system time for reaped descendants, not task wall time. "
+        self.p("Command CPU time is wait4 user+system time with host subreaping of sandbox descendants, not task wall time. "
+               "Artifacts without reaped-descendants accounting have incomplete command CPU/RSS and are excluded from those totals. "
                "RSS is the largest process, not simultaneous tree memory. Host utilization, memory, "
                "pressure and device I/O include other machine activity; stacked device counters can overlap. "
                "Dependency bumps are separate; cache temperature remains unknown. Candidate-written "
@@ -347,6 +348,7 @@ class Report:
             return float(value) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
         groups = defaultdict(list)
         coverage = defaultdict(int)
+        incomplete_command = 0
         for row in rows:
             repo, run, attempt, cohort, conclusion, trigger, source, rc, rp, pc, pp = row
             sizes = sorted({size or kind or 'unknown' for kind, size in self.db.execute(
@@ -355,6 +357,8 @@ class Report:
             groups[(cohort, trigger, ','.join(sizes) or 'unknown', conclusion)].append(row)
             coverage[('resources', rc or 'missing')] += 1
             coverage[('publication', pc or 'missing')] += 1
+            if rc == 'present' and json.loads(rp or '{}').get('command_accounting_scope') != 'reaped-descendants':
+                incomplete_command += 1
         result = []
         for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
             cpu, rss, overhead, busy, samples, covered, partial = [], [], [], [], 0, 0, 0
@@ -364,12 +368,13 @@ class Report:
                     covered += 1
                     partial += bool(payload.get('missing'))
                 user, system = number(payload.get('command_cpu_user_s')), number(payload.get('command_cpu_system_s'))
-                if user is not None and system is not None:
+                accounted = payload.get('command_accounting_scope') == 'reaped-descendants'
+                if accounted and user is not None and system is not None:
                     cpu.append(user + system)
                 for target, field in ((rss, 'command_max_process_rss_bytes'),
                                       (overhead, 'sampler_cpu_s'), (busy, 'host_cpu_busy_fraction')):
                     value = number(payload.get(field))
-                    if value is not None:
+                    if value is not None and (target is not rss or accounted):
                         target.append(value)
                 samples += int(number(payload.get('samples')) or 0)
             result.append([*key, len(values), f'{covered}/{len(values)}', partial, samples,
@@ -382,6 +387,8 @@ class Report:
                       'Median host busy', 'Sampler CPU s'], result))
         self.p(table(['Observation', 'Coverage', 'Attempts'],
                      [[*key, value] for key, value in sorted(coverage.items())]))
+        self.p(f"Incomplete command accounting: {incomplete_command} present resource artifacts; "
+               "host counters remain available, but command CPU/RSS are not representative of the sandbox.")
         if rows:
             span = self.db.execute("SELECT MIN(created_at),MAX(created_at) FROM runs WHERE repo='TauCeti'").fetchone()
             self.p(f"Cohort span: {span}; "
