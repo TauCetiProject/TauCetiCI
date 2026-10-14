@@ -241,3 +241,76 @@ has no live scheduling or service-write integration. No optimum, automatic
 enablement, 24-hour baseline gate, admission decision, cache producer change or
 publication credential access is introduced. The older independent-arrival
 simulator is retained and labelled as a historical illustration.
+
+## Controlled runner experiment (#16245)
+
+`runner-benchmark.yml` is a separate, manual, read-only experiment in **TauCetiCI**.
+It does not dispatch `pr-build`, post production statuses, record approvals, save
+Actions caches, attach persistent cache volumes, or invoke a publisher. Its token
+has only contents/actions read permission; checkout credentials are removed.
+Candidate compilation runs offline under the staging bwrap policy with only
+`.lake` writable. The same policy first checks that credentials, the host Mathlib
+download store, network, nested user namespaces and writes to trusted tooling are
+unavailable. Full trusted build, lint and axiom audits remain enabled. Uploaded
+artifacts contain statistics/logs only, never compiled output or publishable maps.
+
+The existing GitHub-hosted collector tests remain enabled. A supplemental
+Namespace validation job runs the same complete suite; the two experimental
+control jobs also use Namespace to avoid the GitHub-hosted queue. These jobs do
+not execute the representative TauCeti workloads or consume benchmark slots.
+
+The immutable plan is `benchmarks/plan.json`: fixed landed source commits and one tooling commit, pinned
+Lean and manifest digest, three workloads, three shapes, two repetitions (18
+slots). Warm/light restores published batch 730 and compiles the next landed PR (6 changed files); warm/heavy
+restores the same parent and compiles the entire landed batch 735 (27 PRs, 76 changed
+files). The parent revision map is SHA-256 pinned and every downloaded mapping
+must match it before compilation. Cold/bump starts with no root-package artifacts on that same post-bump
+pin; it models full root recompilation rather than an additional dependency bump.
+All cells independently install the same official toolchain and fetch the same
+complete official Mathlib cache into fresh job-local directories. There is no
+compressed-download or toolchain snapshot restore, so hidden cache hits cannot
+bias setup. Root cache restoration uses one exact published revision, with no
+ancestor fallback; a missing/partial warm cache fails that slot. SHA-256 inventories
+of downloaded root mappings/archive bytes must agree across all successful cells
+of a workload. These hashes establish comparability and byte integrity; the
+existing audited-main publisher supplies producer trust.
+
+Only the **earliest dispatch of this workflow** on `main`, attempt 1, may execute.
+Every worker independently rejects reruns, including rerun-failed reusing gate
+outputs. Later dispatches fail the budget gate. **Do not delete workflow run history
+or rename/copy this workflow to restart the experiment**: failed, cancelled,
+missing, timed-out and mismatched slots consume the original budget; they are not
+replaced. Concurrency is at most three jobs at ordinary priority, without bors
+priority or cancellation. The experiment has no production/default-runner effect.
+
+After review and landing, dispatch once:
+
+```sh
+gh workflow run runner-benchmark.yml --repo TauCetiProject/TauCetiCI --ref main
+gh run watch RUN_ID --repo TauCetiProject/TauCetiCI --exit-status --interval 120
+gh api repos/TauCetiProject/TauCetiCI/actions/runs/RUN_ID/jobs --paginate --slurp > jobs.json
+gh run download RUN_ID --repo TauCetiProject/TauCetiCI --dir benchmark-results
+python3 -m benchmarks.experiment report --directory benchmark-results --jobs jobs.json
+```
+
+The final report enumerates all 18 slots even if a worker never started or uploaded
+an artifact. Cache drift invalidates that workload comparison. Host resource
+samplers cover setup, Mathlib, root restore, trusted drivers and sandbox separately;
+they report CPU, largest-process RSS (not simultaneous process-tree memory), host
+memory/CPU pressure and device I/O. Incomplete descendant accounting stays visibly
+partial. Candidate phase timestamps/build logs are separately labelled untrusted
+statistics. Sample counts, CPU model, actual memory/CPU count, cgroup limits and
+lineage remain in each result. Setup/command costs are estimated unit-minutes,
+with prepaid/overage USD ranges using the dated public Namespace rates in the plan.
+They exclude checkout/provisioning/artifact overhead; use the final jobs API start
+and completion times for whole-job cost, and the provider invoice for actual
+billing. Neither cost model includes shared plan allocation or storage charges.
+
+Recommendations require both repetitions on baseline and candidate, at least 10%
+less median elapsed and at most 10% greater compute cost. The two-run sample is a
+bounded experiment, not a statistical guarantee or whole-pipeline throughput claim.
+Review per-workload resource/phase data and whole-job costs before proposing any
+default change. Keeping 8CPU/16GB is a valid result. A justified production change
+must be a separate human-reviewed TauCeti infrastructure PR with the previous labels
+recorded for immediate revert, followed by a **new** workflow-pinned production
+dispatch and verification. PR #15568's GitHub fallback is separate.
