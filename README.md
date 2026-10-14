@@ -193,11 +193,12 @@ download store, network, nested user namespaces and writes to trusted tooling ar
 unavailable. Full trusted build, lint and axiom audits remain enabled. Uploaded
 artifacts contain statistics/logs only, never compiled output or publishable maps.
 
-The immutable plan is `benchmarks/plan.json`: one source/tooling commit, pinned
+The immutable plan is `benchmarks/plan.json`: fixed landed source commits and one tooling commit, pinned
 Lean and manifest digest, three workloads, three shapes, two repetitions (18
-slots). Warm/light restores the exact parent of one landed PR; warm/heavy restores
-the exact parent of a 12-PR landed interval (36 changed files). Both compile the
-same head. Cold/bump starts with no root-package artifacts on that same post-bump
+slots). Warm/light restores published batch 730 and compiles the next landed PR (6 changed files); warm/heavy
+restores the same parent and compiles the entire landed batch 735 (27 PRs, 76 changed
+files). The parent revision map is SHA-256 pinned and every downloaded mapping
+must match it before compilation. Cold/bump starts with no root-package artifacts on that same post-bump
 pin; it models full root recompilation rather than an additional dependency bump.
 All cells independently install the same official toolchain and fetch the same
 complete official Mathlib cache into fresh job-local directories. There is no

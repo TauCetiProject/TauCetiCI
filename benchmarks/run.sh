@@ -44,8 +44,10 @@ root_cache() {
     # The checkout points at the exact published parent; no ancestor fallback.
     git -C pr diff --exit-code "$CACHE_SHA" "$HEAD_SHA" -- lakefile.toml lean-toolchain lake-manifest.json
     git -C pr checkout --detach "$CACHE_SHA"
+    curl -fsSL "$CACHE_MAP_URL" -o results/root-map.jsonl
+    echo "$CACHE_MAP_SHA256  results/root-map.jsonl" | sha256sum -c -
     LAKE_CACHE_MAX_REVS=1 bash gate/scripts/lake-cache-get.sh pr
-    python3 -m benchmarks.experiment inventory --directory pr/.lake/cache > results/cache.json
+    python3 -m benchmarks.experiment inventory --directory pr/.lake/cache --map results/root-map.jsonl > results/cache.json
   fi
   git -C pr checkout --detach "$HEAD_SHA"
 }

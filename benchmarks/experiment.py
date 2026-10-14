@@ -34,6 +34,17 @@ def authorize(runs, run_id, attempt, branch):
         raise ValueError('the experiment already has an owner dispatch')
 
 
+def verify_mappings(root, map_file):
+    lines = map_file.read_text().splitlines()
+    if not lines or json.loads(lines[0]) != '2026-03-17':
+        raise ValueError('unexpected root map schema')
+    expected = dict(json.loads(line) for line in lines[1:])
+    observed = {f.stem: json.loads(f.read_text()).get('data')
+                for f in (root / 'outputs/TauCeti').glob('*.json')}
+    if not expected or observed != expected:
+        raise ValueError('downloaded mappings differ from the pinned published map')
+
+
 def inventory(root):
     """Content identity for the verified root cache, not a proof of correctness."""
     rows = []
@@ -132,6 +143,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['gate', 'matrix', 'inventory', 'report'])
     parser.add_argument('--jobs', type=Path)
+    parser.add_argument('--map', type=Path)
     parser.add_argument('--directory', type=Path, default=Path('results'))
     args = parser.parse_args()
     p = plan()
@@ -146,6 +158,8 @@ def main():
         authorize(runs, int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT']), os.environ['GITHUB_REF'])
         print('Authorized 18 slots; reruns and later dispatches are disabled.')
     elif args.command == 'inventory':
+        if args.map:
+            verify_mappings(args.directory, args.map)
         digest, count = inventory(args.directory)
         print(json.dumps({'sha256': digest, 'files': count}))
     else:

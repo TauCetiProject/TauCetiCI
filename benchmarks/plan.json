@@ -2,20 +2,26 @@
   "experiment": "16245-v1",
   "repository": "TauCetiProject/TauCeti",
   "tooling_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
-  "head_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
   "toolchain": "leanprover/lean4:v4.35.0-rc3",
   "workloads": {
     "warm-light": {
-      "cache_sha": "40f0da53982df59adadc3775ea72ead0136daa88",
-      "description": "One landed PR, 4 source files changed"
+      "cache_sha": "720bf8c135bd2c354a15d55a73f2fc2c3d7aa358",
+      "description": "One landed PR after published batch 730, 6 source files changed",
+      "head_sha": "99f5b2a9f6eb5c925917e64124960cf9a442751b",
+      "cache_map_sha256": "8163a900a187830756f0a066f20bf3d5b723a665ba4ee7b3cea261b73babdec6",
+      "cache_map_url": "https://cache.taucetiproject.org/revisions/TauCetiProject/TauCeti/tc/leanprover--lean4---v4.35.0-rc3/720bf8c135bd2c354a15d55a73f2fc2c3d7aa358.jsonl"
     },
     "warm-heavy": {
-      "cache_sha": "fe6c4a0697ca07392a89078f6dece139d66949a1",
-      "description": "12 landed PRs, 36 source files changed"
+      "cache_sha": "720bf8c135bd2c354a15d55a73f2fc2c3d7aa358",
+      "description": "Entire landed batch 735, 27 PRs and 76 source files changed",
+      "head_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
+      "cache_map_sha256": "8163a900a187830756f0a066f20bf3d5b723a665ba4ee7b3cea261b73babdec6",
+      "cache_map_url": "https://cache.taucetiproject.org/revisions/TauCetiProject/TauCeti/tc/leanprover--lean4---v4.35.0-rc3/720bf8c135bd2c354a15d55a73f2fc2c3d7aa358.jsonl"
     },
     "cold-bump": {
       "cache_sha": null,
-      "description": "Full root-package rebuild on the fixed post-bump pins; official Mathlib remains warm"
+      "description": "Full root-package rebuild on the fixed post-bump pins; official Mathlib remains warm",
+      "head_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5"
     }
   },
   "shapes": {

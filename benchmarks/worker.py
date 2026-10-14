@@ -17,7 +17,7 @@ def main():
     start = time.monotonic()
     record = dict(cell, experiment=p['experiment'], run_id=os.environ['GITHUB_RUN_ID'],
                   run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']), harness_sha=os.environ['HARNESS_SHA'],
-                  tooling_sha=p['tooling_sha'], head_sha=p['head_sha'], status='failed')
+                  tooling_sha=p['tooling_sha'], head_sha=p['workloads'][cell['workload']]['head_sha'], status='failed')
     try:
         if record['run_attempt'] != 1:
             raise ValueError('reruns cannot execute benchmark slots')
@@ -35,8 +35,10 @@ def main():
         if manifest != p['manifest_sha256'] or Path('pr/lean-toolchain').read_text().strip() != p['toolchain']:
             raise ValueError('unexpected workload pins')
         record['manifest_sha256'] = manifest
-        env = {**os.environ, 'HEAD_SHA': p['head_sha'],
-               'CACHE_SHA': p['workloads'][cell['workload']]['cache_sha'] or 'cold'}
+        env = {**os.environ, 'HEAD_SHA': p['workloads'][cell['workload']]['head_sha'],
+               'CACHE_SHA': p['workloads'][cell['workload']]['cache_sha'] or 'cold',
+               'CACHE_MAP_URL': p['workloads'][cell['workload']].get('cache_map_url', ''),
+               'CACHE_MAP_SHA256': p['workloads'][cell['workload']].get('cache_map_sha256', '')}
         # No caller credentials in dependency tooling; bwrap has its own empty environment.
         for name in list(env):
             if 'TOKEN' in name or 'SECRET' in name or 'PASSWORD' in name or name.startswith('ACTIONS_'):

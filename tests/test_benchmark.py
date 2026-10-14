@@ -163,3 +163,21 @@ class FailureEvidenceTests(unittest.TestCase):
                 self.assertGreaterEqual(result['estimated_unit_minutes'], 0)
             finally:
                 os.chdir(previous)
+
+class MapBindingTests(unittest.TestCase):
+    def test_downloaded_root_mappings_must_equal_pinned_map(self):
+        from benchmarks.experiment import verify_mappings
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            output = root / 'outputs/TauCeti'
+            output.mkdir(parents=True)
+            map_file = root / 'published.jsonl'
+            map_file.write_text('"2026-03-17"\n["aaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbb.ltar"]\n')
+            with self.assertRaises(ValueError):
+                verify_mappings(root, map_file)
+            f = output / 'aaaaaaaaaaaaaaaa.json'
+            f.write_text('{"data":"bbbbbbbbbbbbbbbb.ltar"}')
+            verify_mappings(root, map_file)
+            f.write_text('{"data":"cccccccccccccccc.ltar"}')
+            with self.assertRaises(ValueError):
+                verify_mappings(root, map_file)
