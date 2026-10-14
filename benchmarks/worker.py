@@ -31,6 +31,12 @@ def main():
         for path in ('cpu.max', 'memory.max'):
             f = Path('/sys/fs/cgroup') / path
             record[path] = f.read_text().strip() if f.exists() else None
+        quota = record['cpu.max']
+        if quota and quota.split()[0] != 'max' and int(quota.split()[0]) / int(quota.split()[1]) < spec['cpu']:
+            raise ValueError('cgroup CPU quota is below requested shape')
+        limit = record['memory.max']
+        if limit and limit != 'max' and int(limit) < .85 * spec['memory_gb'] * 10**9:
+            raise ValueError('cgroup memory limit is below requested shape')
         manifest = hashlib.sha256(Path('pr/lake-manifest.json').read_bytes()).hexdigest()
         if manifest != p['manifest_sha256'] or Path('pr/lean-toolchain').read_text().strip() != p['toolchain']:
             raise ValueError('unexpected workload pins')
