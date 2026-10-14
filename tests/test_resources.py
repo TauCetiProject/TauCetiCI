@@ -5,7 +5,7 @@ import zipfile
 from unittest.mock import Mock
 
 from analysis.report import Report
-from collector.collect import job_record
+from collector.collect import job_record, run_record
 from collector.resources import observations, cohort
 import test_merge_reporting
 from test_merge_reporting import run
@@ -64,6 +64,18 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(cohort({'tested': {'diff': {'paths': [], 'files_truncated': True}}}), 'unknown')
         self.assertEqual(cohort({}), 'unknown')
 
+    def test_jobs_are_bound_to_attempt_api_paths(self):
+        gh = Mock()
+        gh.paginate.side_effect = [[{'id': 1, 'name': 'build', 'status': 'completed'}],
+                                   [{'id': 2, 'name': 'build', 'status': 'completed'}]]
+        value = {'id': 7, 'run_attempt': 2, 'path': '.github/workflows/ci.yml',
+                 'conclusion': 'success', 'event': 'push', 'head_sha': 'a'*40,
+                 'created_at': '2026-10-13T01:00:00Z'}
+        record = run_record(gh, 'TauCeti', value, None, 'all')
+        self.assertEqual([job['run_attempt'] for job in record['jobs']], [1, 2])
+        self.assertTrue(gh.paginate.call_args_list[0].args[0].endswith('/attempts/1/jobs'))
+        self.assertTrue(gh.paginate.call_args_list[1].args[0].endswith('/attempts/2/jobs'))
+
     def test_api_job_state_preserved(self):
         for state in ('queued', 'in_progress', 'completed'):
             self.assertEqual(job_record({'id': 1, 'name': 'build', 'status': state}, True)['status'], state)
@@ -97,6 +109,15 @@ class ResourceReportTests(unittest.TestCase):
         self.assertIn('retry execution: 1.0 minutes', result)
         self.assertIn('Speculation waste is unknown', result)
         self.assertEqual(db.execute('SELECT COUNT(*) FROM main_landings').fetchone()[0], 0)
+
+    def test_prior_jobs_without_an_attempt_snapshot_have_explicit_gaps(self):
+        value = run(1, 'b'*40, attempt=2)
+        value['jobs'].append({'id': 11, 'name': 'build', 'run_attempt': 1,
+                              'conclusion': 'failure'})
+        db = self.database([value])
+        self.assertEqual(db.execute('SELECT conclusion,cohort FROM run_attempts WHERE run_attempt=1').fetchone(), (None, 'unknown'))
+        self.assertEqual(db.execute("SELECT coverage FROM resource_observations WHERE run_attempt=1 AND kind='resources'").fetchone()[0], 'attempt-not-collected')
+        self.assertIsNone(db.execute('SELECT workflow_sha FROM run_attempts WHERE run_attempt=2').fetchone()[0])
 
     def test_resource_values_never_override_ci_or_landing(self):
         value = run(1, 'b'*40)

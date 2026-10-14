@@ -385,7 +385,8 @@ class Report:
         if rows:
             span = self.db.execute("SELECT MIN(created_at),MAX(created_at) FROM runs WHERE repo='TauCeti'").fetchone()
             self.p(f"Cohort span: {span}; "
-                   f"{len({row[6] for row in rows})} workflow-source revisions. Source revisions, "
+                   f"{len({row[6] for row in rows if row[6]})} known workflow-source revisions; "
+                   f"{sum(not row[6] for row in rows)} attempts lack source provenance. Source revisions, "
                    "attempts and raw pressure/device counters are retained in SQLite for matching comparisons. "
                    "Historical resource gaps are explicit; no 24-hour baseline is required.")
         host_rows, io_rows = [], []
@@ -446,6 +447,9 @@ class Report:
             FROM jobs j JOIN runs r USING(repo,run_id)
             LEFT JOIN merge_builds m USING(repo,run_id)
             WHERE j.repo='TauCeti' AND m.run_id IS NOT NULL""").fetchone()
+        unknown_attempts = self.db.execute("SELECT COUNT(*) FROM jobs WHERE repo='TauCeti' AND run_attempt IS NULL").fetchone()[0]
+        self.p(f"Job attempt identity missing for {unknown_attempts} historical jobs; they are excluded "
+               "from retry attribution. Fresh jobs are bound by the attempt-specific API path.")
         self.p(f"Merge-validation retry execution: {(waste[0] or 0)/60:.1f} minutes; failed/cancelled job "
                f"execution: {(waste[1] or 0)/60:.1f} minutes; CI-success without observed landing: "
                f"{(waste[2] or 0)/60:.1f} minutes. These overlapping cost categories are not summed "

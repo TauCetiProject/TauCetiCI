@@ -346,8 +346,13 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
     # level only, and otherwise a sample of them is (SAMPLE_SHORT); either way marked
     # `jobs_fetched: false`.
     fetch = run.get("conclusion") != "skipped" and needs_jobs(run, jobs_for)
-    jobs = list(gh.paginate(f"repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs", key="jobs",
-                            filter="all")) if fetch else []
+    # Bind jobs to attempts using the API path; historical all-attempt listings
+    # can omit run_attempt, which must never be guessed from the latest attempt.
+    jobs = []
+    if fetch:
+        for attempt in range(1, run.get("run_attempt", 1) + 1):
+            jobs.extend({**job, "run_attempt": attempt} for job in gh.paginate(
+                f"repos/{ORG}/{repo}/actions/runs/{run['id']}/attempts/{attempt}/jobs", key="jobs"))
     detail = enricher is not None and workflow in BUILD_WORKFLOWS
     rec = {
         "schema": SCHEMA,

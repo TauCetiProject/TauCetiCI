@@ -226,17 +226,24 @@ def build(out: Path):
                 ".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
                 ".github/workflows/publish-lake-cache.yml"):
             db.execute("INSERT OR REPLACE INTO run_attempts VALUES (?,?,?,?,?,?)", (
-                r["repo"], r["run_id"], r["run_attempt"], r.get("conclusion"), cohort(r), r["head_sha"]))
+                r["repo"], r["run_id"], r["run_attempt"], r.get("conclusion"), cohort(r),
+                (((r.get("observations") or {}).get("resources") or {}).get("payload") or {}).get("workflow_sha")))
             for kind in ("resources", "publication"):
                 observation = (r.get("observations") or {}).get(kind) or {"coverage": "historical-missing"}
                 db.execute("INSERT OR REPLACE INTO resource_observations VALUES (?,?,?,?,?,?,?)", (
                     r["repo"], r["run_id"], r["run_attempt"], kind, observation["coverage"],
                     observation.get("artifact_id"),
                     json.dumps(observation["payload"]) if observation.get("payload") else None))
+            for attempt in {j.get("run_attempt") for j in r["jobs"]} - {None, r["run_attempt"]}:
+                db.execute("INSERT OR IGNORE INTO run_attempts VALUES (?,?,?,?,?,?)", (
+                    r["repo"], r["run_id"], attempt, None, "unknown", None))
+                for kind in ("resources", "publication"):
+                    db.execute("INSERT OR IGNORE INTO resource_observations VALUES (?,?,?,?,?,?,?)", (
+                        r["repo"], r["run_id"], attempt, kind, "attempt-not-collected", None, None))
         for j in r["jobs"]:
             f = j.get("failure") or {}
             db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                r["repo"], r["run_id"], j["id"], j.get("run_attempt") or r["run_attempt"], j["name"], j.get("conclusion"),
+                r["repo"], r["run_id"], j["id"], j.get("run_attempt"), j["name"], j.get("conclusion"),
                 j.get("created_at"), j.get("started_at"), j.get("completed_at"),
                 seconds(j.get("created_at"), j.get("started_at")) if j.get("status") != "queued" else None,
                 seconds(j.get("started_at"), j.get("completed_at")) if j.get("status") != "queued" else None,

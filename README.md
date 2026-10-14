@@ -126,7 +126,10 @@ historical cohorts are available immediately without a 24-hour baseline gate.
 The derived tables are `run_attempts` (cohort, CI conclusion, workflow source),
 `resource_observations` (coverage and payload per attempt), and `phase_boundaries`
 (trusted API step start/end, including failure/cancel/partial jobs). `jobs.api_status`
-preserves queued/in_progress/completed from the jobs API; a queued job does not
+preserves queued/in_progress/completed from the jobs API; jobs are fetched
+through attempt-specific API paths so earlier execution cannot be mislabeled
+as a retry. Historical missing attempt identity is excluded from retry attribution.
+Earlier attempts without a collected snapshot have explicit coverage gaps; a queued job does not
 contribute execution time. Historical unknown API states remain unknown.
 
 The report separates dependency bumps (cache warmth unknown), ordinary changes
