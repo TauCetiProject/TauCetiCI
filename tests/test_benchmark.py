@@ -99,7 +99,8 @@ class WholeJobTests(unittest.TestCase):
         p = plan()
         rows = BenchmarkTests().records()
         jobs = [dict(name='benchmark (' + s['slot'] + ')', id=i, status='completed', conclusion='success',
-                     started_at='2026-10-14T01:00:00Z', completed_at='2026-10-14T01:02:00Z') for i, s in enumerate(slots(p))]
+                     started_at='2026-10-14T00:50:00Z', completed_at='2026-10-14T01:02:00Z',
+                     runner_name='runner', steps=[dict(started_at='2026-10-14T01:00:00Z')]) for i, s in enumerate(slots(p))]
         report = summarize(p, rows, jobs)
         self.assertEqual(report['groups'][0]['median_unit_minutes'], 16)
         self.assertEqual(report['groups'][1]['median_unit_minutes'], 32)
@@ -188,3 +189,14 @@ class MapBindingTests(unittest.TestCase):
             f.write_text('{"data":"cccccccccccccccc.ltar"}')
             with self.assertRaises(ValueError):
                 verify_mappings(root, map_file)
+
+class QueueCostTests(unittest.TestCase):
+    def test_cancelled_unallocated_job_is_not_billed_as_execution(self):
+        p = plan()
+        slot = slots(p)[0]['slot']
+        job = dict(name=slot, status='completed', conclusion='cancelled', runner_name=None,
+                   started_at='2026-10-14T01:00:00Z', completed_at='2026-10-14T01:20:00Z', steps=[])
+        row = summarize(p, [], [job])['slots'][0]
+        self.assertNotIn('job_estimated_unit_minutes', row)
+        self.assertEqual(row['job_timing_coverage'], 'unallocated-or-timing-unavailable')
+        self.assertEqual(row['status'], 'missing')

@@ -314,3 +314,21 @@ default change. Keeping 8CPU/16GB is a valid result. A justified production chan
 must be a separate human-reviewed TauCeti infrastructure PR with the previous labels
 recorded for immediate revert, followed by a **new** workflow-pinned production
 dispatch and verification. PR #15568's GitHub fallback is separate.
+
+The [first dispatch](https://github.com/TauCetiProject/TauCetiCI/actions/runs/38652074029)
+failed during package setup because the host PATH omitted system sbin directories.
+It produced 14 failed setup records and four missing records; the jobs API accounts
+for 13 failed and five cancelled slots. No TauCeti build phase ran. The complete
+receipt, plan, API lineage, artifact metadata and raw resource/job observations are
+retained in `benchmarks/evidence/38652074029.json.gz`. These are setup/failure
+observations, not runner performance evidence. No measured runner recommendation
+is available. PR #12 fixes the host PATH and adds actual Ubuntu package setup to CI.
+The readiness test additionally verifies full dependency/root-cache preparation,
+trusted drivers and the sandbox boundary, stopping before TauCeti compilation.
+
+Cancelled jobs without an assigned runner and execution steps have no execution
+cost estimate. GitHub can populate `started_at` for these queued jobs; using that
+value would incorrectly bill queue time. Assigned-job estimates start at the first
+execution step. Provider startup, billing rounding and invoice allocation remain
+outside this estimate. The original 18-slot budget remains exhausted; it cannot
+be reset or rerun without explicit user authorization of additional attempts.
