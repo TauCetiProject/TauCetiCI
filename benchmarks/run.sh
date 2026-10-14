@@ -27,7 +27,11 @@ setup() {
     printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' 'profile bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' | sudo tee /etc/apparmor.d/bwrap >/dev/null
     sudo apparmor_parser -r /etc/apparmor.d/bwrap
   fi
-  sudo -n sysctl -w vm.max_map_count=1048576 >/dev/null
+  if [ "$(cat /proc/sys/vm/max_map_count)" -lt 1048576 ]; then
+    sudo -n sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 \
+      || sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 || true
+  fi
+  cat /proc/sys/vm/max_map_count > results/vm-max-map-count.txt
 }
 mathlib() {
   # All cells start from empty job-local dependency/download directories. Only
