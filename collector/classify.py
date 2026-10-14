@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-CLASSIFIER_VERSION = 1
+CLASSIFIER_VERSION = 2
 
 # (class, regex on the first failing step's name). First match wins.
 STEP_RULES: list[tuple[str, str]] = [
@@ -23,7 +23,10 @@ STEP_RULES: list[tuple[str, str]] = [
 # (class, regex on log lines) for failures inside the build step, where build, audits and lints
 # share one step. Checked in order against the failing step's extracted error lines.
 LOG_RULES: list[tuple[str, str]] = [
-    ("timeout", r"watchdog|exceeded .* deadline|timed out|Killed"),
+    # Exit 137 also means an external SIGKILL (for example, OOM). The historical
+    # Lean wrapper calls it a deadline expiry even when the process ran for seconds.
+    ("process-killed", r"(?:^|\s)Killed(?:\s+timeout\b|\s*$)|\bLean exited with code 137\b"),
+    ("timeout", r"\btimed out\b|\bexceeded .* (?:deadline|wall-clock limit)\b"),
     ("infra-cache", r"failed to download artifact|Transferred a partial file"),
     ("lint-env", r"LINT-ENV: FAIL"),
     ("audit-axioms", r"[Aa]xiom"),
@@ -36,6 +39,7 @@ LOG_RULES: list[tuple[str, str]] = [
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 TIMESTAMP = re.compile(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ")
 INTERESTING = re.compile(r"error|FAIL|✖|timed out|Killed|##\[error\]", re.IGNORECASE)
+NON_DIAGNOSTIC = re.compile(r"^(?:✔(?:\s|$)|\+\+?\s)")
 
 
 def excerpt(log: str, start: str | None = None, end: str | None = None, limit: int = 30) -> list[str]:
@@ -53,7 +57,8 @@ def excerpt(log: str, start: str | None = None, end: str | None = None, limit: i
         if lo and hi and TIMESTAMP.match(raw) and not (lo <= raw[:19] <= hi):
             continue
         line = ANSI.sub("", TIMESTAMP.sub("", raw)).strip()
-        if line and INTERESTING.search(line) and "Process completed with exit code" not in line:
+        if (line and not NON_DIAGNOSTIC.match(line) and INTERESTING.search(line)
+                and "Process completed with exit code" not in line):
             out.append(line[:300])
             if len(out) >= limit:
                 break
@@ -69,8 +74,12 @@ def classify(conclusion: str | None, failed_step: str | None, lines: list[str] |
         return "timeout"
     step = failed_step or ""
     if re.search(r"Build exact candidate|lake build|^Build$", step):
+        # Old records contain successful module names such as KilledByRank and
+        # ErrorBound. Filter them here too when rebuilding historical classifications.
+        diagnostics = [ANSI.sub("", line).strip() for line in (lines or [])]
+        diagnostics = [line for line in diagnostics if not NON_DIAGNOSTIC.match(line)]
         for cls, rx in LOG_RULES:
-            if any(re.search(rx, l) for l in (lines or [])):
+            if any(re.search(rx, line) for line in diagnostics):
                 return cls
         return "build-unknown" if lines is None else "lean-error"
     for cls, rx in STEP_RULES:

@@ -11,6 +11,10 @@ Tables
        derive_queue_chains. (group_prs/group_position from the records are superseded: they list
        only the entry's own PR.)
        jobs_fetched: 0 when a backfill recorded the run without its jobs)
+  Failure labels are recomputed from archived excerpts with the current classifier.
+  Raw records retain their original label/version; records without excerpts keep that label.
+  process-killed establishes neither a timeout nor an OOM cause.
+
   jobs(repo, run_id, job_id, run_attempt, name, conclusion, created_at, started_at, completed_at,
        wait_s, run_s, runner_kind, runner_size, labels, failure_class, failed_step, excerpt)
   steps(job_id, n, name, conclusion, started_at, completed_at, run_s)
@@ -42,6 +46,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
+from . import classify
 from .merge_identity import identity, apply_dispatch_title
 from .resources import cohort, phase, verified_observation
 
@@ -259,13 +264,19 @@ def build(out: Path):
                         r["repo"], r["run_id"], attempt, kind, "attempt-not-collected", None, None))
         for j in r["jobs"]:
             f = j.get("failure") or {}
+            # Labels are derived. Reapply current rules to archived evidence so
+            # classifier repairs also correct historical charts without rewriting records.
+            failure_class = f.get("class")
+            if f and f.get("excerpt") is not None:
+                failure_class = classify.classify(j.get("conclusion"), f.get("failed_step"),
+                                                  f["excerpt"])
             db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 r["repo"], r["run_id"], j["id"], j.get("run_attempt"), j["name"], j.get("conclusion"),
                 j.get("created_at"), j.get("started_at"), j.get("completed_at"),
                 seconds(j.get("created_at"), j.get("started_at")) if j.get("status") != "queued" else None,
                 seconds(j.get("started_at"), j.get("completed_at")) if j.get("status") != "queued" else None,
                 j.get("runner_kind"), runner_size(j.get("labels") or []), json.dumps(j.get("labels") or []),
-                f.get("class"), f.get("failed_step"),
+                failure_class, f.get("failed_step"),
                 "\n".join(f["excerpt"]) if f.get("excerpt") else None, j.get("status"),
             ))
             for s in j.get("steps") or []:
