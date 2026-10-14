@@ -38,7 +38,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import classify
+from . import classify, resources
 from .merge_identity import apply_telemetry, apply_dispatch_title
 from .observations import read_days, batch_members
 from .gh import GitHub
@@ -315,6 +315,7 @@ def job_record(job: dict, detail: bool) -> dict:
         "name": job["name"],
         "run_attempt": job.get("run_attempt"),
         "conclusion": job.get("conclusion"),
+        "status": job.get("status"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "completed_at": job.get("completed_at"),
@@ -391,6 +392,16 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
                         "batch_members": json.dumps(members)}})
                 except Exception as e:
                     print(f"batch metadata for run {run['id']} unavailable: {e}", file=sys.stderr)
+        if workflow in (".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
+                        ".github/workflows/publish-lake-cache.yml"):
+            rec["observations"] = resources.observations(gh, repo, run)
+            # Immutable compare metadata distinguishes dependency bumps in historical
+            # staging cohorts even when no resource artifact exists yet.
+            tested = rec.get("tested") or {}
+            if tested.get("base_sha") and tested.get("head_sha") and "diff" not in tested:
+                comparison = enricher.compare(tested["base_sha"], tested["head_sha"])
+                if comparison:
+                    tested["diff"] = enricher.diff_summary(comparison)
         for j, jr in zip(jobs, rec["jobs"]):
             f = enricher.failure(j)
             if f:

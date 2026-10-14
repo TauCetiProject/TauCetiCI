@@ -41,6 +41,7 @@ import re
 import sqlite3
 from pathlib import Path
 from .merge_identity import identity, apply_dispatch_title
+from .resources import cohort, phase
 
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
@@ -60,7 +61,7 @@ CREATE TABLE jobs (
   repo TEXT, run_id INTEGER, job_id INTEGER PRIMARY KEY, run_attempt INTEGER, name TEXT,
   conclusion TEXT, created_at TEXT, started_at TEXT, completed_at TEXT, wait_s REAL, run_s REAL,
   runner_kind TEXT, runner_size TEXT, labels TEXT,
-  failure_class TEXT, failed_step TEXT, excerpt TEXT
+  failure_class TEXT, failed_step TEXT, excerpt TEXT, api_status TEXT
 );
 CREATE TABLE steps (
   job_id INTEGER, n INTEGER, name TEXT, conclusion TEXT, started_at TEXT, completed_at TEXT,
@@ -76,6 +77,13 @@ CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
 CREATE TABLE telemetry (repo TEXT, run_id INTEGER, phases_json TEXT, build_json TEXT, meta_json TEXT,
   PRIMARY KEY (repo, run_id));
+CREATE TABLE resource_observations (repo TEXT, run_id INTEGER, run_attempt INTEGER,
+  kind TEXT, coverage TEXT, artifact_id INTEGER, payload_json TEXT,
+  PRIMARY KEY(repo, run_id, run_attempt, kind));
+CREATE TABLE run_attempts (repo TEXT, run_id INTEGER, run_attempt INTEGER, conclusion TEXT,
+  cohort TEXT, workflow_sha TEXT, PRIMARY KEY(repo, run_id, run_attempt));
+CREATE TABLE phase_boundaries (job_id INTEGER, n INTEGER, phase TEXT, trust TEXT,
+  started_at TEXT, completed_at TEXT, run_s REAL, PRIMARY KEY(job_id,n));
 CREATE TABLE merge_builds (repo TEXT, run_id INTEGER, engine TEXT, head_sha TEXT, base_sha TEXT,
   batch_id INTEGER, members_json TEXT, landed INTEGER, PRIMARY KEY(repo, run_id));
 CREATE TABLE merge_observations (observed_at TEXT PRIMARY KEY, backend TEXT, setting_updated_at TEXT,
@@ -214,21 +222,36 @@ def build(out: Path):
             db.execute("INSERT OR REPLACE INTO telemetry VALUES (?,?,?,?,?)", (
                 r["repo"], r["run_id"], json.dumps(t.get("phases") or []),
                 json.dumps(t.get("build") or {}), json.dumps(t.get("meta") or {})))
+        if r["repo"] == "TauCeti" and r["workflow"] in (
+                ".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
+                ".github/workflows/publish-lake-cache.yml"):
+            db.execute("INSERT OR REPLACE INTO run_attempts VALUES (?,?,?,?,?,?)", (
+                r["repo"], r["run_id"], r["run_attempt"], r.get("conclusion"), cohort(r), r["head_sha"]))
+            for kind in ("resources", "publication"):
+                observation = (r.get("observations") or {}).get(kind) or {"coverage": "historical-missing"}
+                db.execute("INSERT OR REPLACE INTO resource_observations VALUES (?,?,?,?,?,?,?)", (
+                    r["repo"], r["run_id"], r["run_attempt"], kind, observation["coverage"],
+                    observation.get("artifact_id"),
+                    json.dumps(observation["payload"]) if observation.get("payload") else None))
         for j in r["jobs"]:
             f = j.get("failure") or {}
-            db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                r["repo"], r["run_id"], j["id"], j.get("run_attempt"), j["name"], j.get("conclusion"),
+            db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                r["repo"], r["run_id"], j["id"], j.get("run_attempt") or r["run_attempt"], j["name"], j.get("conclusion"),
                 j.get("created_at"), j.get("started_at"), j.get("completed_at"),
-                seconds(j.get("created_at"), j.get("started_at")),
-                seconds(j.get("started_at"), j.get("completed_at")),
+                seconds(j.get("created_at"), j.get("started_at")) if j.get("status") != "queued" else None,
+                seconds(j.get("started_at"), j.get("completed_at")) if j.get("status") != "queued" else None,
                 j.get("runner_kind"), runner_size(j.get("labels") or []), json.dumps(j.get("labels") or []),
                 f.get("class"), f.get("failed_step"),
-                "\n".join(f["excerpt"]) if f.get("excerpt") else None,
+                "\n".join(f["excerpt"]) if f.get("excerpt") else None, j.get("status"),
             ))
             for s in j.get("steps") or []:
                 db.execute("INSERT OR REPLACE INTO steps VALUES (?,?,?,?,?,?,?)", (
                     j["id"], s["n"], s["name"], s.get("conclusion"), s.get("started_at"),
                     s.get("completed_at"), seconds(s.get("started_at"), s.get("completed_at"))))
+                db.execute("INSERT OR REPLACE INTO phase_boundaries VALUES (?,?,?,?,?,?,?)", (
+                    j["id"], s["n"], phase(s["name"]), "github-api-step",
+                    s.get("started_at"), s.get("completed_at"),
+                    seconds(s.get("started_at"), s.get("completed_at"))))
 
     derive_queue_chains(db)
 

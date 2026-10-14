@@ -325,6 +325,148 @@ class Report:
                "runner sizes and coverage. Totals include observed shared/auxiliary costs separately; "
                "unfetched jobs are never silently estimated as zero-cost work.")
 
+    def resources(self):
+        """Observed costs, coverage and cohorts; no decisions consume this report."""
+        self.h("Resource use and accepted throughput (observations only)")
+        self.p("Command CPU time is wait4 user+system time for reaped descendants, not task wall time. "
+               "RSS is the largest process, not simultaneous tree memory. Host utilization, memory, "
+               "pressure and device I/O include other machine activity; stacked device counters can overlap. "
+               "Dependency bumps are separate; cache temperature remains unknown. Candidate-written "
+               "sandbox phase/module telemetry is untrusted. These statistics never authorize merging.")
+        rows = self.db.execute("""SELECT a.repo,a.run_id,a.run_attempt,a.cohort,a.conclusion,
+            r.trigger,a.workflow_sha,o.coverage,o.payload_json,p.coverage,p.payload_json
+            FROM run_attempts a JOIN runs r USING(repo,run_id)
+            LEFT JOIN resource_observations o ON o.repo=a.repo AND o.run_id=a.run_id
+                AND o.run_attempt=a.run_attempt AND o.kind='resources'
+            LEFT JOIN resource_observations p ON p.repo=a.repo AND p.run_id=a.run_id
+                AND p.run_attempt=a.run_attempt AND p.kind='publication'
+            WHERE a.repo='TauCeti' AND r.workflow IN
+                ('.github/workflows/pr-build.yml','.github/workflows/ci.yml',
+                 '.github/workflows/publish-lake-cache.yml')""").fetchall()
+        def number(value):
+            return float(value) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+        groups = defaultdict(list)
+        coverage = defaultdict(int)
+        for row in rows:
+            repo, run, attempt, cohort, conclusion, trigger, source, rc, rp, pc, pp = row
+            sizes = sorted({size or kind or 'unknown' for kind, size in self.db.execute(
+                'SELECT runner_kind,runner_size FROM jobs WHERE repo=? AND run_id=? AND run_attempt=?',
+                (repo, run, attempt))})
+            groups[(cohort, trigger, ','.join(sizes) or 'unknown', conclusion)].append(row)
+            coverage[('resources', rc or 'missing')] += 1
+            coverage[('publication', pc or 'missing')] += 1
+        result = []
+        for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
+            cpu, rss, overhead, busy, samples, covered, partial = [], [], [], [], 0, 0, 0
+            for row in values:
+                payload = json.loads(row[8] or '{}')
+                if row[7] == 'present':
+                    covered += 1
+                    partial += bool(payload.get('missing'))
+                user, system = number(payload.get('command_cpu_user_s')), number(payload.get('command_cpu_system_s'))
+                if user is not None and system is not None:
+                    cpu.append(user + system)
+                for target, field in ((rss, 'command_max_process_rss_bytes'),
+                                      (overhead, 'sampler_cpu_s'), (busy, 'host_cpu_busy_fraction')):
+                    value = number(payload.get(field))
+                    if value is not None:
+                        target.append(value)
+                samples += int(number(payload.get('samples')) or 0)
+            result.append([*key, len(values), f'{covered}/{len(values)}', partial, samples,
+                           f'{sum(cpu):.1f}' if cpu else 'n/a',
+                           f'{max(rss)/1024**2:.1f}' if rss else 'n/a',
+                           f'{quantile(busy,.5):.1%}' if busy else 'n/a',
+                           f'{sum(overhead):.3f}' if overhead else 'n/a'])
+        self.p(table(['Cohort', 'Trigger', 'Runner sizes', 'CI conclusion', 'Attempts',
+                      'Resource artifacts', 'Partial host counters', 'Samples', 'Observed CPU s', 'Max process RSS MiB',
+                      'Median host busy', 'Sampler CPU s'], result))
+        self.p(table(['Observation', 'Coverage', 'Attempts'],
+                     [[*key, value] for key, value in sorted(coverage.items())]))
+        if rows:
+            self.p(f"Cohort span: {self.db.execute('SELECT MIN(created_at),MAX(created_at) FROM runs WHERE repo=\'TauCeti\'').fetchone()}; "
+                   f"{len({row[6] for row in rows})} workflow-source revisions. Source revisions, "
+                   "attempts and raw pressure/device counters are retained in SQLite for matching comparisons. "
+                   "Historical resource gaps are explicit; no 24-hour baseline is required.")
+        host_rows, io_rows = [], []
+        for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
+            peak, pressure, devices = [], defaultdict(float), defaultdict(lambda: defaultdict(float))
+            pressure_samples = 0
+            for row in values:
+                payload = json.loads(row[8] or '{}')
+                value = number(payload.get('host_used_peak_bytes'))
+                if value is not None:
+                    peak.append(value)
+                stalls = payload.get('host_pressure_stall_us') or {}
+                pressure_samples += bool(stalls)
+                for resource, kinds in stalls.items():
+                    for kind, value in kinds.items():
+                        if number(value) is not None:
+                            pressure[resource + '/' + kind] += value / 1e6
+                for device, counters in (payload.get('host_device_io_bytes') or {}).items():
+                    for kind, value in counters.items():
+                        if number(value) is not None:
+                            devices[device][kind] += value
+            host_rows.append([*key, f'{max(peak)/1024**2:.1f}' if peak else 'n/a',
+                              pressure_samples, json.dumps(dict(pressure), sort_keys=True)])
+            for device, counters in sorted(devices.items()):
+                io_rows.append([*key, device, f"{counters.get('read_bytes', 0)/1024**2:.1f}",
+                                f"{counters.get('write_bytes', 0)/1024**2:.1f}"])
+        self.p(table(['Cohort', 'Trigger', 'Runner sizes', 'CI conclusion', 'Sampled host used peak MiB',
+                      'Pressure artifacts', 'Observed pressure stall seconds'], host_rows))
+        self.p(table(['Cohort', 'Trigger', 'Runner sizes', 'CI conclusion', 'Host device',
+                      'Read MiB', 'Write MiB'], io_rows))
+        publications = [json.loads(row[10]) for row in rows if row[9] == 'present' and row[10]]
+        complete = [p for p in publications if p.get('complete') is True]
+        self.p(f"Publication observations: {len(publications)} artifacts, {len(complete)} complete; "
+               f"{sum(p.get('confirmed') is True for p in publications)} public-map confirmations. "
+               f"Complete staged payloads total {sum(number(p.get('staged_bytes')) or 0 for p in complete):.0f} bytes "
+               f"and {sum(number(p.get('staged_objects')) or 0 for p in complete):.0f} objects. "
+               "Staged volume includes the revision map and is attempted payload volume, not measured "
+               "network bytes or unique uploaded objects. A green CI run, confirmed cache publication, "
+               "and landing on main are three distinct observations.")
+        phases = self.db.execute("""SELECT p.phase,COUNT(*),SUM(p.run_s) FROM phase_boundaries p
+            JOIN jobs j ON j.job_id=p.job_id WHERE j.repo='TauCeti'
+            GROUP BY p.phase ORDER BY p.phase""").fetchall()
+        self.p(table(['Trusted API step phase', 'Step boundaries', 'Observed elapsed minutes'],
+                     [[name, count, f'{(seconds or 0)/60:.1f}'] for name,count,seconds in phases]))
+        self.p("API step phases preserve start/end boundaries across success, failure, cancellation "
+               "and partial jobs. The sandbox step combines compile and audits; its finer candidate-written "
+               "boundaries remain untrusted. Queue wait uses job created/start times and API status; "
+               "queued jobs never count as executing, and unknown historical API states remain unknown.")
+        states = self.db.execute("""SELECT COALESCE(api_status,'historical-unknown'),COUNT(*),
+            SUM(wait_s),SUM(run_s) FROM jobs WHERE repo='TauCeti' GROUP BY 1""").fetchall()
+        self.p(table(['API job state', 'Jobs', 'Queue wait minutes', 'Execution minutes'],
+                     [[state, count, f'{(wait or 0)/60:.1f}', f'{(execution or 0)/60:.1f}']
+                      for state,count,wait,execution in states]))
+        waste = self.db.execute("""SELECT
+            SUM(CASE WHEN j.run_attempt>1 THEN j.run_s ELSE 0 END),
+            SUM(CASE WHEN j.conclusion IN ('failure','cancelled') THEN j.run_s ELSE 0 END),
+            SUM(CASE WHEN m.landed=0 AND r.conclusion='success' THEN j.run_s ELSE 0 END)
+            FROM jobs j JOIN runs r USING(repo,run_id)
+            LEFT JOIN merge_builds m USING(repo,run_id)
+            WHERE j.repo='TauCeti' AND m.run_id IS NOT NULL""").fetchone()
+        self.p(f"Merge-validation retry execution: {(waste[0] or 0)/60:.1f} minutes; failed/cancelled job "
+               f"execution: {(waste[1] or 0)/60:.1f} minutes; CI-success without observed landing: "
+               f"{(waste[2] or 0)/60:.1f} minutes. These overlapping cost categories are not summed "
+               "and success without landing is not necessarily waste. Speculation waste is unknown "
+               "until a trusted producer designates speculative attempts; no speculation is inferred from logs.")
+        accepted = defaultdict(set)
+        for members, at in self.db.execute("""SELECT m.members_json,l.landed_at FROM merge_builds m
+            JOIN main_landings l ON l.repo=m.repo AND l.head_sha=m.head_sha WHERE m.repo='TauCeti'"""):
+            for member in json.loads(members):
+                if member.get('pr'):
+                    accepted[at[:10]].add(member['pr'])
+        # A member may occur in several overlapping landed batches. Count its first landing only.
+        seen, throughput = set(), []
+        for day, prs in sorted(accepted.items()):
+            unique = prs - seen
+            seen.update(prs)
+            throughput.append([day, len(unique)])
+        self.p(table(['Landing evidence UTC day', 'Unique accepted PRs'], throughput))
+        self.p("Accepted throughput requires tested-head main-push evidence and deduplicates PRs across "
+               "overlapping batches and reruns. Untimed landings and unknown batch members are excluded; "
+               "push timestamps are upper bounds, and collection gaps limit the denominator.")
+
     # --- coverage ---------------------------------------------------------------------------
 
     def coverage(self):
@@ -707,6 +849,7 @@ def main(argv=None):
     r.simulate(params)
     r.capacity()
     r.merge_backends()
+    r.resources()
     n, k = db.execute(f"""SELECT COUNT(*), SUM(j.conclusion = 'failure') FROM runs r JOIN jobs j USING (repo, run_id)
                           WHERE r.workflow = '{PR_BUILD}' AND r.trigger = 'pr' AND j.name = '{BUILD}'
                             AND j.conclusion IN ('success', 'failure')""").fetchone()
