@@ -41,7 +41,7 @@ import re
 import sqlite3
 from pathlib import Path
 from .merge_identity import identity, apply_dispatch_title
-from .resources import cohort, phase
+from .resources import cohort, phase, verified_observation
 
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
@@ -193,6 +193,11 @@ def build(out: Path):
                    [(c["sha"], c["committed_at"], c.get("pr"), c.get("subject")) for c in main.values()])
 
     for r in records("runs"):
+        # Old raw records remain append-only; derived trusted statistics must
+        # independently verify producer provenance on every rebuild.
+        r = {**r, "observations": {
+            kind: verified_observation(r["repo"], r, kind, observation)
+            for kind, observation in (r.get("observations") or {}).items()}}
         # Historical bors runs without an artifact still contribute their
         # cost. Unknown tested heads never count as landed workflow-source SHAs.
         if r.get("trigger") == "repository_dispatch":

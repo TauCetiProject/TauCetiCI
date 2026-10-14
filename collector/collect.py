@@ -374,6 +374,8 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
         rec.update({
             "head_branch": run.get("head_branch"),
             "head_repo": (run.get("head_repository") or {}).get("full_name"),
+            "workflow_repository": (run.get("repository") or {}).get("full_name"),
+            "referenced_workflows": run.get("referenced_workflows") or [],
             "title": (run.get("display_title") or "")[:200],
             "actor": (run.get("actor") or {}).get("login"),
             "run_started_at": run.get("run_started_at"),

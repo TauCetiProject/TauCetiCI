@@ -11,6 +11,12 @@ import test_merge_reporting
 from test_merge_reporting import run
 
 
+def trusted_record(*args, **kwargs):
+    record = run(*args, **kwargs)
+    record.update(head_branch='main', head_repo='TauCetiProject/TauCeti')
+    return record
+
+
 def archive(payload, name='ci-host-resources.json'):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w') as z:
@@ -21,9 +27,11 @@ def archive(payload, name='ci-host-resources.json'):
 class CollectionTests(unittest.TestCase):
     def setUp(self):
         self.gh = Mock()
-        self.run = {'id': 4, 'run_attempt': 2}
+        self.run = {'id': 4, 'run_attempt': 2, 'path': '.github/workflows/pr-build.yml',
+                    'event': 'repository_dispatch', 'head_branch': 'main', 'head_sha': 'a'*40,
+                    'head_repository': {'full_name': 'TauCetiProject/TauCeti'}}
         self.payload = {'schema': 'tauceti-ci.host-resources/v1', 'trust': 'host',
-                        'run_id': '4', 'run_attempt': 2, 'samples': 2}
+                        'run_id': '4', 'run_attempt': 2, 'samples': 2, 'workflow_sha': 'a'*40}
         self.gh.get.return_value = {'artifacts': [{'id': 7, 'name': 'ci-host-resources-2'}]}
         self.gh.raw.return_value = archive(self.payload)
 
@@ -47,6 +55,51 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(observations(self.gh, 'TauCeti', self.run)['resources']['coverage'], 'invalid-or-unavailable')
         self.gh.get.side_effect = RuntimeError('API failed')
         self.assertEqual(observations(self.gh, 'TauCeti', self.run)['resources']['coverage'], 'unavailable')
+
+    def test_candidate_artifacts_cannot_self_declare_trusted_host(self):
+        self.gh.get.return_value['artifacts'].append({'id': 8, 'name': 'ci-publication-2'})
+        for change in ({'event': 'pull_request'}, {'event': 'pull_request_target'},
+                       {'head_branch': 'candidate', 'event': 'workflow_dispatch'},
+                       {'head_repository': {'full_name': 'candidate/TauCeti'}},
+                       {'path': '.github/workflows/candidate.yml'}, {'head_sha': None}):
+            with self.subTest(change=change):
+                value = {**self.run, **change}
+                values = observations(self.gh, 'TauCeti', value)
+                observation = values['resources']
+                self.assertEqual(observation['coverage'], 'unverified-producer')
+                self.assertIsNone(observation['payload'])
+                self.assertEqual(observation['artifact_id'], 7)
+                self.assertEqual(values['publication']['coverage'], 'unverified-producer')
+        self.assertEqual(observations(self.gh, 'Other', self.run)['resources']['coverage'], 'unverified-producer')
+        self.gh.raw.assert_not_called()
+
+    def test_main_dispatch_and_push_are_trusted_but_wrong_source_sha_is_a_gap(self):
+        for workflow, event in (('pr-build', 'workflow_dispatch'), ('ci', 'push')):
+            value = {**self.run, 'path': f'.github/workflows/{workflow}.yml', 'event': event}
+            self.assertEqual(observations(self.gh, 'TauCeti', value)['resources']['coverage'], 'present')
+        self.gh.raw.return_value = archive({**self.payload, 'workflow_sha': 'b'*40})
+        self.assertEqual(observations(self.gh, 'TauCeti', self.run)['resources']['coverage'], 'unverified-producer')
+
+    def test_target_pr_requires_independent_base_workflow_references(self):
+        reference = {'path': 'TauCetiProject/TauCeti/.github/workflows/pick-runner.yml@' + 'a'*40,
+                     'sha': 'a'*40, 'ref': 'refs/heads/main'}
+        target = {**self.run, 'event': 'pull_request_target', 'head_branch': 'candidate',
+                  'head_sha': 'b'*40, 'head_repository': {'full_name': 'fork/TauCeti'},
+                  'repository': {'full_name': 'TauCetiProject/TauCeti'},
+                  'referenced_workflows': [reference]}
+        self.assertEqual(observations(self.gh, 'TauCeti', target)['resources']['coverage'], 'present')
+        for change in ({'repository': {'full_name': 'fork/TauCeti'}},
+                       {'referenced_workflows': []}, {'event': 'pull_request'},
+                       {'referenced_workflows': [{**reference, 'ref': 'refs/heads/candidate'}]},
+                       {'referenced_workflows': [{**reference, 'sha': 'b'*40}]},
+                       {'referenced_workflows': [reference, {
+                           'path': 'TauCetiProject/TauCeti/.github/workflows/publish-lake-cache.yml@' + 'b'*40,
+                           'ref': 'refs/heads/main', 'sha': 'b'*40}]}):
+            with self.subTest(change=change):
+                self.gh.raw.reset_mock()
+                self.assertEqual(observations(self.gh, 'TauCeti', {**target, **change})['resources']['coverage'],
+                                 'unverified-producer')
+                self.gh.raw.assert_not_called()
 
     def test_oversized_zip_payload_is_not_decompressed(self):
         self.gh.get.return_value['artifacts'][0]['size_in_bytes'] = 2**21
@@ -83,14 +136,28 @@ class CollectionTests(unittest.TestCase):
 
 class ResourceReportTests(unittest.TestCase):
     database = test_merge_reporting.ReportingTests.database
+    def test_rebuild_preserves_api_attested_target_observations(self):
+        value = run(1, 'b'*40)
+        value.update(event='pull_request_target', head_repo='fork/TauCeti',
+                     head_branch='candidate', workflow_repository='TauCetiProject/TauCeti',
+                     referenced_workflows=[{
+                         'path': 'TauCetiProject/TauCeti/.github/workflows/pick-runner.yml@' + 'c'*40,
+                         'ref': 'refs/heads/main', 'sha': 'c'*40}])
+        value['observations'] = {'resources': {'coverage': 'present', 'payload': {
+            'workflow_sha': 'c'*40, 'dependency_bump': '0'}}}
+        db = self.database([value])
+        self.assertEqual(db.execute('SELECT cohort,workflow_sha FROM run_attempts').fetchone(), ('ordinary', 'c'*40))
+        self.assertEqual(db.execute("SELECT coverage FROM resource_observations WHERE kind='resources'").fetchone()[0], 'present')
+
     def test_failure_cancel_partial_rerun_and_publication_separate_from_landing(self):
-        runs = [run(1, 'b'*40), run(1, 'b'*40, attempt=2), run(2, 'c'*40), run(3, 'd'*40)]
+        runs = [trusted_record(1, 'b'*40), trusted_record(1, 'b'*40, attempt=2),
+                trusted_record(2, 'c'*40), trusted_record(3, 'd'*40)]
         for value, conclusion in zip(runs, ('failure', 'success', 'cancelled', 'success')):
             value['conclusion'] = conclusion
             value['jobs'][0].update(conclusion=conclusion, status='completed')
         runs[1]['observations'] = {
             'resources': {'coverage': 'present', 'artifact_id': 7,
-                'payload': {'command_accounting_scope': 'reaped-descendants', 'dependency_bump': '1', 'samples': 2, 'command_cpu_user_s': 3,
+                'payload': {'workflow_sha': 'a'*40, 'command_accounting_scope': 'reaped-descendants', 'dependency_bump': '1', 'samples': 2, 'command_cpu_user_s': 3,
                             'command_cpu_system_s': 1, 'command_max_process_rss_bytes': 2**20}},
             'publication': {'coverage': 'present', 'payload': {'complete': True, 'staged_objects': 3,
                              'staged_bytes': 40, 'uploaded': True, 'confirmed': False}}}
@@ -112,9 +179,9 @@ class ResourceReportTests(unittest.TestCase):
 
     def test_direct_child_or_legacy_accounting_does_not_claim_sandbox_cost(self):
         for scope in (None, 'direct-child-only', 'reaped-descendants'):
-            value = run(1, 'b'*40)
+            value = trusted_record(1, 'b'*40)
             value['observations'] = {'resources': {'coverage': 'present', 'payload': {
-                'command_accounting_scope': scope, 'command_cpu_user_s': 100,
+                'workflow_sha': 'a'*40, 'command_accounting_scope': scope, 'command_cpu_user_s': 100,
                 'command_cpu_system_s': 1, 'command_max_process_rss_bytes': 123 * 2**20,
                 'host_cpu_busy_fraction': .25}}}
             report = Report(self.database([value]))
@@ -147,6 +214,28 @@ class ResourceReportTests(unittest.TestCase):
         db = self.database([value])
         self.assertEqual(db.execute('SELECT conclusion FROM runs').fetchone()[0], 'failure')
         self.assertEqual(db.execute('SELECT landed FROM merge_builds').fetchone()[0], 0)
+
+    def test_rebuild_rejects_old_self_labelled_payloads_and_cohort_flags(self):
+        for change in ({'event': 'pull_request'}, {'head_branch': 'candidate'},
+                       {'head_repo': None}, {'head_sha': 'e'*40}):
+            with self.subTest(change=change):
+                value = trusted_record(1, 'b'*40)
+                value.update(change)
+                value['tested']['diff'] = {'paths': ['TauCeti/A.lean']}
+                value['observations'] = {
+                    'resources': {'coverage': 'present', 'artifact_id': 7, 'payload': {
+                        'workflow_sha': 'a'*40, 'dependency_bump': '1', 'command_cpu_user_s': 999}},
+                    'publication': {'coverage': 'present', 'artifact_id': 8,
+                                    'payload': {'staged_bytes': 999, 'confirmed': True}}}
+                db = self.database([value])
+                resource = db.execute("SELECT coverage,payload_json FROM resource_observations WHERE kind='resources'").fetchone()
+                self.assertEqual(resource, ('unverified-producer', None))
+                self.assertEqual(db.execute('SELECT cohort,workflow_sha FROM run_attempts').fetchone(), ('ordinary', None))
+                # A payload SHA mismatch cannot authenticate resources, but the
+                # independently trusted publisher context still authenticates publication.
+                if 'head_sha' not in change:
+                    self.assertEqual(db.execute("SELECT coverage,payload_json FROM resource_observations WHERE kind='publication'").fetchone(),
+                                     ('unverified-producer', None))
 
 
 if __name__ == '__main__':

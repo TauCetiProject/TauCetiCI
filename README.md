@@ -123,6 +123,18 @@ borrowing earlier measurements. Missing, expired, partial and invalid telemetry
 is nonfatal and visible. Deploy the TauCeti producer first to populate new metrics;
 historical cohorts are available immediately without a 24-hour baseline gate.
 
+Artifact names and self-reported trust labels do not establish producer trust.
+The collector independently requires GitHub API provenance for TauCeti main-source
+`pr-build` dispatches or `ci` main pushes/dispatches. For `pull_request_target`,
+it requires the base repository and consistent pinned main references to known
+reusable workflows from the API; the run's head fields describe the candidate.
+Host observations must also match the independently established workflow SHA.
+Candidate PR workflows, branch dispatches and contexts
+without independently verified source provenance produce visible
+`unverified-producer` gaps. Historical target runs without those API references
+also remain unverified. Database rebuilds apply the same
+rule to historical records, and unverified dependency flags cannot set cohorts.
+
 The derived tables are `run_attempts` (cohort, CI conclusion, workflow source),
 `resource_observations` (coverage and payload per attempt), and `phase_boundaries`
 (trusted API step start/end, including failure/cancel/partial jobs). `jobs.api_status`
