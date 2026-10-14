@@ -67,7 +67,17 @@ jobs:
           if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
           git commit -qm "records: $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3 4 5; do
-            git pull -q --rebase origin main && git push -q origin HEAD:main && exit 0
+            git fetch -q origin main || { sleep $((i * 10)); continue; }
+            if ! git rebase origin/main; then
+              # Only the two JSON watermarks have a safe automatic resolution.
+              # Keep conservative coverage; never discard either writer's records.
+              if ! python3 -m collector.resolve_cursors \
+                  || ! GIT_EDITOR=true git rebase --continue; then
+                git rebase --abort || true
+                exit 1
+              fi
+            fi
+            git push -q origin HEAD:main && exit 0
             sleep $((i * 10))
           done
           exit 1
