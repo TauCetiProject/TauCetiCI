@@ -339,7 +339,8 @@ def needs_jobs(run: dict, jobs_for: str) -> bool:
     return jobs_for == "all" and run["id"] % SAMPLE_SHORT == 0
 
 
-def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs_for: str) -> dict:
+def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs_for: str,
+               *, batch_fallback: bool = True) -> dict:
     workflow = run.get("path") or run.get("name")
     # A run skipped by its `if:` never reached a runner; its jobs carry nothing worth a call. With
     # `jobs_for="build"` (backfills of long periods) the high-volume workflows are recorded at run
@@ -390,7 +391,7 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
             if t:
                 rec["telemetry"] = t
                 apply_telemetry(rec, t)
-            if rec.get("merge_metadata_pending") and rec["tested"].get("batch_id"):
+            if batch_fallback and rec.get("merge_metadata_pending") and rec["tested"].get("batch_id"):
                 try:
                     tested = rec["tested"]
                     members = batch_members(tested["batch_id"], tested["head_sha"])
