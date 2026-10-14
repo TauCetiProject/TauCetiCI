@@ -2,6 +2,7 @@
 import io
 import json
 import math
+import re
 import zipfile
 
 LIMIT = 1024 * 1024
@@ -9,6 +10,58 @@ ARTIFACTS = {
     'resources': ('ci-host-resources', 'ci-host-resources.json', 'tauceti-ci.host-resources/v1', 'host'),
     'publication': ('ci-publication', 'ci-publication.json', 'tauceti-ci.publication/v1', 'publisher-host'),
 }
+
+
+def producer_sha(repo, run):
+    """Require API provenance, independently of artifact-controlled labels.
+
+    For target PRs, API head fields describe the candidate, not the harness.
+    Require the API's pinned main reusable-workflow references in that context.
+    The same check handles stored records without trusting payload assertions.
+    """
+    workflow = run.get('path') or run.get('workflow')
+    events = {
+        '.github/workflows/pr-build.yml': ('repository_dispatch', 'workflow_dispatch'),
+        '.github/workflows/ci.yml': ('push', 'workflow_dispatch'),
+    }
+    repository = (run.get('repository') or {}).get('full_name') or run.get('workflow_repository')
+    if repo != 'TauCeti' or repository not in (None, 'TauCetiProject/TauCeti'):
+        return None
+    if workflow == '.github/workflows/pr-build.yml' and run.get('event') == 'pull_request_target':
+        if repository != 'TauCetiProject/TauCeti':
+            return None
+        sources = set()
+        for reference in run.get('referenced_workflows') or []:
+            sha = reference.get('sha')
+            path = reference.get('path', '')
+            if path.split('@')[0] not in (
+                    'TauCetiProject/TauCeti/.github/workflows/pick-runner.yml',
+                    'TauCetiProject/TauCeti/.github/workflows/publish-lake-cache.yml'):
+                continue
+            if (reference.get('ref') != 'refs/heads/main' or not isinstance(sha, str)
+                    or re.fullmatch(r'[0-9a-f]{40}', sha) is None or not path.endswith('@' + sha)):
+                return None
+            sources.add(sha)
+        return next(iter(sources)) if len(sources) == 1 else None
+    head_repo = (run.get('head_repository') or {}).get('full_name') or run.get('head_repo')
+    if (head_repo == 'TauCetiProject/TauCeti'
+            and run.get('head_branch') == 'main'
+            and run.get('event') in events.get(workflow, ())
+            and isinstance(run.get('head_sha'), str)
+            and re.fullmatch(r'[0-9a-f]{40}', run['head_sha']) is not None):
+        return run['head_sha']
+    return None
+
+
+def verified_observation(repo, run, kind, observation):
+    """Recheck stored observations too, so rebuilding removes old self-label trust."""
+    if observation.get('coverage') != 'present':
+        return observation
+    payload = observation.get('payload') or {}
+    source = producer_sha(repo, run)
+    if not source or (kind == 'resources' and payload.get('workflow_sha') != source):
+        return {**observation, 'coverage': 'unverified-producer', 'payload': None}
+    return observation
 
 
 def validate(payload, kind):
@@ -56,6 +109,10 @@ def observations(gh, repo, run):
         if artifact.get('expired'):
             result[key]['coverage'] = 'expired'
             continue
+        if not producer_sha(repo, run):
+            result[key] = {'coverage': 'unverified-producer',
+                           'artifact_id': artifact['id'], 'payload': None}
+            continue
         try:
             if artifact.get('size_in_bytes', 0) > LIMIT:
                 raise ValueError('oversized artifact')
@@ -73,7 +130,8 @@ def observations(gh, repo, run):
                     or payload.get('run_attempt') != run.get('run_attempt', 1)):
                 raise ValueError('observation provenance mismatch')
             validate(payload, key)
-            result[key] = {'coverage': 'present', 'artifact_id': artifact['id'], 'payload': payload}
+            result[key] = verified_observation(repo, run, key, {
+                'coverage': 'present', 'artifact_id': artifact['id'], 'payload': payload})
         except Exception:
             result[key]['coverage'] = 'invalid-or-unavailable'
     return result
@@ -81,7 +139,9 @@ def observations(gh, repo, run):
 
 def cohort(record):
     """Cache temperature is never inferred from success or a dependency change."""
-    payload = ((record.get('observations') or {}).get('resources') or {}).get('payload') or {}
+    observation = (record.get('observations') or {}).get('resources') or {}
+    observation = verified_observation(record.get('repo'), record, 'resources', observation)
+    payload = (observation.get('payload') or {}) if observation.get('coverage') == 'present' else {}
     bump = payload.get('dependency_bump')
     if bump == '1':
         return 'dependency-bump (warmth unknown)'
