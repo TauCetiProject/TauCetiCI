@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Invoked by the main-defined benchmark workflow; never by candidate code.
 set -euo pipefail
-export PATH="$HOME/.elan/bin:/usr/bin:/bin"
+export PATH="$HOME/.elan/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export MATHLIB_CACHE_DIR="$RUNNER_TEMP/benchmark-mathlib"
 export LAKE_CACHE_DIR="$PWD/pr/.lake/cache"
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true LAKE_NO_CACHE=true

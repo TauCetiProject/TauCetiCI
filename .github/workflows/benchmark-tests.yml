@@ -22,3 +22,10 @@ jobs:
       - run: python -m unittest discover -s tests
       - run: python -m compileall -q collector analysis benchmarks
       - run: bash -n benchmarks/run.sh
+      - name: Exercise Ubuntu package setup with the actual host PATH
+        run: |
+          set -euo pipefail
+          mkdir -p pr
+          printf '%s\n' leanprover/lean4:v4.35.0-rc3 > pr/lean-toolchain
+          HARNESS_SHA="$GITHUB_SHA" HEAD_SHA=4f1a681d10b8371c56bc49158b0481d18bd949f5 CACHE_SHA=cold \
+            bash benchmarks/run.sh phase setup
