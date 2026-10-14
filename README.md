@@ -135,6 +135,16 @@ without independently verified source provenance produce visible
 also remain unverified. Database rebuilds apply the same
 rule to historical records, and unverified dependency flags cannot set cohorts.
 
+The hourly `collect resources` workflow independently samples recent completed
+`pr-build`/`ci` runs, so a slow full-history collection cannot stall new resource
+data. It lists at most 100 runs per workflow within six hours, attempts at most
+20 new trusted runs, caps API requests at 150 and starts no requests after five
+minutes. It defers quota waits; the job timeout is 15 minutes. This recent sample
+is neither exhaustive nor random. Each record carries `collection_scope`, and
+`records/resource-refresh/` receipts expose list truncation, run/API caps, missing
+artifacts and deferred work. No general completeness cursor advances. Manual
+dispatch can name up to 20 completed runs for reproducible verification.
+
 The derived tables are `run_attempts` (cohort, CI conclusion, workflow source),
 `resource_observations` (coverage and payload per attempt), and `phase_boundaries`
 (trusted API step start/end, including failure/cancel/partial jobs). `jobs.api_status`

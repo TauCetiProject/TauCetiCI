@@ -16,6 +16,10 @@ import urllib.request
 API = "https://api.github.com"
 
 
+class RateLimitUnavailable(RuntimeError):
+    pass
+
+
 def _token() -> str:
     tok = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if tok:
@@ -25,13 +29,15 @@ def _token() -> str:
 
 
 class GitHub:
-    def __init__(self, min_remaining: int = int(os.environ.get("MIN_REMAINING", "100"))):
+    def __init__(self, min_remaining: int = int(os.environ.get("MIN_REMAINING", "100")),
+                 wait_for_rate_limit: bool = True):
         self.token = _token()
         self.min_remaining = min_remaining
         self.calls = 0
         self.remaining: int | None = None
         self.reset: int | None = None
         self._lock = threading.Lock()
+        self.wait_for_rate_limit = wait_for_rate_limit
 
     def _count(self, headers: dict | None = None):
         with self._lock:
@@ -40,11 +46,16 @@ class GitHub:
                 self.remaining = int(headers["x-ratelimit-remaining"])
                 self.reset = int(headers.get("x-ratelimit-reset", "0"))
 
+    def before_request(self):
+        """Optional request budget hook, including each retry and artifact request."""
+
     def _request(self, url: str, accept: str = "application/vnd.github+json") -> tuple[bytes, dict]:
         if not url.startswith("http"):
             url = f"{API}/{url.lstrip('/')}"
         for attempt in range(6):
             if self.remaining is not None and self.remaining < self.min_remaining and self.reset:
+                if not self.wait_for_rate_limit:
+                    raise RateLimitUnavailable('rate-limit reserve reached; not waiting across reset')
                 wait = max(0, self.reset - time.time()) + 5
                 print(f"rate limit low ({self.remaining}); sleeping {wait:.0f}s", file=sys.stderr)
                 time.sleep(wait)
@@ -55,6 +66,7 @@ class GitHub:
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "tauceti-ci-collector",
             })
+            self.before_request()
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     headers = {k.lower(): v for k, v in resp.headers.items()}
@@ -65,11 +77,15 @@ class GitHub:
                 if e.code in (404, 410, 422):
                     raise
                 if e.code in (403, 429) and e.headers.get("x-ratelimit-remaining") == "0":
+                    if not self.wait_for_rate_limit:
+                        raise RateLimitUnavailable('rate limit exhausted; not waiting across reset') from e
                     wait = max(0, int(e.headers.get("x-ratelimit-reset", "0")) - time.time()) + 5
                     print(f"rate limited; sleeping {wait:.0f}s", file=sys.stderr)
                     time.sleep(wait)
                     continue
                 if e.code in (403, 429) and e.headers.get("retry-after"):
+                    if not self.wait_for_rate_limit:
+                        raise RateLimitUnavailable('rate limit retry requested; bounded refresh deferred') from e
                     time.sleep(int(e.headers["retry-after"]) + 1)
                     continue
                 if e.code >= 500 or e.code in (403, 429):
@@ -109,6 +125,7 @@ class GitHub:
         opener = urllib.request.build_opener(NoRedirect)
         req = urllib.request.Request(f"{API}/{path.lstrip('/')}", headers={
             "Authorization": f"Bearer {self.token}", "User-Agent": "tauceti-ci-collector"})
+        self.before_request()
         self._count()
         try:
             with opener.open(req, timeout=60) as resp:

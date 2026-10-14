@@ -334,6 +334,9 @@ class Report:
                "pressure and device I/O include other machine activity; stacked device counters can overlap. "
                "Dependency bumps are separate; cache temperature remains unknown. Candidate-written "
                "sandbox phase/module telemetry is untrusted. These statistics never authorize merging.")
+        self.p("The independent hourly resource refresh is a bounded recent sample, not exhaustive or random coverage. "
+               "Raw collection_scope metadata and records/resource-refresh receipts expose its lookback, listing truncation "
+               "and run/API budgets. The general collection cursor remains the completeness boundary.")
         rows = self.db.execute("""SELECT a.repo,a.run_id,a.run_attempt,a.cohort,a.conclusion,
             r.trigger,a.workflow_sha,o.coverage,o.payload_json,p.coverage,p.payload_json
             FROM run_attempts a JOIN runs r USING(repo,run_id)

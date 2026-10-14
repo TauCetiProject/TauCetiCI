@@ -1,0 +1,47 @@
+name: collect resources
+
+on:
+  schedule:
+    - cron: "47 * * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Optional comma-separated completed TauCeti run IDs; empty samples recent runs"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-resources
+  cancel-in-progress: false
+
+jobs:
+  resources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect bounded resource sample
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOURCE_RUN_IDS: ${{ inputs.runs }}
+        run: |
+          set -o pipefail
+          python3 -m collector.refresh_resources | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Commit and push append-only observations
+        if: ${{ always() && !cancelled() }}
+        run: |
+          git config user.name "tauceti-ci-collector"
+          git config user.email "tauceti-ci-collector@users.noreply.github.com"
+          git add records
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          git commit -qm "records: bounded resource refresh $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3 4 5; do
+            git fetch -q origin main || { sleep $((i * 10)); continue; }
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            git push -q origin HEAD:main && exit 0
+            sleep $((i * 10))
+          done
+          exit 1
