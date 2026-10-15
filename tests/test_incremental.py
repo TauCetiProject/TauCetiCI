@@ -161,6 +161,74 @@ class IncrementalTests(unittest.TestCase):
         self.assertFalse(cursor)
         self.assertFalse(self.read('inventory-coverage'))
 
+    def test_low_full_page_count_is_probed_before_certifying_completeness(self):
+        items = [run(n, stamp=collect.iso(self.since+dt.timedelta(seconds=n*6))) for n in range(260)]
+        class UndercountAPI(ListingAPI):
+            def get(api, *args, **kwargs):
+                result = super().get(*args, **kwargs)
+                lo, hi = kwargs['created'].split('..')
+                if collect.parse_time(hi)-collect.parse_time(lo) > dt.timedelta(minutes=15):
+                    result['total_count'] = 200
+                return result
+        api = UndercountAPI(items)
+        cursor = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            inc.scan(api, self.index, 'TauCeti', self.since, self.until, 'low', self.checkpoint, cursor)
+        self.assertEqual({r['run_id'] for r in self.read('inventory')}, set(range(260)))
+        self.assertEqual(cursor['TauCeti'], collect.iso(self.until))
+        self.assertEqual(api.requests[2][1], 3)  # Probe the undisclosed final page.
+
+    def test_underreported_zero_and_partial_counts_do_not_discard_returned_rows(self):
+        for reported in (0, 1):
+            with self.subTest(reported=reported):
+                items = [run(500+reported*10+n, stamp=collect.iso(self.since+dt.timedelta(minutes=n*20))) for n in range(2)]
+                class LowAPI(ListingAPI):
+                    def get(api, *args, **kwargs):
+                        result = super().get(*args, **kwargs)
+                        lo, hi = kwargs['created'].split('..')
+                        if collect.parse_time(hi)-collect.parse_time(lo) > dt.timedelta(minutes=15):
+                            result['total_count'] = reported
+                        return result
+                api = LowAPI(items)
+                cursor = {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    inc.scan(api, self.index, 'TauCeti', self.since, self.until, 'zero', self.checkpoint, cursor)
+                self.assertTrue({r['id'] for r in items} <= {r['run_id'] for r in self.read('inventory')})
+                self.assertEqual(cursor['TauCeti'], collect.iso(self.until))
+                self.assertEqual(len(api.requests), 3)
+
+    def test_bad_second_after_a_valid_half_keeps_records_and_has_bounded_descent(self):
+        items = [run(n, stamp=collect.iso(self.since+dt.timedelta(minutes=n*10+1))) for n in range(3)]
+        ghost = collect.iso(self.since+dt.timedelta(minutes=15, seconds=5))
+        class GhostAPI(ListingAPI):
+            def get(api, *args, **kwargs):
+                result = super().get(*args, **kwargs)
+                lo, hi = kwargs['created'].split('..')
+                result['total_count'] += int(lo <= ghost <= hi)
+                return result
+        api = GhostAPI(items)
+        cursor = {}
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'one second'):
+            inc.scan(api, self.index, 'TauCeti', self.since, self.until, 'ghost', self.checkpoint, cursor)
+        self.assertEqual({r['run_id'] for r in self.read('inventory')}, {0, 1, 2})
+        self.assertFalse(cursor)
+        self.assertFalse(self.read('inventory-coverage'))
+        self.assertLessEqual(len(api.requests), 30)
+
+    def test_budget_stop_during_the_final_page_probe_preserves_records_but_not_coverage(self):
+        class LimitedAPI(ListingAPI):
+            def get(api, *args, **kwargs):
+                if api.requests:
+                    raise inc.CollectionStopped('API budget')
+                return super().get(*args, **kwargs)
+        cursor = {}
+        with self.assertRaises(inc.CollectionStopped):
+            inc.scan(LimitedAPI([run(n) for n in range(100)]), self.index, 'TauCeti', self.since,
+                     self.until, 'probe', self.checkpoint, cursor)
+        self.assertEqual(len(self.read('inventory')), 100)
+        self.assertFalse(cursor)
+        self.assertFalse(self.read('inventory-coverage'))
+
     def test_cache_reads_only_new_files_and_rejects_records_absent_from_checkout(self):
         self.inventory(run())
         self.assertEqual(self.index.sync(), 0)

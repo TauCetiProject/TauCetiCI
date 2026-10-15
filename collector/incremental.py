@@ -225,19 +225,24 @@ def list_window(gh, repo, since, until, page_done):
     path = f'repos/{collect.ORG}/{repo}/actions/runs'
     first = gh.get(path, created=query, per_page=100, page=1)
     total = first['total_count']
-    def divide(reason):
+    def divide(reason, *, report=True):
         seconds = int((until-since).total_seconds())
         if seconds <= 1:
             raise RuntimeError(f'{repo} {query}: {reason} in one second; inventory coverage left open')
-        print(f'{repo} {query}: {reason}; retrying smaller inventory windows', flush=True)
+        if report:
+            print(f'{repo} {query}: {reason}; retrying smaller inventory windows', flush=True)
         middle = since + dt.timedelta(seconds=seconds//2)
         list_window(gh, repo, since, middle, page_done)
         list_window(gh, repo, middle, until, page_done)
     if total >= 1000:
-        divide('>=1000 runs')
+        divide('>=1000 runs', report=False)
         return
     count, seen = 0, set()
-    for page in range(1, max((total+99)//100, bool(first['workflow_runs'])) + 1):
+    pages = (total+99)//100
+    if first['workflow_runs']:
+        pages = max(1, pages)  # Retain rows even if the count incorrectly says zero.
+    last_full = False
+    for page in range(1, pages + 1):
         value = first if page == 1 else gh.get(path, created=query, per_page=100, page=page)
         items = value['workflow_runs']
         if not items:
@@ -249,8 +254,15 @@ def list_window(gh, repo, since, until, page_done):
         page_done(items)
         count += len(items)
         seen.update(r['id'] for r in items)
+        last_full = len(items) == 100
     if count != total or len(seen) != total:
         divide(f'incomplete listing ({len(seen)} distinct runs, reported {total})')
+    elif last_full:
+        # An undercount that is a multiple of 100 otherwise looks complete.
+        extra = gh.get(path, created=query, per_page=100, page=pages+1)['workflow_runs']
+        if extra:
+            page_done(extra)
+            divide(f'listing continues past reported total {total}')
 
 
 def scan(gh, index, repo, since, until, stamp, checkpoint, cursor=None, cursor_name='inventory-cursor.json', jobs_for='all'):
