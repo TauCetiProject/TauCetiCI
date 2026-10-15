@@ -245,6 +245,12 @@ simulator is retained and labelled as a historical illustration.
 ## Controlled runner experiment (#16245)
 
 `runner-benchmark.yml` is a separate, manual, read-only experiment in **TauCetiCI**.
+The bounded experiment is complete: [results and limitations](benchmarks/RESULTS.md)
+recommend retaining 8CPU/16GB. All 18 replacement slots built and passed audits,
+then failed the same full-library lint finding; no successful whole-pipeline
+performance claim or production runner change is made. The consumed budget
+does not permit another workload dispatch.
+
 It does not dispatch `pr-build`, post production statuses, record approvals, save
 Actions caches, attach persistent cache volumes, or invoke a publisher. Its token
 has only contents/actions read permission; checkout credentials are removed.
@@ -286,13 +292,12 @@ missing and timed-out replacement slots consume this budget and are not replaced
 Concurrency remains three at ordinary priority, without persistent caches or
 production authority.
 
-After review and landing, dispatch once:
+The approved replacement was dispatched once after landing as run `38665598590`.
+Do not repeat it. To reproduce its report from retained artifacts:
 
 ```sh
-gh workflow run runner-benchmark.yml --repo TauCetiProject/TauCetiCI --ref main
-gh run watch RUN_ID --repo TauCetiProject/TauCetiCI --exit-status --interval 120
-gh api repos/TauCetiProject/TauCetiCI/actions/runs/RUN_ID/jobs --paginate --slurp > jobs.json
-gh run download RUN_ID --repo TauCetiProject/TauCetiCI --dir benchmark-results
+gh api repos/TauCetiProject/TauCetiCI/actions/runs/38665598590/attempts/1/jobs --paginate --slurp > jobs.json
+gh run download 38665598590 --repo TauCetiProject/TauCetiCI --dir benchmark-results
 python3 -m benchmarks.experiment report --directory benchmark-results --jobs jobs.json
 ```
 
@@ -309,7 +314,7 @@ They exclude checkout/provisioning/artifact overhead; use the final jobs API sta
 and completion times for whole-job cost, and the provider invoice for actual
 billing. Neither cost model includes shared plan allocation or storage charges.
 
-Recommendations require both repetitions on baseline and candidate, at least 10%
+Runner promotions require two successful repetitions on baseline and candidate, at least 10%
 less median elapsed and at most 10% greater compute cost. The two-run sample is a
 bounded experiment, not a statistical guarantee or whole-pipeline throughput claim.
 Review per-workload resource/phase data and whole-job costs before proposing any
@@ -324,8 +329,10 @@ It produced 14 failed setup records and four missing records; the jobs API accou
 for 13 failed and five cancelled slots. No TauCeti build phase ran. The complete
 receipt, plan, API lineage, artifact metadata and raw resource/job observations are
 retained in `benchmarks/evidence/38652074029.json.gz`. These are setup/failure
-observations, not runner performance evidence. No measured runner recommendation
-is available. PR #12 fixes the host PATH and adds actual Ubuntu package setup to CI.
+observations, not runner performance evidence. Replacement performance observations
+and their failed-lint limitation are retained in
+`benchmarks/evidence/38665598590.json.gz` and [RESULTS.md](benchmarks/RESULTS.md).
+PR #12 fixes the host PATH and adds actual Ubuntu package setup to CI.
 The readiness test additionally verifies full dependency/root-cache preparation,
 trusted drivers and the sandbox boundary, stopping before TauCeti compilation.
 
