@@ -15,25 +15,31 @@ The records answer, for each CI run:
 ## Layout
 
 ```
-records/runs/<repo>/<yyyy>/<mm>/<dd>/<collected-at>.ndjson.gz   one line per completed run
-records/main/<repo>/<yyyy>/<mm>/<dd>/<collected-at>.ndjson.gz   main's history (what landed when)
-records/settings/<repo>/<observed-at>.json                     rulesets (merge queue) when changed
-collector/                                                     collection and database code
+records/inventory/<repo>/<yyyy>/<mm>/<dd>/*.ndjson.gz  listing metadata, all statuses
+records/jobs/<repo>/<yyyy>/<mm>/<dd>/*.ndjson.gz       fetched jobs for one attempt
+records/runs/<repo>/<yyyy>/<mm>/<dd>/*.ndjson.gz       optional enriched run snapshots
+records/inventory-coverage/<repo>/**/*.ndjson.gz      completed discovery intervals
+records/merge-members/<repo>/**/*.ndjson.gz           independently fetched bors batch membership
+records/observations/**/*.ndjson.gz                  bors readiness snapshots
+records/main/<repo>/**/*.ndjson.gz                   main's history (what landed when)
+records/settings/<repo>/<observed-at>.json           changed rulesets
+collector/                                           collection and database code
 ```
 
-Record files are dated by the run's `created_at`, written once, and never rewritten. A run appears
-once per attempt; a re-run adds a record for the new attempt.
+Record files are dated by the run's `created_at`, written atomically, and never rewritten.
+Metadata, jobs and optional details are separate snapshots of the same run attempt; a retry
+has its own attempt identity. The derived database combines them without allowing a basic
+snapshot to erase enriched data. Active runs have no terminal result until a later scan.
 
-Every run carries its jobs. Runs of TauCeti's build workflows (`pr-build`, `ci`, `nightly-verify`,
-`pr-profile`, `lint-full`, `pages`) also carry steps, `tested` (the commits), and a `failure`
-object on each failed job. The high-volume label, notification and merge-bot workflows are
-recorded with jobs only, and only for one run in four (chosen by run id); the rest, and all of them
-in long backfills, are recorded at run level (`jobs_fetched: false`). The sample keeps their queue
-waits unbiased at a quarter of the API cost.
+All TauCeti build workflows (`pr-build`, `ci`, `nightly-verify`, `pr-profile`, `lint-full`,
+`pages`) have their jobs collected. The high-volume label, notification and merge-bot
+workflows have their jobs sampled one run in four, chosen by run id. Optional build details
+include steps, tested commits, failure excerpts and trusted resource artifacts. Pending job
+work is explicit; missing optional artifacts do not pin job coverage.
 
 ## Querying
 
-A SQLite database is rebuilt every three hours from the records and published as `ci.sqlite.gz` on the
+A SQLite database is rebuilt after collection, with a three-hour fallback schedule, and published as `ci.sqlite.gz` on the
 [`db` release](https://github.com/TauCetiProject/TauCetiCI/releases/tag/db):
 
 ```bash
@@ -48,18 +54,62 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 
 ## Collection
 
-[`collect.yml`](.github/workflows/collect.yml) runs hourly. It resumes from `state/cursor.json`
-with six hours of overlap for long runs, and skips runs already recorded. It sizes its API budget
-from the token's live rate limit and spends it on build workflows first, leaving anything it cannot
-afford for the next hour. If `github.token` proves too small for the organisation's volume (about
-1,500 runs an hour reach a runner), set `COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY` for an
-App installed on the organisation.
+[`collect.yml`](.github/workflows/collect.yml) is scheduled every twenty minutes. GitHub may
+delay scheduled runs. Each invocation starts no requests after thirty minutes, checkpoints
+completed records to git about every two minutes, and performs a final push before the
+55-minute runner timeout. API exhaustion ends a phase without waiting for a quota reset.
+Before each checkpoint, uncommitted page/job files are packed by kind, repository and day;
+committed archives stay immutable. Interrupted discovery windows are replayed; already written pages and enrichment are retained.
 
-Backfill a period locally with, for example:
+Discovery records metadata before fetching jobs, logs or artifacts. Recent six-hour windows
+are scanned for each repository before older backlog. The separate chronological inventory
+cursor advances only through fully enumerated windows. Listing pages reuse their count request
+and recursively split dense windows to respect GitHub's 1,000-result cap. A burst that cannot
+be enumerated leaves coverage open rather than being silently truncated.
+
+The disposable `.cache/collector.sqlite` index remembers known files, pending attempts and
+batch membership; a cache miss rebuilds it from git. Warm invocations read only new record
+files. Job fetching uses attempt-specific endpoints, persists small completed batches, retries
+individual failures later, and reserves work for both current builds and sampled auxiliary
+jobs before optional enrichment. Missing earlier attempts get their own metadata and job work
+items; already archived attempt jobs are not fetched again. Known workflows still active after
+six hours are polled by run id with an hourly backoff. Completed artifact listings and immutable
+comparisons are shared within an invocation. Bors observations and batch membership have independent budgets
+and do not require GitHub API quota.
+
+`state/inventory-cursor.json` tracks contiguous discovery, `state/build-cursor.json` tracks
+build-job completeness, `state/details-cursor.json` tracks optional detail work, and
+`state/cursor.json` retains all sampled-job completeness. Main history has its own
+`state/main-cursor.json` with overlap for commits created before they reached main. The active
+repository catalog keeps archived repositories from pinning current fleet coverage.
+Inventory coverage receipts also expose newer discovery islands across an older backlog.
+The observation cursor advances only after every page of an archive day was read. A separate
+page position resumes interrupted archives and replays the current tail page to discover new
+observations, instead of downloading the entire day again. External reads and inventory also
+have phase time limits, leaving time for job collection. Recent active workflows hold job coverage open; historical stuck runs remain visible in inventory
+but stop pinning the watermark after the six-hour overlap. Reruns of runs created outside
+that overlap require an explicit backfill; no claim of continuous historical rerun monitoring
+is made. Permanently unavailable attempts and jobs are explicit gaps. A 404/410 ends that work item;
+other run-specific errors retain durable retry receipts and become explicit gaps after three failures,
+instead of pinning every later chart indefinitely. Shared network and API outages remain retryable. The published database retains their
+reasons, and chart freshness metadata and visible notes report these gaps. Resource records
+awaiting enrichment are labelled pending, separately from missing historical artifacts.
+
+If the installation token is too small for the organisation's volume, configure
+`COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY` for an App installed on the organisation.
+The normal GitHub-hosted invocation caps requests at 4,500 including retries. Local backfills
+write records and keep existing coverage cursors conservative; add `--push` only in a trusted
+main checkout where completed records may be published:
 
 ```bash
-python3 -m collector.collect --since 2026-09-01 --until 2026-09-08 --jobs-for build
+python3 -m collector.incremental --since 2026-09-01 --until 2026-09-08 --jobs-for build
 ```
+
+The manual `backfill` workflow uses this same collector and checkpoint path. Re-dispatching
+the same range and job mode resumes its separate inventory cursor, rather than restarting
+the range. Backfills have their own serialized queue; their append-only records and separate
+range cursors allow normal collection to continue. Future range endpoints are capped at the
+current time, and backfills never advance the observation cursor.
 
 Job logs are kept by GitHub for 90 days, so failure excerpts can be backfilled only that far.
 Run and job metadata do not expire.

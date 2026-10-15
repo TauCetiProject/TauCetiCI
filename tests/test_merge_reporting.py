@@ -43,6 +43,17 @@ class ReportingTests(unittest.TestCase):
         report.merge_backends()
         return "\n".join(report.parts)
 
+    def test_queue_reconstruction_keeps_repositories_with_the_same_commit_separate(self):
+        first = run(1, 'b'*40, trigger='merge_queue', start='01:00', end='01:10')
+        first.update(head_sha='b'*40, tested={'base_sha': 'a'*40, 'queue_pr': 41})
+        second = run(2, 'c'*40, trigger='merge_queue', start='01:02', end='01:12')
+        second.update(head_sha='c'*40, tested={'base_sha': 'b'*40, 'queue_pr': 42})
+        unrelated = run(3, 'b'*40, trigger='merge_queue', start='01:00', end='01:10')
+        unrelated.update(repo='Other', head_sha='b'*40, tested={'base_sha': 'a'*40, 'queue_pr': 99})
+        db = self.database([first, second, unrelated])
+        self.assertEqual(json.loads(db.execute("SELECT queue_chain FROM runs WHERE repo='TauCeti' AND run_id=2").fetchone()[0]), [41, 42])
+        self.assertEqual(json.loads(db.execute("SELECT queue_chain FROM runs WHERE repo='Other'").fetchone()[0]), [99])
+
     def test_push_cost_is_counted_once_despite_duplicate_validation_and_all_rerun_jobs(self):
         head = "b" * 40
         pushes = [run(3, head, "main", start="01:15", end="01:18"),

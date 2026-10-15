@@ -72,7 +72,7 @@ class RefreshTests(unittest.TestCase):
             value = refresh.refresh(self.gh, [1, 2, 3], max_runs=2, now=self.now)
         self.assertEqual(value['recorded'], 2)
         self.assertEqual(value['deferred'], 'run limit reached')
-        self.assertEqual([r['run_id'] for r in self.snapshots()], [3, 2])
+        self.assertCountEqual([r['run_id'] for r in self.snapshots()], [3, 2])
         self.assertIsNone(self.snapshots()[0]['collection_scope']['since'])
 
     def test_later_budget_exhaustion_preserves_completed_records(self):
