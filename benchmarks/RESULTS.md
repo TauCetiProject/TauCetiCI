@@ -1,6 +1,7 @@
 # Runner experiment 16245
 
-Completed: all 18 approved replacement slots are accounted. Retain 8CPU/16GB.
+All 18 approved replacement slots are accounted. The earlier unconditional
+recommendation to retain 8CPU/16GB is withdrawn; it used an unapproved cost ceiling.
 All workload validations failed the same full-library lint finding; no production
 runner setting changed.
 
@@ -108,7 +109,13 @@ still selects 8CPU/16GB. This benchmark has changed no production runner setting
 
 ## Measurements and recommendation
 
-**Retain 8CPU/16GB.** All 18 authorized replacement slots executed and their records are complete. All 18 passed build and duplicate/axiom/module audits, then failed the same unscoped full-library lint finding. No successful whole-pipeline hardware comparison is available. The unchanged default is supported conservatively by the measured cost/pressure observations; no larger shape meets the declared cost criterion.
+**16CPU/32GB is the strongest measured latency candidate, especially for cold builds.**
+The previous 10% cost-increase limit was introduced by the implementation session;
+it was absent from the issue and user requirements. It is not an approved policy.
+No production change has been validated: all 18 attempts passed build and
+specified audits, then failed the same unscoped full-library lint finding.
+These measurements show execution tradeoffs through that common failed gate,
+not successful bors service times.
 
 The tables below compare two repetitions through that common failed gate. They describe the fixed full-validation workload and retain 0/2 successful validations for every cell.
 
@@ -154,13 +161,38 @@ Known replacement worker execution: **10956.133 compute unit-minutes**, approxim
 
 The cold baseline uses a median 7.63 of eight CPU cores; its median memory
 pressure is 17.45 seconds across roughly two hours of sandbox execution. No
-trial failed due to OOM or timeout. Larger runners reduced elapsed time, with
-substantial variation between repetitions, but the measured compute-cost
-increase exceeds the plan's 10% allowance in every workload/shape comparison.
-In particular, 16CPU/32GB reduces cold elapsed time by 40.5% at 18.9% extra
-compute cost. This can inform a separately authorized latency/cost tradeoff;
-it does not qualify for this plan's default promotion.
+trial failed due to OOM or timeout.
+
+### Cost versus latency and queue capacity
+
+The following comparisons use the same observed medians above. Dollar estimates
+use the pinned prepaid-to-overage rates, not the provider invoice. Capacity is
+an inference at unchanged job concurrency with a saturated executor; it excludes
+assembly, publication, failures/retries and provider waiting. It is not measured
+accepted PRs per hour.
+
+| Workload | 8CPU16GB → 16CPU32GB minutes | Minutes saved | Extra USD per attempt | Compute cost increase | Fixed-concurrency attempt capacity increase |
+|---|---:|---:|---:|---:|---:|
+| Warm/light | 20.31 → 14.63 | 5.68 | $0.072–0.107 | 44.0% | 38.9% |
+| Warm/heavy | 26.43 → 19.16 | 7.27 | $0.095–0.143 | 45.0% | 37.9% |
+| Cold/root | 126.33 → 75.11 | 51.22 | $0.191–0.287 | 18.9% | 68.2% |
+
+8CPU/32GB has the same per-minute compute price as 16CPU/32GB and is slower
+in every workload median. It has no measured advantage here.
+
+A queue near saturation can benefit substantially from a service-time reduction.
+For illustration, a 28% reduction moves executor utilization from 90% to 64.8%
+at unchanged arrival rate and job concurrency. This is a scenario, not an observed
+bors utilization estimate. At a saturated fixed vCPU quota, doubling CPUs per
+job can instead halve concurrency; the warm measurements would then imply about
+31% fewer attempts per hour. Check actual quota headroom before rollout.
+
+An actual keep-up assessment needs the current arrival rate and workload mix,
+success/retry rate, batch sizes, allowed concurrent batches, provider vCPU quota
+and full production service times. This experiment does not establish those
+values. A successful production canary should assess queue age/backlog and
+accepted PRs per hour alongside spend, without an invented cost veto.
 
 The [permanent receipt](evidence/38665598590.json.gz) retains the plan, all 18 raw worker/resource records, final jobs/run/artifact API data, observed failed-gate summaries and separately labelled untrusted phase/error excerpts. `protocol_completed` and `accounting_complete` are true; `complete` remains false because there were no successful full validations. Failed runs are not relabelled as successes.
 
-No runner-default change is released. The rollback reference remains the existing 8CPU/16GB labels. The benchmark has no automatic configuration/publication path, and its consumed budget prevents further workload dispatches. New experiments need new explicit authorization. A later hardware promotion requires independent successful validation and the human-reviewed production change/rollback process described in README.md.
+No runner-default change is released. The rollback reference remains the existing 8CPU/16GB labels. The benchmark has no automatic configuration/publication path, and its consumed budget prevents further workload dispatches. New experiments need new explicit authorization. A later hardware promotion requires independent successful validation and the human-reviewed production change/rollback process described in README.md. Historical receipts retain the original recommendation fields as provenance; the unsupported cost-policy conclusion in them is superseded by this correction.

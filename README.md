@@ -364,14 +364,17 @@ They exclude checkout/provisioning/artifact overhead; use the final jobs API sta
 and completion times for whole-job cost, and the provider invoice for actual
 billing. Neither cost model includes shared plan allocation or storage charges.
 
-Runner promotions require two successful repetitions on baseline and candidate, at least 10%
-less median elapsed and at most 10% greater compute cost. The two-run sample is a
-bounded experiment, not a statistical guarantee or whole-pipeline throughput claim.
-Review per-workload resource/phase data and whole-job costs before proposing any
-default change. Keeping 8CPU/16GB is a valid result. A justified production change
-must be a separate human-reviewed TauCeti infrastructure PR with the previous labels
-recorded for immediate revert, followed by a **new** workflow-pinned production
-dispatch and verification. PR #15568's GitHub fallback is separate.
+There is no approved cost ceiling or automatic runner choice. Compare elapsed
+latency, compute cost and queue capacity together. At fixed job concurrency,
+capacity scales inversely with service time; at a saturated vCPU quota, larger
+runners may reduce concurrent jobs. Include assembly, publication, failures and
+arrival rates before claiming bors can keep up. Two repetitions are a bounded
+experiment, not a statistical guarantee or whole-pipeline throughput measurement.
+Successful comparable validations are needed to validate a production promotion.
+A production runner change follows the human-reviewed TauCeti infrastructure
+process, records the previous labels for immediate revert, and uses a **new**
+workflow-pinned production dispatch for verification. PR #15568's GitHub fallback
+is separate.
 
 The [first dispatch](https://github.com/TauCetiProject/TauCetiCI/actions/runs/38652074029)
 failed during package setup because the host PATH omitted system sbin directories.
