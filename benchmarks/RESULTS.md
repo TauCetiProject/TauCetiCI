@@ -2,8 +2,9 @@
 
 All 18 approved replacement slots are accounted. The earlier unconditional
 recommendation to retain 8CPU/16GB is withdrawn; it used an unapproved cost ceiling.
-All workload validations failed the same full-library lint finding; no production
-runner setting changed.
+All workload validations failed the same full-library lint finding. After reviewing
+the measured tradeoffs, the user separately authorized 16CPU/32GB for bors staging;
+the production change landed as described in [ROLLOUT.md](ROLLOUT.md).
 
 ## Protocol and budget
 
@@ -104,15 +105,18 @@ compiled outputs remain in the disposable job. Integrity hashes identify bytes
 and establish comparability; they do not establish proof correctness.
 
 Production's
-[runner selection](https://github.com/TauCetiProject/TauCeti/blob/d7b458634262dceeb12798bd9133fd919cc0e8d1/.github/workflows/pr-build.yml#L107)
-still selects 8CPU/16GB. This benchmark has changed no production runner setting.
+[runner selection](https://github.com/TauCetiProject/TauCeti/blob/346965ee5b080ab881c80e16054c36f5ac19af97/.github/workflows/pr-build.yml#L108)
+now selects 16CPU/32GB for bors staging. The user authorized this separate
+production change after reviewing latency and cost; the benchmark has no
+automatic promotion path. See [ROLLOUT.md](ROLLOUT.md) for release verification.
 
 ## Measurements and recommendation
 
 **16CPU/32GB is the strongest measured latency candidate, especially for cold builds.**
 The previous 10% cost-increase limit was introduced by the implementation session;
 it was absent from the issue and user requirements. It is not an approved policy.
-No production change has been validated: all 18 attempts passed build and
+The controlled experiment did not produce a successful full-validation pair:
+all 18 attempts passed build and
 specified audits, then failed the same unscoped full-library lint finding.
 These measurements show execution tradeoffs through that common failed gate,
 not successful bors service times.
@@ -195,4 +199,4 @@ accepted PRs per hour alongside spend, without an invented cost veto.
 
 The [permanent receipt](evidence/38665598590.json.gz) retains the plan, all 18 raw worker/resource records, final jobs/run/artifact API data, observed failed-gate summaries and separately labelled untrusted phase/error excerpts. `protocol_completed` and `accounting_complete` are true; `complete` remains false because there were no successful full validations. Failed runs are not relabelled as successes.
 
-No runner-default change is released. The rollback reference remains the existing 8CPU/16GB labels. The benchmark has no automatic configuration/publication path, and its consumed budget prevents further workload dispatches. New experiments need new explicit authorization. A later hardware promotion requires independent successful validation and the human-reviewed production change/rollback process described in README.md. Historical receipts retain the original recommendation fields as provenance; the unsupported cost-policy conclusion in them is superseded by this correction.
+A separately authorized bors runner-default change is released through production PR #16875. Reverting that PR restores staging to 8CPU/16GB; its routing test records the previous label. The benchmark has no automatic configuration/publication path, and its consumed budget prevents further workload dispatches. New experiments need new explicit authorization. A later hardware promotion requires independent successful validation and the human-reviewed production change/rollback process described in README.md. Historical receipts retain the original recommendation fields as provenance; the unsupported cost-policy conclusion in them is superseded by this correction.
