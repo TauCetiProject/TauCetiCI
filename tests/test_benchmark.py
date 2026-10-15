@@ -200,3 +200,16 @@ class QueueCostTests(unittest.TestCase):
         self.assertNotIn('job_estimated_unit_minutes', row)
         self.assertEqual(row['job_timing_coverage'], 'unallocated-or-timing-unavailable')
         self.assertEqual(row['status'], 'missing')
+
+class ReplacementBudgetTests(unittest.TestCase):
+    def test_only_first_replacement_can_claim_fixed_approval(self):
+        retired = plan()['authorization']['retired_dispatches']
+        original = retired[0]
+        runs = [{'id': original}, {'id': original + 2}, {'id': original + 1}]
+        authorize(runs, original + 1, 1, 'refs/heads/main', retired)
+        for owner, attempt in [(original, 1), (original + 2, 1), (original + 1, 2)]:
+            with self.assertRaises(ValueError):
+                authorize(runs, owner, attempt, 'refs/heads/main', retired)
+        self.assertEqual(plan()['authorization']['total_scheduled_cap'], 36)
+        self.assertEqual(len(slots(plan())), 18)
+        self.assertTrue(Path(plan()['authorization']['evidence']).exists())

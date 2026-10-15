@@ -275,13 +275,16 @@ of downloaded root mappings/archive bytes must agree across all successful cells
 of a workload. These hashes establish comparability and byte integrity; the
 existing audited-main publisher supplies producer trust.
 
-Only the **earliest dispatch of this workflow** on `main`, attempt 1, may execute.
-Every worker independently rejects reruns, including rerun-failed reusing gate
-outputs. Later dispatches fail the budget gate. **Do not delete workflow run history
-or rename/copy this workflow to restart the experiment**: failed, cancelled,
-missing, timed-out and mismatched slots consume the original budget; they are not
-replaced. Concurrency is at most three jobs at ordinary priority, without bors
-priority or cancellation. The experiment has no production/default-runner effect.
+The user approved exactly 18 replacement slots on 2026-10-15, for a total of
+36 scheduled slots including the original failed experiment. The fixed plan
+records that authorization and retires only original dispatch `38652074029`;
+its evidence remains unchanged. Only the **earliest non-retired dispatch** on
+`main`, attempt 1, may execute. Every worker independently rejects reruns,
+including rerun-failed reusing gate outputs. Later dispatches fail the budget gate.
+Do not delete workflow history or rename/copy the workflow. Failed, cancelled,
+missing and timed-out replacement slots consume this budget and are not replaced.
+Concurrency remains three at ordinary priority, without persistent caches or
+production authority.
 
 After review and landing, dispatch once:
 
@@ -330,5 +333,6 @@ Cancelled jobs without an assigned runner and execution steps have no execution
 cost estimate. GitHub can populate `started_at` for these queued jobs; using that
 value would incorrectly bill queue time. Assigned-job estimates start at the first
 execution step. Provider startup, billing rounding and invoice allocation remain
-outside this estimate. The original 18-slot budget remains exhausted; it cannot
-be reset or rerun without explicit user authorization of additional attempts.
+outside this estimate. The original 18-slot budget remains exhausted and retained. The user approved
+one additional 18-slot replacement on 2026-10-15; the total scheduled cap is 36.
+Further attempts require new explicit authorization.
