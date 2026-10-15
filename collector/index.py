@@ -9,6 +9,8 @@ from . import collect
 
 
 class Index:
+    kinds = ('inventory', 'jobs', 'runs', 'merge-members', 'collection-errors', 'attempt-gaps')
+
     def __init__(self, path, records):
         self.records = Path(records)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +133,7 @@ class Index:
 
     def sync(self):
         """Read only new/grown files. Reject cache entries absent from this checkout."""
-        kinds = ('inventory', 'jobs', 'runs', 'merge-members', 'collection-errors', 'attempt-gaps')
+        kinds = self.kinds
         current = {str(p.relative_to(self.records)): (p, p.stat().st_size)
                    for kind in kinds for p in (self.records/kind).rglob('*.ndjson.gz')}
         old = dict(self.db.execute('SELECT path,size FROM files'))

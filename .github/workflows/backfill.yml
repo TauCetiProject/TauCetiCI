@@ -12,7 +12,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: collect
+  group: backfill
   cancel-in-progress: false
 jobs:
   backfill:

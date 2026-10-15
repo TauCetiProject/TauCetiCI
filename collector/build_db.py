@@ -241,12 +241,15 @@ def build(out: Path):
             if r.get(stream+'_gap'):
                 db.execute('INSERT OR REPLACE INTO collection_gaps VALUES (?,?,?,?,?,?)',
                     (r['repo'],r['run_id'],r['run_attempt'],stream,r['created_at'],r[stream+'_gap']['reason']))
-        prev = db.execute("SELECT run_attempt FROM runs WHERE repo=? AND run_id=?",
+        prev = db.execute("SELECT run_attempt,conclusion,created_at,updated_at FROM runs WHERE repo=? AND run_id=?",
                           (r["repo"], r["run_id"])).fetchone()
         if not prev or prev[0] <= r["run_attempt"]:
+            conclusion, created, updated = r.get('conclusion'),r['created_at'],r.get('updated_at')
+            if prev and prev[0] == r['run_attempt'] and (updated or '') < (prev[3] or ''):
+                conclusion,created,updated = prev[1:]
             db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)", (
                 r["repo"], r["run_id"], r["run_attempt"], r["workflow"], r["event"], r["trigger"],
-                r.get("conclusion"), r["head_sha"], r["created_at"], r.get("updated_at"),
+                conclusion, r["head_sha"], created, updated,
                 t.get("pr"), t.get("queue_pr"), t.get("base_sha"), t.get("group_position"),
                 json.dumps(t["group_prs"]) if "group_prs" in t else None,
                 t.get("merge_base"), t.get("behind_by"), t.get("ahead_by"),
@@ -270,8 +273,16 @@ def build(out: Path):
             db.execute("INSERT OR REPLACE INTO run_attempts VALUES (?,?,?,?,?,?)", (
                 r["repo"], r["run_id"], r["run_attempt"], r.get("conclusion"), cohort(r),
                 (((r.get("observations") or {}).get("resources") or {}).get("payload") or {}).get("workflow_sha")))
+            if r.get('details_gap'):
+                default_coverage = 'enrichment-unavailable'
+            elif stage == 'runs':
+                default_coverage = 'historical-missing'
+            elif r['workflow'] in ('.github/workflows/pr-build.yml','.github/workflows/ci.yml') and r.get('conclusion') != 'skipped':
+                default_coverage = 'pending-enrichment'
+            else:
+                default_coverage = 'not-collected'
             for kind in ("resources", "publication"):
-                observation = (r.get("observations") or {}).get(kind) or {"coverage": "enrichment-unavailable" if r.get("details_gap") else "pending-enrichment" if stage != "runs" else "historical-missing"}
+                observation = (r.get("observations") or {}).get(kind) or {"coverage": default_coverage}
                 db.execute("INSERT OR REPLACE INTO resource_observations VALUES (?,?,?,?,?,?,?)", (
                     r["repo"], r["run_id"], r["run_attempt"], kind, observation["coverage"],
                     observation.get("artifact_id"),

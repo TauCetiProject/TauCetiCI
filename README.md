@@ -58,7 +58,8 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 delay scheduled runs. Each invocation starts no requests after thirty minutes, checkpoints
 completed records to git about every two minutes, and performs a final push before the
 55-minute runner timeout. API exhaustion ends a phase without waiting for a quota reset.
-Interrupted discovery windows are replayed; already written pages and enrichment are retained.
+Before each checkpoint, uncommitted page/job files are packed by kind, repository and day;
+committed archives stay immutable. Interrupted discovery windows are replayed; already written pages and enrichment are retained.
 
 Discovery records metadata before fetching jobs, logs or artifacts. Recent six-hour windows
 are scanned for each repository before older backlog. The separate chronological inventory
@@ -89,8 +90,8 @@ have phase time limits, leaving time for job collection. Recent active workflows
 but stop pinning the watermark after the six-hour overlap. Reruns of runs created outside
 that overlap require an explicit backfill; no claim of continuous historical rerun monitoring
 is made. Permanently unavailable attempts and jobs are explicit gaps. A 404/410 ends that work item;
-other errors retain durable retry receipts and become explicit gaps after three failures,
-instead of pinning every later chart indefinitely. The published database retains their
+other run-specific errors retain durable retry receipts and become explicit gaps after three failures,
+instead of pinning every later chart indefinitely. Shared network and API outages remain retryable. The published database retains their
 reasons, and chart freshness metadata and visible notes report these gaps. Resource records
 awaiting enrichment are labelled pending, separately from missing historical artifacts.
 
@@ -106,7 +107,9 @@ python3 -m collector.incremental --since 2026-09-01 --until 2026-09-08 --jobs-fo
 
 The manual `backfill` workflow uses this same collector and checkpoint path. Re-dispatching
 the same range and job mode resumes its separate inventory cursor, rather than restarting
-the range. It shares the collection lock so checkpoint writers do not overlap.
+the range. Backfills have their own serialized queue; their append-only records and separate
+range cursors allow normal collection to continue. Future range endpoints are capped at the
+current time, and backfills never advance the observation cursor.
 
 Job logs are kept by GitHub for 90 days, so failure excerpts can be backfilled only that far.
 Run and job metadata do not expire.

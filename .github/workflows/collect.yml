@@ -28,6 +28,8 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Check for the App
         id: app

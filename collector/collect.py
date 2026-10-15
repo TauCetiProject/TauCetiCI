@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import threading
+import time
 import tempfile
 import uuid
 import zipfile
@@ -118,7 +119,7 @@ def write_records(kind: str, repo: str | None, records: list[dict], date_field: 
         d.mkdir(parents=True, exist_ok=True)
         # Each batch is an immutable gzip member/file. A killed writer cannot
         # truncate a file containing previously checkpointed records.
-        target = d / f"{stamp}-{uuid.uuid4().hex[:12]}.ndjson.gz"
+        target = d / f"{stamp}-{time.time_ns():020d}-{uuid.uuid4().hex[:12]}.ndjson.gz"
         with tempfile.NamedTemporaryFile(dir=d, suffix='.tmp', delete=False) as tmp:
             temporary = Path(tmp.name)
         try:

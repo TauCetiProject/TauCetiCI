@@ -10,11 +10,17 @@ import copy
 import datetime as dt
 import json
 import hashlib
+import gzip
+import os
+import shutil
+import tempfile
+import uuid
 import signal
 import subprocess
 import threading
 import time
 import urllib.error
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import collect
@@ -174,6 +180,38 @@ def persist(index, kind, repo, records, stamp):
     index.db.commit()
 
 
+def coalesce(index, stamp):
+    """Pack only uncommitted files before publication; committed archives stay immutable."""
+    names = subprocess.check_output(['git','-C',str(collect.ROOT),'ls-files','--others',
+                                     '--exclude-standard','--','records'],timeout=30).decode().splitlines()
+    groups = {}
+    for name in names:
+        if name.endswith('.ndjson.gz'):
+            path = collect.ROOT/name
+            groups.setdefault(path.parent,[]).append(path)
+    for parent, paths in groups.items():
+        if len(paths) < 2:
+            continue
+        target = parent/f'{stamp}-{time.time_ns():020d}-{uuid.uuid4().hex[:12]}.ndjson.gz'
+        with tempfile.NamedTemporaryFile(dir=parent,suffix='.tmp',delete=False) as f:
+            temporary=Path(f.name)
+        try:
+            with gzip.open(temporary,'wb') as merged:
+                for path in sorted(paths):
+                    with gzip.open(path,'rb') as source:
+                        shutil.copyfileobj(source,merged)
+            os.replace(temporary,target)
+            for path in paths:
+                path.unlink()
+                index.db.execute('DELETE FROM files WHERE path=?',(str(path.relative_to(index.records)),))
+            if target.relative_to(index.records).parts[0] in index.kinds:
+                index.db.execute('INSERT OR REPLACE INTO files VALUES (?,?)',
+                                 (str(target.relative_to(index.records)),target.stat().st_size))
+            index.db.commit()
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def list_window(gh, repo, since, until, page_done):
     """List all statuses in [since,until), persisting each page exactly once.
 
@@ -328,6 +366,13 @@ def refresh_active(gh,index,stamp,checkpoint,until):
         checkpoint()
 
 
+def run_specific_error(error):
+    """Shared API/network outages must never retire otherwise recoverable runs."""
+    if isinstance(error,urllib.error.HTTPError):
+        return 400 <= error.code < 500 and error.code not in (401,403,408,429)
+    return isinstance(error,(KeyError,ValueError,TypeError))
+
+
 def earlier_attempts(gh, index, stamp, checkpoint):
     while True:
         pending = index.attempts()
@@ -344,7 +389,7 @@ def earlier_attempts(gh, index, stamp, checkpoint):
             except CollectionStopped:
                 raise
             except Exception as e:
-                failures = index.failures(repo,run,'attempt')+1
+                failures = index.failures(repo,run,'attempt')+int(run_specific_error(e))
                 permanent = isinstance(e,urllib.error.HTTPError) and e.code in (404,410)
                 record = {'repo': repo, 'run_id': number, 'run_attempt': attempt,
                           'created_at': created, 'stream': 'attempt', 'failures': failures,
@@ -400,7 +445,7 @@ def enrich(gh, index, stamp, checkpoint, *, build, detail=False, recent=None):
                     item = pending[futures.index(future)]
                     repo, run, _ = item
                     stream = 'details' if detail else 'jobs'
-                    failures = index.failures(repo, run, stream)+1
+                    failures = index.failures(repo, run, stream)+int(run_specific_error(e))
                     message = f'{type(e).__name__}: {e}'[:500]
                     permanent = isinstance(e, urllib.error.HTTPError) and e.code in (404,410)
                     if permanent or failures >= 3:
@@ -431,12 +476,12 @@ def enrich(gh, index, stamp, checkpoint, *, build, detail=False, recent=None):
             raise stopped
 
 
-def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, jobs_for='all'):
+def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, jobs_for='all', requested_until=None):
     index.sync()
     legacy = read_state('cursor.json')
     inventory = read_state('inventory-cursor.json') or dict(legacy)
     errors = []
-    backfill_name = 'backfills/'+hashlib.sha256((collect.iso(since)+'..'+collect.iso(until)+'..'+jobs_for).encode()).hexdigest()[:32]+'.json' if since else None
+    backfill_name = 'backfills/'+hashlib.sha256((collect.iso(since)+'..'+collect.iso(requested_until or until)+'..'+jobs_for).encode()).hexdigest()[:32]+'.json' if since else None
     backfill = read_state(backfill_name) if since else None
     def coverage():
         if not since:
@@ -450,7 +495,10 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, 
             save_state('build-cursor.json', builds)
             save_state('details-cursor.json', details)
     if isinstance(checkpoint, Checkpoint):
-        checkpoint.prepare = coverage
+        def prepare():
+            coalesce(index,stamp)
+            coverage()
+        checkpoint.prepare = prepare
     def phase(label, calls, work, seconds=None):
         gh.phase(calls, seconds=seconds)
         try:
@@ -463,7 +511,8 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, 
         finally:
             checkpoint()
 
-    phase('observations', 0, lambda: observations(gh, stamp, checkpoint, until), seconds=120)
+    if not since:
+        phase('observations', 0, lambda: observations(gh, stamp, checkpoint, until), seconds=120)
     if hasattr(gh, 'fit_quota'):
         gh.fit_quota()
     if discover:
@@ -482,7 +531,8 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, 
             start = since or collect.parse_time(main_cursor.get(repo, legacy.get(repo, collect.iso(until)))) - collect.OVERLAP
             collect.collect_main(gh, repo, start, until, stamp, False)
             if not since:
-                main_cursor[repo] = collect.iso(until)
+                previous = collect.parse_time(main_cursor.get(repo,legacy.get(repo,collect.iso(until))))
+                main_cursor[repo] = collect.iso(max(previous,until))
                 save_state('main-cursor.json', main_cursor)
             collect.snapshot_settings(gh, repo, stamp, False)
     phase('main history', max(1, gh.max_calls//20), main_history, seconds=120)
@@ -494,7 +544,13 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, 
     gh.phase(inventory_budget, seconds=600)
     for repo in sorted(repos, key=lambda r: r not in collect.DETAIL_REPOS) if not since else []:
         try:
-            scan(gh, index, repo, since or until-collect.OVERLAP, until, stamp, checkpoint)
+            recent_start = until-collect.OVERLAP
+            scan(gh, index, repo, recent_start, until, stamp, checkpoint)
+            if repo in inventory and recent_start <= collect.parse_time(inventory[repo]) <= until:
+                # The recent scan overlaps the contiguous prefix: reuse its
+                # proof rather than listing the same tail a second time.
+                inventory[repo] = collect.iso(until)
+                save_state('inventory-cursor.json',inventory)
         except CollectionStopped as e:
             print(f'recent inventory: {e}', flush=True)
             break
@@ -556,11 +612,16 @@ def main(argv=None):
         repos = args.repos.split(',') if args.repos else sorted(
             set(read_state('repositories.json').get('active') or
                 (set(read_state('cursor.json')) | set(read_state('inventory-cursor.json')) | {'TauCeti'})))
-        until = collect.parse_time(args.until) if args.until else dt.datetime.now(collect.UTC).replace(microsecond=0)
+        now = dt.datetime.now(collect.UTC).replace(microsecond=0)
+        requested_until = collect.parse_time(args.until).replace(microsecond=0) if args.until else now
+        until = min(now,requested_until)
+        since = collect.parse_time(args.since).replace(microsecond=0) if args.since else None
+        if since is not None and since >= until:
+            ap.error('--since must precede the effective end time')
         stamp = dt.datetime.now(collect.UTC).strftime('%Y%m%dT%H%M%S%fZ')
         run(gh, index, repos, until, stamp, checkpoint,
-            collect.parse_time(args.since).replace(microsecond=0) if args.since else None,
-            discover=not args.repos, jobs_for=args.jobs_for)
+            since,
+            discover=not args.repos, jobs_for=args.jobs_for, requested_until=requested_until)
     finally:
         try:
             checkpoint(force=True)

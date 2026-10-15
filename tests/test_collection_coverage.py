@@ -13,6 +13,17 @@ import test_incremental as fixtures
 
 
 class CoverageTests(unittest.TestCase):
+    def test_older_inventory_snapshot_cannot_erase_a_terminal_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            finished=inc.inventory_record('TauCeti',fixtures.run())
+            finished['updated_at']='2026-10-15T00:20:00Z'
+            active=inc.inventory_record('TauCeti',fixtures.run(status='in_progress',conclusion=None))
+            with patch.object(build_db,'ROOT',root),patch.object(build_db,'RECORDS',root/'records'),                     patch.object(build_db,'records',side_effect=lambda kind: iter([finished,active] if kind=='inventory' else [])):
+                build_db.build(root/'db.sqlite')
+            with contextlib.closing(sqlite3.connect(root/'db.sqlite')) as db:
+                self.assertEqual(db.execute('SELECT conclusion FROM runs').fetchone()[0],'success')
+
     def test_published_coverage_excludes_archived_repositories_and_exposes_details_and_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'state').mkdir()

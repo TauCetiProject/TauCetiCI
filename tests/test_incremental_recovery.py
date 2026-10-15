@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import sqlite3
+import subprocess
 import unittest
 import urllib.error
 from unittest.mock import Mock, patch
@@ -16,6 +17,27 @@ class RecoveryTests(unittest.TestCase):
     setUp = fixtures.IncrementalTests.setUp
     inventory = fixtures.IncrementalTests.inventory
     read = fixtures.IncrementalTests.read
+
+    def test_checkpoint_packing_preserves_committed_files_and_the_cache_manifest(self):
+        self.inventory(fixtures.run(1))
+        first=next((self.records/'inventory').rglob('*.gz'))
+        original=first.read_bytes()
+        for args in [('init','-b','main'),('config','user.name','test'),('config','user.email','test@example.invalid'),
+                     ('add','records'),('commit','-m','published baseline')]:
+            subprocess.run(['git',*args],cwd=self.root,check=True,capture_output=True)
+        for number in (2,3,4):
+            self.inventory(fixtures.run(number))
+        inc.coalesce(self.index,'packed')
+        self.assertEqual(first.read_bytes(),original)
+        self.assertEqual(len(list((self.records/'inventory').rglob('*.gz'))),2)
+        self.assertEqual({r['run_id'] for r in self.read('inventory')},{1,2,3,4})
+        with patch('collector.index.gzip.open',side_effect=AssertionError('reread packed archive')):
+            self.assertEqual(self.index.sync(),0)
+        for path in (self.records/'inventory').rglob('*.gz'):
+            if path != first:
+                path.unlink()  # A failed push must not lend cached packed records.
+        self.index.sync()
+        self.assertEqual(self.index.db.execute('SELECT COUNT(*) FROM runs').fetchone()[0],1)
 
     def test_unpublished_cached_jobs_are_requeued_without_a_final_sync(self):
         value = self.inventory(fixtures.run())
@@ -46,6 +68,37 @@ class RecoveryTests(unittest.TestCase):
                 inc.enrich(Mock(), self.index, 'jobs', self.checkpoint, build=True)
         self.assertEqual(len(self.read('jobs')), 32)
         self.assertEqual(self.checkpoint.call_count, 1)
+
+    def test_shared_api_outages_do_not_permanently_retire_runs(self):
+        self.inventory(fixtures.run())
+        for attempt in range(4):
+            with patch('collector.incremental.time.time',return_value=10000+attempt*3601),                     patch.object(collect,'run_record',side_effect=RuntimeError('GitHub API failed repeatedly')),                     contextlib.redirect_stdout(io.StringIO()):
+                inc.enrich(Mock(),self.index,'outage',self.checkpoint,build=True)
+        self.assertFalse(self.read('jobs'))
+        self.assertEqual([r['failures'] for r in self.read('collection-errors')],[0]*4)
+        with patch('collector.index.time.time',return_value=30000):
+            self.assertEqual(len(self.index.pending(build=True)),1)
+
+    def test_future_backfill_endpoint_is_clamped_and_the_requested_range_is_retained(self):
+        with patch.object(inc,'Index'),patch.object(inc,'BoundedGitHub'),                 patch.object(inc.signal,'signal'),patch.object(inc,'run') as run:
+            inc.main(['--repos','TauCeti','--since','2026-10-01','--until','2999-01-01'])
+        self.assertLessEqual(run.call_args.args[3],collect.dt.datetime.now(collect.UTC))
+        self.assertEqual(run.call_args.kwargs['requested_until'].year,2999)
+
+    def test_extending_a_current_day_backfill_resumes_without_touching_observations(self):
+        requested=self.until+collect.dt.timedelta(days=1)
+        inc.save_state('observations-cursor.json',{'TauCeti':'2026-10-15T00:05:00Z'})
+        ranges=[]
+        for end in (self.since+collect.dt.timedelta(minutes=15),self.until):
+            api=fixtures.CollectionAPI([],budget=80)
+            with patch.object(inc,'observations') as observations,patch.object(collect,'collect_main'),                     patch.object(collect,'snapshot_settings'),contextlib.redirect_stdout(io.StringIO()):
+                inc.run(api,self.index,['TauCeti'],end,'growing',self.checkpoint,
+                        since=self.since,requested_until=requested)
+            observations.assert_not_called()
+            ranges.extend(api.requests)
+        self.assertEqual([r[0] for r in ranges],
+                         ['2026-10-15T00:00:00Z..2026-10-15T00:14:59Z','2026-10-15T00:15:00Z..2026-10-15T00:29:59Z'])
+        self.assertEqual(inc.read_state('observations-cursor.json')['TauCeti'],'2026-10-15T00:05:00Z')
 
     def test_deleted_jobs_leave_an_explicit_gap_instead_of_pinning_coverage(self):
         self.inventory(fixtures.run())
