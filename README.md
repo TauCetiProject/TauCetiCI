@@ -376,6 +376,11 @@ process, records the previous labels for immediate revert, and uses a **new**
 workflow-pinned production dispatch for verification. PR #15568's GitHub fallback
 is separate.
 
+The user chose 16CPU/32GB for bors staging after reviewing the measured
+latency/cost tradeoffs. The normal Bors release and subsequent hardware checks
+are recorded in [the production rollout](benchmarks/ROLLOUT.md). The experiment
+cap and its failed-validation accounting remain unchanged.
+
 The [first dispatch](https://github.com/TauCetiProject/TauCetiCI/actions/runs/38652074029)
 failed during package setup because the host PATH omitted system sbin directories.
 It produced 14 failed setup records and four missing records; the jobs API accounts
