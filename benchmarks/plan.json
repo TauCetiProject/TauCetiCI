@@ -1,5 +1,5 @@
 {
-  "experiment": "16245-v1",
+  "experiment": "16245-v2-approved-replacement",
   "repository": "TauCetiProject/TauCeti",
   "tooling_sha": "4f1a681d10b8371c56bc49158b0481d18bd949f5",
   "toolchain": "leanprover/lean4:v4.35.0-rc3",
@@ -49,5 +49,15 @@
     "prepaid_usd_per_unit_minute": 0.001,
     "overage_usd_per_unit_minute": 0.0015
   },
-  "manifest_sha256": "d2cc624cfe9ec5ac6f21940c79dca2c55413ac6cd2ea0ce3666ce348c4e4cee5"
+  "manifest_sha256": "d2cc624cfe9ec5ac6f21940c79dca2c55413ac6cd2ea0ce3666ce348c4e4cee5",
+  "authorization": {
+    "approved_utc_date": "2026-10-15",
+    "retired_dispatches": [
+      38652074029
+    ],
+    "prior_scheduled_slots": 18,
+    "replacement_scheduled_slots": 18,
+    "total_scheduled_cap": 36,
+    "evidence": "benchmarks/evidence/38652074029.json.gz"
+  }
 }

@@ -22,8 +22,8 @@ def slots(p):
             for s in p['shapes']]
 
 
-def authorize(runs, run_id, attempt, branch):
-    """Only the earliest dispatch may execute; reruns and other refs fail closed.
+def authorize(runs, run_id, attempt, branch, retired_dispatches=()):
+    """Only the earliest non-retired dispatch may execute; reruns and other refs fail closed.
 
     Run history must never be deleted for this workflow. A later dispatch, including
     concurrent dispatch, cannot acquire another set of slots. Every worker also
@@ -31,7 +31,8 @@ def authorize(runs, run_id, attempt, branch):
     """
     if attempt != 1 or branch != 'refs/heads/main':
         raise ValueError('benchmarks require first attempt on main')
-    if not runs or run_id != min(int(r['id']) for r in runs):
+    eligible = [int(r['id']) for r in runs if int(r['id']) not in retired_dispatches]
+    if not eligible or run_id != min(eligible):
         raise ValueError('the experiment already has an owner dispatch')
 
 
@@ -155,6 +156,12 @@ def main():
     parser.add_argument('--directory', type=Path, default=Path('results'))
     args = parser.parse_args()
     p = plan()
+    authorization = p.get('authorization', {})
+    if authorization and authorization != {
+            'approved_utc_date': '2026-10-15', 'retired_dispatches': [38652074029],
+            'prior_scheduled_slots': 18, 'replacement_scheduled_slots': 18,
+            'total_scheduled_cap': 36, 'evidence': 'benchmarks/evidence/38652074029.json.gz'}:
+        raise ValueError('invalid fixed replacement authorization')
     if len(slots(p)) != p['cap'] or p['cap'] != 18:
         raise ValueError('invalid experiment budget')
     if args.command == 'matrix':
@@ -163,7 +170,8 @@ def main():
         raw = subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
             'repos/TauCetiProject/TauCetiCI/actions/workflows/runner-benchmark.yml/runs?event=workflow_dispatch&per_page=100'])
         runs = [r for page in json.loads(raw) for r in page['workflow_runs']]
-        authorize(runs, int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT']), os.environ['GITHUB_REF'])
+        authorize(runs, int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT']), os.environ['GITHUB_REF'],
+                  p.get('authorization', {}).get('retired_dispatches', ()))
         print('Authorized 18 slots; reruns and later dispatches are disabled.')
     elif args.command == 'inventory':
         if args.map:
