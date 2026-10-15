@@ -213,7 +213,7 @@ def coalesce(index, stamp):
 
 
 def list_window(gh, repo, since, until, page_done):
-    """List all statuses in [since,until), persisting each page exactly once.
+    """List all statuses in [since,until), persisting pages before retrying gaps.
 
     Reuse the first page's count instead of a separate count request. Split down
     to seconds, not five-minute windows that can exceed GitHub's 1,000-result cap.
@@ -225,24 +225,32 @@ def list_window(gh, repo, since, until, page_done):
     path = f'repos/{collect.ORG}/{repo}/actions/runs'
     first = gh.get(path, created=query, per_page=100, page=1)
     total = first['total_count']
-    if total >= 1000:
+    def divide(reason):
         seconds = int((until-since).total_seconds())
         if seconds <= 1:
-            raise RuntimeError(f'{repo}: >=1000 runs in one second; inventory coverage left open')
+            raise RuntimeError(f'{repo} {query}: {reason} in one second; inventory coverage left open')
+        print(f'{repo} {query}: {reason}; retrying smaller inventory windows', flush=True)
         middle = since + dt.timedelta(seconds=seconds//2)
         list_window(gh, repo, since, middle, page_done)
         list_window(gh, repo, middle, until, page_done)
+    if total >= 1000:
+        divide('>=1000 runs')
         return
-    count = 0
-    for page in range(1, (total+99)//100 + 1):
+    count, seen = 0, set()
+    for page in range(1, max((total+99)//100, bool(first['workflow_runs'])) + 1):
         value = first if page == 1 else gh.get(path, created=query, per_page=100, page=page)
         items = value['workflow_runs']
         if not items:
-            raise RuntimeError(f'{repo}: listing page disappeared; coverage left open')
+            # GitHub's count and paginated listing can disagree even for a
+            # historical range. Retain completed pages, then enumerate smaller
+            # ranges instead of pinning this cursor on the same bad page.
+            divide(f'listing page {page} disappeared (reported {total} runs)')
+            return
         page_done(items)
         count += len(items)
-    if count < total:
-        raise RuntimeError(f'{repo}: incomplete listing; coverage left open')
+        seen.update(r['id'] for r in items)
+    if count != total or len(seen) != total:
+        divide(f'incomplete listing ({len(seen)} distinct runs, reported {total})')
 
 
 def scan(gh, index, repo, since, until, stamp, checkpoint, cursor=None, cursor_name='inventory-cursor.json', jobs_for='all'):

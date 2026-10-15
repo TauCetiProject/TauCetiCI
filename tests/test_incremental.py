@@ -117,6 +117,50 @@ class IncrementalTests(unittest.TestCase):
         self.assertFalse(self.read('inventory-coverage'))
         self.assertFalse(inc.read_state('inventory-cursor.json'))
 
+    def test_disappearing_page_splits_the_range_and_deduplicates_durable_pages(self):
+        items = [run(n, stamp=collect.iso(self.since+dt.timedelta(seconds=n*10))) for n in range(150)]
+        class InconsistentAPI(ListingAPI):
+            def get(api, *args, **kwargs):
+                result = super().get(*args, **kwargs)
+                lo, hi = kwargs['created'].split('..')
+                if collect.parse_time(hi)-collect.parse_time(lo) > dt.timedelta(minutes=15) and kwargs['page']==2:
+                    result['workflow_runs']=[]
+                return result
+        api=InconsistentAPI(items)
+        cursor={}
+        with contextlib.redirect_stdout(io.StringIO()):
+            inc.scan(api,self.index,'TauCeti',self.since,self.until,'split',self.checkpoint,cursor)
+        self.assertEqual(len(self.read('inventory')),150)
+        self.assertEqual(len({r['run_id'] for r in self.read('inventory')}),150)
+        self.assertEqual(cursor['TauCeti'],collect.iso(self.until))
+        self.assertEqual(len(api.requests),4)  # Original two pages, then two smaller first pages.
+
+    def test_duplicate_pages_do_not_hide_missing_runs_behind_the_reported_count(self):
+        items = [run(n, stamp=collect.iso(self.since+dt.timedelta(seconds=n*10))) for n in range(150)]
+        class DuplicateAPI(ListingAPI):
+            def get(api,*args,**kwargs):
+                result=super().get(*args,**kwargs)
+                lo,hi=kwargs['created'].split('..')
+                if collect.parse_time(hi)-collect.parse_time(lo) > dt.timedelta(minutes=15) and kwargs['page']==2:
+                    result['workflow_runs']=items[:50]
+                return result
+        cursor={}
+        with contextlib.redirect_stdout(io.StringIO()):
+            inc.scan(DuplicateAPI(items),self.index,'TauCeti',self.since,self.until,'duplicate',self.checkpoint,cursor)
+        self.assertEqual({r['run_id'] for r in self.read('inventory')},set(range(150)))
+        self.assertEqual(cursor['TauCeti'],collect.iso(self.until))
+
+    def test_persistent_single_second_mismatch_never_advances_coverage(self):
+        class MissingAPI(ListingAPI):
+            def get(api,*args,**kwargs):
+                return {'total_count':1,'workflow_runs':[]}
+        cursor={}
+        with self.assertRaisesRegex(RuntimeError,'one second'):
+            inc.scan(MissingAPI([]),self.index,'TauCeti',self.since,
+                     self.since+dt.timedelta(seconds=1),'missing',self.checkpoint,cursor)
+        self.assertFalse(cursor)
+        self.assertFalse(self.read('inventory-coverage'))
+
     def test_cache_reads_only_new_files_and_rejects_records_absent_from_checkout(self):
         self.inventory(run())
         self.assertEqual(self.index.sync(), 0)
