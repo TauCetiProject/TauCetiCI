@@ -345,11 +345,8 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False):
     errors = []
     def coverage():
         if not since:
-            full = {r: end for r, end in legacy.items() if r in repos}
-            builds = {r: end for r, end in read_state('build-cursor.json').items() if r in repos}
+            full, builds = dict(legacy), read_state('build-cursor.json')
             for repo, end in inventory.items():
-                if repo not in repos:
-                    continue
                 full[repo] = index.coverage(repo, end)
                 builds[repo] = index.coverage(repo, end, build=True)
             save_state('cursor.json', full)
