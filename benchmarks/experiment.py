@@ -132,20 +132,24 @@ def summarize(p, results, jobs=None):
                                median_sandbox_cpu_s=statistics.median(r['phases']['sandbox']['command_cpu_user_s'] + r['phases']['sandbox']['command_cpu_system_s'] for r in good) if good and all('sandbox' in r.get('phases', {}) for r in good) else None,
                                largest_process_rss_bytes=max(r['phases']['sandbox']['command_max_process_rss_bytes'] for r in good) if good and all('sandbox' in r.get('phases', {}) for r in good) else None,
                                median_unit_minutes=statistics.median(r.get('job_estimated_unit_minutes', r['elapsed_s'] / 60 * spec['units_per_minute']) for r in good) if good else None))
-    recommendations = []
+    comparisons = []
     for w in p['workloads']:
         choices = [g for g in groups if g['workload'] == w]
         baseline = choices[0]
-        eligible = [g for g in choices[1:] if g['successful'] == baseline['successful'] == 2
-                    and (g['median_job_elapsed_s'] or g['median_elapsed_s']) <= .90 * (baseline['median_job_elapsed_s'] or baseline['median_elapsed_s'])
-                    and g['median_unit_minutes'] <= 1.10 * baseline['median_unit_minutes']]
-        winner = min(eligible, key=lambda g: g['median_elapsed_s']) if eligible else baseline
-        recommendations.append(dict(workload=w, shape=winner['shape'],
-                                    reason='At least 10% faster at no more than 10% extra estimated compute cost'
-                                    if eligible else 'Retain baseline; no complete larger-shape pair meets benefit/cost threshold'))
+        for candidate in choices[1:]:
+            paired = candidate['successful'] == baseline['successful'] == 2
+            base_time = baseline['median_job_elapsed_s'] or baseline['median_elapsed_s']
+            candidate_time = candidate['median_job_elapsed_s'] or candidate['median_elapsed_s']
+            available = paired and bool(base_time) and bool(candidate_time) and bool(baseline['median_unit_minutes'])
+            comparisons.append(dict(
+                workload=w, baseline_shape=baseline['shape'], shape=candidate['shape'],
+                complete_pair=paired,
+                elapsed_reduction_fraction=1 - candidate_time / base_time if available else None,
+                compute_cost_increase_fraction=candidate['median_unit_minutes'] / baseline['median_unit_minutes'] - 1 if available else None,
+                fixed_concurrency_capacity_ratio=base_time / candidate_time if available else None))
     complete = all(r['status'] == 'success' for r in rows)
-    return dict(experiment=p['experiment'], complete=complete, slots=rows, groups=groups, recommendations=recommendations,
-                recommendation='Review per-workload recommendations against whole-job costs and resource coverage before changing production; no automatic runner change.')
+    return dict(experiment=p['experiment'], complete=complete, slots=rows, groups=groups, comparisons=comparisons,
+                recommendation='No automatic runner choice or cost ceiling. Assess latency, queue capacity, concurrency limits and compute cost together. Failed comparisons do not establish successful production throughput.')
 
 
 def main():
@@ -189,7 +193,7 @@ def main():
         for g in report['groups']:
             lines.append(f"| {g['workload']} | {g['shape']} | {g['successful']}/{g['planned']} | {g['median_elapsed_s']} | {g['median_job_elapsed_s']} | {g['median_unit_minutes']} |")
         lines += ['', '| Workload | Shape | Median sandbox CPU seconds | Largest process RSS bytes |', '|---|---|---:|---:|', *[f"| {g['workload']} | {g['shape']} | {g['median_sandbox_cpu_s']} | {g['largest_process_rss_bytes']} |" for g in report['groups']]]
-        lines += ['', *[f"{r['workload']}: {r['shape']}. {r['reason']}." for r in report['recommendations']], '', report['recommendation'], '', 'Costs use whole-job API durations when present, otherwise command durations excluding checkout/provisioning/artifact overhead. Use jobs API duration for whole-job estimates; provider invoice remains authoritative. Missing, failed, partial and cache-incomparable slots stay in report.json. Full phase logs are untrusted statistics; host sampler records have separate scope.']
+        lines += ['', '| Workload | Shape vs baseline | Complete successful pair | Elapsed reduction fraction | Compute-cost increase fraction | Fixed-concurrency capacity ratio |', '|---|---|---|---:|---:|---:|', *[f"| {r['workload']} | {r['shape']} vs {r['baseline_shape']} | {r['complete_pair']} | {r['elapsed_reduction_fraction']} | {r['compute_cost_increase_fraction']} | {r['fixed_concurrency_capacity_ratio']} |" for r in report['comparisons']], '', report['recommendation'], '', 'Costs use whole-job API durations when present, otherwise command durations excluding checkout/provisioning/artifact overhead. Use jobs API duration for whole-job estimates; provider invoice remains authoritative. Missing, failed, partial and cache-incomparable slots stay in report.json. Full phase logs are untrusted statistics; host sampler records have separate scope.']
         (args.directory / 'REPORT.md').write_text('\n'.join(lines) + '\n')
 
 

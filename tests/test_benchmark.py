@@ -110,16 +110,23 @@ class WholeJobTests(unittest.TestCase):
         self.assertEqual(report['slots'][0]['job']['conclusion'], 'success')
         self.assertEqual(report['slots'][0]['status'], 'missing')
 
-    def test_recommendation_requires_complete_pair_and_cost_threshold(self):
+    def test_tradeoffs_include_faster_more_expensive_shape_without_cost_veto(self):
         rows = BenchmarkTests().records()
         for row in rows:
             if row['shape'] == '16x32':
-                row['elapsed_s'] = 30
+                row['elapsed_s'] = 45
         report = summarize(plan(), rows)
-        self.assertTrue(all(r['shape'] == '16x32' for r in report['recommendations']))
+        candidate = next(c for c in report['comparisons'] if c['workload'] == 'warm-light' and c['shape'] == '16x32')
+        self.assertEqual(candidate['elapsed_reduction_fraction'], .25)
+        self.assertEqual(candidate['compute_cost_increase_fraction'], .5)
+        self.assertAlmostEqual(candidate['fixed_concurrency_capacity_ratio'], 4 / 3)
         rows[2]['status'] = 'failed'
         report = summarize(plan(), rows)
-        self.assertEqual(report['recommendations'][0]['shape'], '8x16')
+        candidate = next(c for c in report['comparisons'] if c['workload'] == 'warm-light' and c['shape'] == '16x32')
+        self.assertFalse(candidate['complete_pair'])
+        self.assertIsNone(candidate['elapsed_reduction_fraction'])
+        self.assertIsNone(candidate['compute_cost_increase_fraction'])
+        self.assertIsNone(candidate['fixed_concurrency_capacity_ratio'])
 
 class FailureEvidenceTests(unittest.TestCase):
     def test_truncated_result_is_accounted_without_losing_report(self):
