@@ -10,7 +10,8 @@ import json
 from pathlib import Path
 import subprocess
 
-ALLOWED = {'state/cursor.json', 'state/observations-cursor.json'}
+ALLOWED = {'state/cursor.json', 'state/observations-cursor.json',
+           'state/inventory-cursor.json', 'state/build-cursor.json'}
 
 
 def merge(left, right):

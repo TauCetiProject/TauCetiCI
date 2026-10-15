@@ -1,5 +1,9 @@
 name: collector tests
-on: [push, pull_request]
+on:
+  push:
+    paths: ['collector/**', 'analysis/**', 'tests/**', '.github/workflows/**']
+  pull_request:
+    paths: ['collector/**', 'analysis/**', 'tests/**', '.github/workflows/**']
 permissions:
   contents: read
 jobs:

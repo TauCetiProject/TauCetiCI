@@ -1,20 +1,15 @@
 name: collect
 
-# Hourly: record every GitHub Actions run that completed in the organisation since the last
-# collection, and push the new record files. Records are append-only: each collection writes new
-# files and never rewrites old ones. Each collection resumes from state/cursor.json (minus six
-# hours of overlap for long runs), and the cursor moves only past runs actually recorded, so a
-# failed push or an exhausted API budget loses nothing.
-#
-# API budget. The organisation completes about 1,500 runs an hour that reach a runner, and each
-# needs one call for its jobs, plus one call per 100 runs listed. The collector sizes its budget from
-# the token's live rate limit and records build workflows first, leaving the rest to later hours if
-# it runs short. If `github.token` proves too small, set COLLECTOR_APP_ID / COLLECTOR_APP_PRIVATE_KEY
-# (an App installed on the organisation) to use an installation token instead.
+# Bounded metadata discovery, then resumable jobs/artifact enrichment. Checkpoints
+# publish completed batches during the run; the 30-minute soft deadline leaves
+# room for final publication before the 55-minute runner timeout.
 
 on:
+  push:
+    branches: [main]
+    paths: ['collector/**', '.github/workflows/collect.yml']
   schedule:
-    - cron: "17 * * * *"
+    - cron: "7,27,47 * * * *"
   workflow_dispatch:
     inputs:
       since: { description: "Backfill from (e.g. 72h, or an ISO time); empty resumes from the cursor", required: false, default: "" }
@@ -49,35 +44,33 @@ jobs:
           private-key: ${{ secrets.COLLECTOR_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
+      - name: Restore the derived record index
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/collector.sqlite
+          key: collector-index-v1-${{ github.run_id }}
+          restore-keys: collector-index-v1-
+
       - name: Collect
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
-          MAX_CALLS: "4500"
+          BACKFILL_SINCE: ${{ inputs.since }}
+          BACKFILL_UNTIL: ${{ inputs.until }}
         run: |
+          set -o pipefail
           args=()
-          [ -n "${{ inputs.since }}" ] && args+=(--since "${{ inputs.since }}")
-          [ -n "${{ inputs.until }}" ] && args+=(--until "${{ inputs.until }}")
-          python3 -m collector.collect "${args[@]}" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -n "$BACKFILL_SINCE" ] && args+=(--since "$BACKFILL_SINCE")
+          [ -n "$BACKFILL_UNTIL" ] && args+=(--until "$BACKFILL_UNTIL")
+          python3 -m collector.incremental --push --max-calls 4500 --max-seconds 1800 \
+            "${args[@]}" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Commit and push
-        run: |
-          git config user.name "tauceti-ci-collector"
-          git config user.email "tauceti-ci-collector@users.noreply.github.com"
-          git add records state
-          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
-          git commit -qm "records: $(date -u +%Y-%m-%dT%H:%MZ)"
-          for i in 1 2 3 4 5; do
-            git fetch -q origin main || { sleep $((i * 10)); continue; }
-            if ! git rebase origin/main; then
-              # Only the two JSON watermarks have a safe automatic resolution.
-              # Keep conservative coverage; never discard either writer's records.
-              if ! python3 -m collector.resolve_cursors \
-                  || ! GIT_EDITOR=true git rebase --continue; then
-                git rebase --abort || true
-                exit 1
-              fi
-            fi
-            git push -q origin HEAD:main && exit 0
-            sleep $((i * 10))
-          done
-          exit 1
+      - name: Publish remaining completed batches
+        if: ${{ always() && !cancelled() }}
+        run: python3 -m collector.checkpoint
+
+      - name: Save the derived record index
+        if: ${{ always() && !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/collector.sqlite
+          key: collector-index-v1-${{ github.run_id }}

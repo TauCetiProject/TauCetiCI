@@ -1,30 +1,13 @@
-"""Collect completed GitHub Actions runs for every repository in the organisation.
+"""Shared run normalization, enrichment and atomic append-only record writers.
 
-Each invocation lists runs created in [since, until], skips those already recorded, and writes the
-new ones to a fresh, never-rewritten file:
-
-    records/runs/<repo>/<yyyy>/<mm>/<dd>/<collected-at>.ndjson.gz   (dated by the run's created_at)
-
-Every run carries its jobs (all attempts), with queue and execution times and the runner. Runs of
-the build workflows in DETAIL_REPOS (TauCeti) also carry steps, the commits they tested,
-merge-queue composition, and a classified failure with an excerpt of the failing step's log. See
-schema/run.v1.json.
-
-Main-branch history and merge-queue settings are recorded alongside, in records/main/ and
-records/settings/, because the analyses join against both.
-
-    python -m collector.collect                        # the hourly job: resume from state/cursor.json
-    python -m collector.collect --since 2026-09-01 --until 2026-09-02   # a backfill window
-
-Listing runs costs one API call per 100 runs, and TauCeti creates over 2,000 runs an hour, so the
-hourly job does not re-list a fixed look-back. It resumes from a per-repository cursor, minus
-OVERLAP to catch long runs that completed since. The cursor advances only past runs actually
-recorded, so a collection that runs out of API budget leaves the rest for the next one.
+The bounded collector entry point is ``python -m collector.incremental``.
+Detailed snapshots and independently collected resource observations use these
+same provenance, attempt, failure and runner classifiers.
 """
 
 from __future__ import annotations
 
-import argparse
+import copy
 import datetime as dt
 import gzip
 import hashlib
@@ -34,13 +17,14 @@ import os
 import re
 import sys
 import threading
+import tempfile
+import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import classify, resources
 from .merge_identity import apply_telemetry, apply_dispatch_title
-from .observations import read_days, batch_members
+from .observations import batch_members
 from .gh import GitHub
 
 ORG = "TauCetiProject"
@@ -49,7 +33,6 @@ SCHEMA = "tauceti-ci.run/v1"
 ROOT = Path(__file__).resolve().parent.parent
 RECORDS = ROOT / "records"
 MAX_LOGS_PER_COLLECTION = 300
-CURSOR = ROOT / "state" / "cursor.json"
 # Longer than any workflow's timeout (nightly-verify's is 4 hours), so a run created before the
 # cursor but completed after it is still listed.
 OVERLAP = dt.timedelta(hours=6)
@@ -64,10 +47,6 @@ BUILD_WORKFLOWS = {".github/workflows/pr-build.yml", ".github/workflows/ci.yml",
 # deterministically) and record the rest at run level. That keeps an unbiased sample of their
 # queue waits while cutting the collector's API cost by about three quarters.
 SAMPLE_SHORT = 4
-
-# The repositories other than DETAIL_REPOS may spend at most 1/OTHERS_SHARE of a collection's API
-# budget between them (see `main`), so they always get some, and never more than that.
-OTHERS_SHARE = 4
 
 UTC = dt.timezone.utc
 
@@ -136,30 +115,18 @@ def write_records(kind: str, repo: str | None, records: list[dict], date_field: 
     for day, rs in by_day.items():
         d = (RECORDS / kind / repo if repo else RECORDS / kind) / day.replace("-", "/")
         d.mkdir(parents=True, exist_ok=True)
-        with gzip.open(d / f"{stamp}.ndjson.gz", "at") as f:
-            for r in sorted(rs, key=lambda r: r[date_field]):
-                f.write(json.dumps(r, separators=(",", ":"), sort_keys=True, ensure_ascii=False) + "\n")
-
-
-# --- listing ------------------------------------------------------------------------------------
-
-
-def list_completed_runs(gh: GitHub, repo: str, since: dt.datetime, until: dt.datetime,
-                        workflow: str | None = None):
-    """All completed runs created in [since, until], optionally of one workflow file. The search
-    behind this endpoint returns at most 1000 runs per query, so a window holding more is split in
-    half until each part fits."""
-    path = (f"repos/{ORG}/{repo}/actions/workflows/{workflow}/runs" if workflow
-            else f"repos/{ORG}/{repo}/actions/runs")
-    q = f"{iso(since)}..{iso(until)}"
-    total = gh.get(path, created=q, status="completed", per_page=1)["total_count"]
-    if total >= 1000 and until - since > dt.timedelta(minutes=5):
-        mid = since + (until - since) / 2
-        yield from list_completed_runs(gh, repo, since, mid, workflow)
-        yield from list_completed_runs(gh, repo, mid + dt.timedelta(seconds=1), until, workflow)
-        return
-    if total:
-        yield from gh.paginate(path, key="workflow_runs", created=q, status="completed")
+        # Each batch is an immutable gzip member/file. A killed writer cannot
+        # truncate a file containing previously checkpointed records.
+        target = d / f"{stamp}-{uuid.uuid4().hex[:12]}.ndjson.gz"
+        with tempfile.NamedTemporaryFile(dir=d, suffix='.tmp', delete=False) as tmp:
+            temporary = Path(tmp.name)
+        try:
+            with gzip.open(temporary, 'wt') as f:
+                for r in sorted(rs, key=lambda r: r[date_field]):
+                    f.write(json.dumps(r, separators=(",", ":"), sort_keys=True, ensure_ascii=False) + "\n")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 # --- enrichment (build workflows of DETAIL_REPOS) -----------------------------------------------
@@ -340,18 +307,20 @@ def needs_jobs(run: dict, jobs_for: str) -> bool:
 
 
 def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs_for: str,
-               *, batch_fallback: bool = True) -> dict:
+               *, batch_fallback: bool = True, current_attempt_only: bool = False,
+               preloaded_record: dict | None = None, keep_steps: bool = False) -> dict:
     workflow = run.get("path") or run.get("name")
     # A run skipped by its `if:` never reached a runner; its jobs carry nothing worth a call. With
     # `jobs_for="build"` (backfills of long periods) the high-volume workflows are recorded at run
     # level only, and otherwise a sample of them is (SAMPLE_SHORT); either way marked
     # `jobs_fetched: false`.
-    fetch = run.get("conclusion") != "skipped" and needs_jobs(run, jobs_for)
+    fetch = preloaded_record is None and run.get("conclusion") != "skipped" and needs_jobs(run, jobs_for)
     # Bind jobs to attempts using the API path; historical all-attempt listings
     # can omit run_attempt, which must never be guessed from the latest attempt.
     jobs = []
     if fetch:
-        for attempt in range(1, run.get("run_attempt", 1) + 1):
+        current = run.get('run_attempt', 1)
+        for attempt in ([current] if current_attempt_only else range(1, current + 1)):
             jobs.extend({**job, "run_attempt": attempt} for job in gh.paginate(
                 f"repos/{ORG}/{repo}/actions/runs/{run['id']}/attempts/{attempt}/jobs", key="jobs"))
     detail = enricher is not None and workflow in BUILD_WORKFLOWS
@@ -367,10 +336,12 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
         "head_sha": run["head_sha"],
         "created_at": run["created_at"],
         "updated_at": run.get("updated_at"),
-        "jobs": [job_record(j, detail) for j in jobs],
+        "jobs": [job_record(j, detail or keep_steps) for j in jobs],
     }
     if not fetch and run.get("conclusion") != "skipped":
         rec["jobs_fetched"] = False
+    if preloaded_record is not None:
+        rec = copy.deepcopy(preloaded_record)
     if detail:
         rec.update({
             "head_branch": run.get("head_branch"),
@@ -410,90 +381,43 @@ def run_record(gh: GitHub, repo: str, run: dict, enricher: Enricher | None, jobs
                 comparison = enricher.compare(tested["base_sha"], tested["head_sha"])
                 if comparison:
                     tested["diff"] = enricher.diff_summary(comparison)
-        for j, jr in zip(jobs, rec["jobs"]):
-            f = enricher.failure(j)
+        for jr in rec["jobs"]:
+            f = enricher.failure(jr)
             if f:
                 jr["failure"] = f
     return rec
-
-
-def collect_runs(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool, max_calls: int,
-                 jobs_for: str = "all") -> tuple[int, dt.datetime]:
-    """Record the completed runs not yet recorded. Build workflows go first; once `max_calls` API
-    calls are spent the rest wait for the next collection, which looks back far enough to find them."""
-    key = lambda r: (r["run_id"] if not r.get("merge_metadata_pending") else -r["run_id"], r["run_attempt"])
-    have = seen_keys("runs", repo, since, until, key)
-    # Backfilling only the build workflows lists them through their own endpoints: listing every
-    # run costs a call per hundred, and TauCeti creates tens of thousands a day.
-    if jobs_for == "build-only":
-        sources = [list_completed_runs(gh, repo, since, until, w.rsplit("/", 1)[1])
-                   for w in sorted(BUILD_WORKFLOWS)]
-    else:
-        sources = [list_completed_runs(gh, repo, since, until)]
-    new = []
-    for r in (r for src in sources for r in src):
-        if gh.calls >= max_calls:
-            print(f"{repo}: API budget reached while listing runs", file=sys.stderr)
-            return 0, since
-        if (r["id"], r.get("run_attempt", 1)) not in have:
-            new.append(r)
-    new.sort(key=lambda r: (r.get("path") not in BUILD_WORKFLOWS, r["created_at"]))
-    enricher = Enricher(gh, repo) if repo in DETAIL_REPOS else None
-
-    def one(r):
-        needs_calls = r.get("conclusion") != "skipped" and needs_jobs(r, jobs_for)
-        if needs_calls and gh.calls >= max_calls:
-            return None
-        return run_record(gh, repo, r, enricher, jobs_for)
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(one, new))
-    records = [r for r in results if r is not None]
-    # Everything created before the earliest run left unrecorded, or still queued or running, is
-    # complete: a run created earlier but not yet finished will appear, and be recorded, later.
-    left = [r["created_at"] for r, rec in zip(new, results) if rec is None]
-    # Only runs created in this window: an ancient run stuck `waiting` (there is one from August)
-    # would otherwise pin the watermark forever, and one created before the window cannot be
-    # recorded by this collection anyway.
-    # Nor a run active for longer than OVERLAP, which is longer than any workflow's timeout: that
-    # run is stuck, not running. One `waiting` run of PR status, created 2026-10-01T01:55Z, never
-    # finished (GitHub would not even cancel it) and held TauCeti's watermark, and with it the CI
-    # charts, at its creation time.
-    stuck_before = until - OVERLAP
-    for status in ("queued", "in_progress", "waiting", "pending", "requested"):
-        active = gh.get(f"repos/{ORG}/{repo}/actions/runs", status=status, per_page=100,
-                        created=f"{iso(since)}..{iso(until)}")
-        left += [r["created_at"] for r in active.get("workflow_runs", [])
-                 if parse_time(r["created_at"]) >= stuck_before]
-    covered = min([until] + [parse_time(t) for t in left])
-    if left:
-        print(f"{repo}: API budget reached; {len(left)} runs left for next time", file=sys.stderr)
-    if not dry_run and records:
-        write_records("runs", repo, records, "created_at", stamp)
-    return len(records), covered
 
 
 def collect_main(gh: GitHub, repo: str, since, until, stamp: str, dry_run: bool) -> int:
     """First-parent history of main: which commits landed when, and from which PR. The merge queue
     fast-forwards main to a group's head, so a merge-queue run landed iff its head_sha is here."""
     have = seen_keys("main", repo, since, until, lambda r: r["sha"])
-    out = []
-    for c in gh.paginate(f"repos/{ORG}/{repo}/commits", sha="main", since=iso(since), until=iso(until)):
-        if c["sha"] in have:
-            continue
-        subj = c["commit"]["message"].splitlines()[0]
-        n = re.search(r"\(#(\d+)\)\s*$", subj)
-        out.append({
-            "schema": "tauceti-ci.main-commit/v1",
-            "sha": c["sha"],
-            "parents": [p["sha"] for p in c["parents"]],
-            "committed_at": c["commit"]["committer"]["date"],
-            "pr": int(n.group(1)) if n else None,
-            "subject": subj[:200],
-        })
-    if not dry_run and out:
-        write_records("main", repo, out, "committed_at", stamp)
-    return len(out)
+    out, count = [], 0
+    def flush():
+        nonlocal count
+        if not dry_run and out:
+            write_records("main", repo, out, "committed_at", stamp)
+        count += len(out)
+        out.clear()
+    try:
+        for c in gh.paginate(f"repos/{ORG}/{repo}/commits", sha="main", since=iso(since), until=iso(until)):
+            if c["sha"] in have:
+                continue
+            subj = c["commit"]["message"].splitlines()[0]
+            n = re.search(r"\(#(\d+)\)\s*$", subj)
+            out.append({
+                "schema": "tauceti-ci.main-commit/v1",
+                "sha": c["sha"],
+                "parents": [p["sha"] for p in c["parents"]],
+                "committed_at": c["commit"]["committer"]["date"],
+                "pr": int(n.group(1)) if n else None,
+                "subject": subj[:200],
+            })
+            if len(out) >= 100:
+                flush()
+    finally:
+        flush()
+    return count
 
 
 def snapshot_settings(gh: GitHub, repo: str, stamp: str, dry_run: bool) -> bool:
@@ -515,91 +439,3 @@ def snapshot_settings(gh: GitHub, repo: str, stamp: str, dry_run: bool) -> bool:
         snap = {"schema": "tauceti-ci.settings/v1", "repo": repo, "observed_at": stamp, "rulesets": rules}
         (d / f"{stamp}.json").write_text(json.dumps(snap, indent=1, sort_keys=True) + "\n")
     return True
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--since", default=None,
-                    help="ISO time or NNh/NNd ago (default: each repository's cursor, minus overlap)")
-    ap.add_argument("--until", default=None, help="ISO time (default now)")
-    ap.add_argument("--repos", default=None, help="comma-separated repos (default: every repo in the org)")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--max-calls", type=int, default=int(os.environ.get("MAX_CALLS", "4500")),
-                    help="stop after this many API calls (default 4500, env MAX_CALLS), and never "
-                         "spend more than the token has left this hour, less a reserve")
-    ap.add_argument("--jobs-for", choices=["all", "build", "build-only"], default="all",
-                    help="all: every workflow, sampling the high-volume ones (default); build: every "
-                         "run listed, jobs only for build workflows; build-only: record only the "
-                         "build workflows (cheapest backfill)")
-    args = ap.parse_args(argv)
-
-    gh = GitHub()
-    # /rate_limit does not count against the limit. Keep a reserve for the push and for anything
-    # else sharing the token.
-    core = gh.get("rate_limit")["resources"]["core"]
-    gh.calls = 0
-    budget = min(args.max_calls, core["remaining"] - max(200, gh.min_remaining))
-    print(f"token: {core['remaining']}/{core['limit']} calls left this hour; budget {budget}", file=sys.stderr)
-    args.max_calls = budget
-    cursor = json.loads(CURSOR.read_text()) if CURSOR.exists() else {}
-    since = parse_time(args.since) if args.since else None
-    until = parse_time(args.until) if args.until else dt.datetime.now(UTC)
-    stamp = dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    repos = args.repos.split(",") if args.repos else [
-        r["name"] for r in gh.paginate(f"orgs/{ORG}/repos") if not r.get("archived")]
-    # The other repositories first, from a reserved share of the budget, then the detail
-    # repositories with everything left. The others need little (a few dozen calls an hour between
-    # them), but collected last they got nothing whenever TauCeti's backlog spent the whole budget:
-    # from 2026-09-28 to 2026-10-01 five of them recorded no runs at all, and since the CI charts end
-    # where the least complete repository does, those charts stopped too.
-    repos.sort(key=lambda r: r in DETAIL_REPOS)
-
-    def since_for(repo):
-        if since:
-            return since
-        c = cursor.get(repo)
-        return parse_time(c) - OVERLAP if c else until - dt.timedelta(hours=24)
-
-    for repo in DETAIL_REPOS & set(repos):
-        if repo == "TauCeti":
-            try:
-                observation_cursor = ROOT / "state" / "observations-cursor.json"
-                observed_to = json.loads(observation_cursor.read_text()) if observation_cursor.exists() else {}
-                observation_since = since if since else parse_time(observed_to[repo]) - dt.timedelta(minutes=2) if repo in observed_to else until - dt.timedelta(days=1)
-                if not args.dry_run and repo not in observed_to:
-                    observed_to[repo] = iso(observation_since)
-                    observation_cursor.parent.mkdir(parents=True, exist_ok=True)
-                    observation_cursor.write_text(json.dumps(observed_to, indent=1) + "\n")
-                observations = list(read_days(observation_since, until))
-                if not args.dry_run and observations:
-                    write_records("observations", repo, observations, "observed_at", stamp)
-                if not args.dry_run:
-                    observed_to[repo] = max(observed_to.get(repo, ""), iso(until))
-                    observation_cursor.parent.mkdir(parents=True, exist_ok=True)
-                    observation_cursor.write_text(json.dumps(observed_to, indent=1) + "\n")
-                print(f"{repo}: {len(observations)} merge observations", file=sys.stderr)
-            except Exception as e:
-                print(f"{repo}: merge observations unavailable: {e}", file=sys.stderr)
-        n = collect_main(gh, repo, since_for(repo), until, stamp, args.dry_run)
-        print(f"{repo} main: {n} new commits", file=sys.stderr)
-        if snapshot_settings(gh, repo, stamp, args.dry_run):
-            print(f"{repo}: rulesets changed", file=sys.stderr)
-    others_cap = gh.calls + args.max_calls // OTHERS_SHARE
-    for repo in repos:
-        if args.jobs_for == "build-only" and repo not in DETAIL_REPOS:
-            continue
-        cap = args.max_calls if repo in DETAIL_REPOS else others_cap
-        n, covered = collect_runs(gh, repo, since_for(repo), until, stamp, args.dry_run,
-                                  cap, args.jobs_for)
-        print(f"{repo}: {n} new runs, complete up to {iso(covered)}", file=sys.stderr)
-        # Only the scheduled (cursor-driven) mode moves the cursor; backfill windows leave it alone.
-        if not since and not args.dry_run:
-            cursor[repo] = max(cursor.get(repo, ""), iso(covered))
-    if not since and not args.dry_run:
-        CURSOR.parent.mkdir(exist_ok=True)
-        CURSOR.write_text(json.dumps(cursor, indent=1, sort_keys=True) + "\n")
-    print(f"API calls: {gh.calls}, rate limit remaining: {gh.remaining}", file=sys.stderr)
-
-
-if __name__ == "__main__":
-    main()
