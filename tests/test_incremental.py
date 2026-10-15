@@ -119,7 +119,7 @@ class IncrementalTests(unittest.TestCase):
 
     def test_cache_reads_only_new_files_and_rejects_records_absent_from_checkout(self):
         self.inventory(run())
-        self.assertEqual(self.index.sync(), 1)
+        self.assertEqual(self.index.sync(), 0)
         with patch('collector.index.gzip.open', side_effect=AssertionError('old gzip reread')):
             self.assertEqual(self.index.sync(), 0)
         for p in (self.records/'inventory').rglob('*.ndjson.gz'):

@@ -59,6 +59,13 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn('only records/ and state/', self.checkpoint(success=False).stderr)
         self.assertEqual(self.git('--git-dir', str(self.remote), 'rev-parse', 'main').stdout, before)
 
+    def test_interrupted_temporary_writes_are_not_published(self):
+        (self.checkout/'records/orphan.tmp').write_text('partial gzip')
+        (self.checkout/'state/cursor.tmp').write_text('partial json')
+        self.checkpoint()
+        files = self.git('--git-dir',str(self.remote),'ls-tree','-r','--name-only','main').stdout
+        self.assertNotIn('.tmp',files)
+
     def test_preserve_concurrent_append_only_writer(self):
         other = self.root/'other'
         self.git('clone', str(self.remote), str(other))

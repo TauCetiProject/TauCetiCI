@@ -9,7 +9,7 @@ on:
     branches: [main]
     paths: ['collector/**', '.github/workflows/collect.yml']
   schedule:
-    - cron: "7,27,47 * * * *"
+    - cron: "3,23,43 * * * *"
   workflow_dispatch:
     inputs:
       since: { description: "Backfill from (e.g. 72h, or an ISO time); empty resumes from the cursor", required: false, default: "" }
@@ -48,8 +48,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .cache/collector.sqlite
-          key: collector-index-v1-${{ github.run_id }}
-          restore-keys: collector-index-v1-
+          key: collector-index-v2-${{ github.run_id }}
+          restore-keys: collector-index-v2-
 
       - name: Collect
         env:
@@ -65,12 +65,13 @@ jobs:
             "${args[@]}" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Publish remaining completed batches
+        id: checkpoint
         if: ${{ always() && !cancelled() }}
         run: python3 -m collector.checkpoint
 
       - name: Save the derived record index
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.checkpoint.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: .cache/collector.sqlite
-          key: collector-index-v1-${{ github.run_id }}
+          key: collector-index-v2-${{ github.run_id }}

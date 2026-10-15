@@ -1,6 +1,7 @@
 """Publish one completed collector checkpoint, keeping concurrent append-only writers."""
 import datetime as dt
 import subprocess
+import time
 
 
 def git(*args, check=True):
@@ -20,7 +21,7 @@ def main():
     git('config', 'user.name', 'tauceti-ci-collector')
     git('config', 'user.email', 'tauceti-ci-collector@users.noreply.github.com')
     records_only(paths('diff', '--name-only', 'origin/main...HEAD'))
-    git('add', '--', 'records', 'state')
+    git('add', '--', 'records', 'state', ':(exclude,glob)records/**/*.tmp', ':(exclude,glob)state/**/*.tmp')
     records_only(paths('diff', '--cached', '--name-only'))
     if git('diff', '--cached', '--quiet', check=False).returncode:
         git('commit', '-qm', f'records: incremental checkpoint {dt.datetime.now(dt.timezone.utc):%Y-%m-%dT%H:%MZ}')
@@ -28,8 +29,11 @@ def main():
         return
     # A previous push may have failed after committing. Retry those commits
     # even when there are no newly staged files.
-    for _ in range(5):
-        git('fetch', '-q', 'origin', 'main')
+    for attempt in range(5):
+        if attempt:
+            time.sleep(min(2**attempt, 10))
+        if git('fetch', '-q', 'origin', 'main', check=False).returncode:
+            continue
         if git('rebase', 'origin/main', check=False).returncode:
             resolved = subprocess.run(['python3', '-m', 'collector.resolve_cursors'], timeout=120)
             if resolved.returncode or git('-c', 'core.editor=true', 'rebase', '--continue', check=False).returncode:

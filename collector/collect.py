@@ -112,6 +112,7 @@ def write_records(kind: str, repo: str | None, records: list[dict], date_field: 
     by_day: dict[str, list[dict]] = {}
     for r in records:
         by_day.setdefault(r[date_field][:10], []).append(r)
+    written = []
     for day, rs in by_day.items():
         d = (RECORDS / kind / repo if repo else RECORDS / kind) / day.replace("-", "/")
         d.mkdir(parents=True, exist_ok=True)
@@ -125,8 +126,10 @@ def write_records(kind: str, repo: str | None, records: list[dict], date_field: 
                 for r in sorted(rs, key=lambda r: r[date_field]):
                     f.write(json.dumps(r, separators=(",", ":"), sort_keys=True, ensure_ascii=False) + "\n")
             os.replace(temporary, target)
+            written.append(target)
         finally:
             temporary.unlink(missing_ok=True)
+    return written
 
 
 # --- enrichment (build workflows of DETAIL_REPOS) -----------------------------------------------
@@ -240,6 +243,15 @@ class Enricher:
             for a in arts.get("artifacts", []):
                 if a.get("expired"):
                     continue
+                # The fixed artifact name is shared across retries. Only bind
+                # telemetry to an attempt when its API timestamps establish the
+                # artifact was uploaded during that execution.
+                started, finished, created = run.get('run_started_at'), run.get('updated_at'), a.get('created_at')
+                if run.get('run_attempt',1) > 1 or created:
+                    if not started or not finished or not created:
+                        continue
+                    if not parse_time(started) <= parse_time(created) <= parse_time(finished):
+                        continue
                 data = self.gh.raw(f"repos/{ORG}/{self.repo}/actions/artifacts/{a['id']}/zip")
                 with zipfile.ZipFile(io.BytesIO(data)) as z:
                     record = json.loads(z.read("telemetry.json"))

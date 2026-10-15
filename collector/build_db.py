@@ -85,6 +85,10 @@ CREATE TABLE annotations (at TEXT, text TEXT);
 CREATE TABLE coverage (repo TEXT PRIMARY KEY, complete_to TEXT);
 CREATE TABLE stream_coverage (repo TEXT, stream TEXT, since TEXT, complete_to TEXT,
   PRIMARY KEY(repo,stream,since,complete_to));
+CREATE TABLE collection_gaps (repo TEXT,run_id INTEGER,run_attempt INTEGER,stream TEXT,created_at TEXT,reason TEXT,
+  PRIMARY KEY(repo,run_id,run_attempt,stream));
+CREATE TABLE enrichment_state (repo TEXT,run_id INTEGER,run_attempt INTEGER,stage TEXT,
+  PRIMARY KEY(repo,run_id,run_attempt));
 CREATE TABLE queue_observation_metadata (observed_at TEXT PRIMARY KEY, eligible_count INTEGER,
   candidate_scan_complete INTEGER, candidate_snapshot_at TEXT);
 CREATE TABLE telemetry (repo TEXT, run_id INTEGER, phases_json TEXT, build_json TEXT, meta_json TEXT,
@@ -230,6 +234,13 @@ def build(out: Path):
                 r["repo"], r["run_id"], r["run_attempt"], t["pr"], t["head_sha"],
                 r.get("updated_at"), json.dumps({"diff": d, "behind_by": t.get("behind_by"),
                     "build": (r.get("telemetry") or {}).get("build") or {}})))
+        stage = r.get('collection_stage', 'runs')
+        db.execute('INSERT OR REPLACE INTO enrichment_state VALUES (?,?,?,?)',
+                   (r['repo'],r['run_id'],r['run_attempt'],stage))
+        for stream in ('jobs','details'):
+            if r.get(stream+'_gap'):
+                db.execute('INSERT OR REPLACE INTO collection_gaps VALUES (?,?,?,?,?,?)',
+                    (r['repo'],r['run_id'],r['run_attempt'],stream,r['created_at'],r[stream+'_gap']['reason']))
         prev = db.execute("SELECT run_attempt FROM runs WHERE repo=? AND run_id=?",
                           (r["repo"], r["run_id"])).fetchone()
         if not prev or prev[0] <= r["run_attempt"]:
@@ -260,7 +271,7 @@ def build(out: Path):
                 r["repo"], r["run_id"], r["run_attempt"], r.get("conclusion"), cohort(r),
                 (((r.get("observations") or {}).get("resources") or {}).get("payload") or {}).get("workflow_sha")))
             for kind in ("resources", "publication"):
-                observation = (r.get("observations") or {}).get(kind) or {"coverage": "historical-missing"}
+                observation = (r.get("observations") or {}).get(kind) or {"coverage": "enrichment-unavailable" if r.get("details_gap") else "pending-enrichment" if stage != "runs" else "historical-missing"}
                 db.execute("INSERT OR REPLACE INTO resource_observations VALUES (?,?,?,?,?,?,?)", (
                     r["repo"], r["run_id"], r["run_attempt"], kind, observation["coverage"],
                     observation.get("artifact_id"),
@@ -297,6 +308,16 @@ def build(out: Path):
                     s.get("started_at"), s.get("completed_at"),
                     seconds(s.get("started_at"), s.get("completed_at"))))
 
+    for r in records('attempt-gaps'):
+        db.execute('INSERT OR REPLACE INTO collection_gaps VALUES (?,?,?,?,?,?)',
+                   (r['repo'],r['run_id'],r['run_attempt'],'attempt',r['created_at'],r['reason']))
+        db.execute('INSERT OR IGNORE INTO run_attempts VALUES (?,?,?,?,?,?)',
+                   (r['repo'],r['run_id'],r['run_attempt'],None,'unknown',None))
+        for kind in ('resources','publication'):
+            db.execute('''INSERT INTO resource_observations VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(repo,run_id,run_attempt,kind) DO UPDATE SET coverage='attempt-unavailable'
+                WHERE coverage IN ('pending-enrichment','historical-missing','attempt-not-collected')''',
+                       (r['repo'],r['run_id'],r['run_attempt'],kind,'attempt-unavailable',None,None))
     # Batch membership is cheap, independently collected metadata. It remains
     # usable when job/artifact enrichment has not caught up.
     for r in records('merge-members'):
@@ -336,7 +357,10 @@ def build(out: Path):
                    (s["repo"], s["observed_at"], json.dumps(s["rulesets"])))
     cursor = ROOT / "state" / "cursor.json"
     if cursor.exists():
-        db.executemany("INSERT INTO coverage VALUES (?,?)", json.loads(cursor.read_text()).items())
+        catalog = ROOT / 'state/repositories.json'
+        active = set(json.loads(catalog.read_text())['active']) if catalog.exists() else None
+        db.executemany("INSERT INTO coverage VALUES (?,?)", [(repo,end) for repo,end in json.loads(cursor.read_text()).items()
+                                                           if active is None or repo in active])
     # Preserve each proven inventory interval, including recent windows ahead
     # of a historical backlog. Consumers can shade gaps instead of calling them
     # empty queues or missing staging activity.
@@ -355,6 +379,13 @@ def build(out: Path):
             if first and first < end:
                 db.execute('INSERT OR IGNORE INTO stream_coverage VALUES (?,?,?,?)',
                            (repo, 'build-jobs', first, end))
+    details_cursor = ROOT / 'state/details-cursor.json'
+    if details_cursor.exists():
+        for repo, end in json.loads(details_cursor.read_text()).items():
+            first = db.execute('SELECT MIN(created_at) FROM runs WHERE repo=?', (repo,)).fetchone()[0]
+            if first and first < end:
+                db.execute('INSERT OR IGNORE INTO stream_coverage VALUES (?,?,?,?)',
+                           (repo, 'details', first, end))
     notes = RECORDS / "annotations.json"
     if notes.exists():
         db.executemany("INSERT INTO annotations VALUES (?,?)",

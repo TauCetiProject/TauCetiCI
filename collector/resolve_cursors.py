@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 
 ALLOWED = {'state/cursor.json', 'state/observations-cursor.json',
-           'state/inventory-cursor.json', 'state/build-cursor.json'}
+           'state/inventory-cursor.json', 'state/build-cursor.json', 'state/main-cursor.json', 'state/details-cursor.json'}
 
 
 def merge(left, right):

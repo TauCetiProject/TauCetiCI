@@ -194,7 +194,7 @@ def observed_baseline(db, since, until):
         JOIN main_landings l ON m.repo=l.repo AND m.head_sha=l.head_sha
         WHERE m.repo='TauCeti' AND m.engine='bors' AND l.landed_at>=? AND l.landed_at<=?""", (since, until)):
         members.update(item['pr'] for item in json.loads(payload or "[]") if item.get('pr'))
-    return {"attempted_runs": len(runs), "missing_job_runs": sum(not r[2] for r in runs),
+    return {"attempted_runs": len(runs), "missing_job_runs": sum(not r[2] and r[1] is not None for r in runs),
             "recorded_validation_runner_minutes": minutes, "accepted_distinct_prs": len(members),
             "recorded_accepted_prs_per_hour": len(members) * 3600 / max(1, timestamp(until) - timestamp(since)),
             "collection_complete_to": covered[0] if covered else None,

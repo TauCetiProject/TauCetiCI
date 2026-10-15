@@ -9,10 +9,12 @@ import argparse
 import copy
 import datetime as dt
 import json
+import hashlib
 import signal
 import subprocess
 import threading
 import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import collect
@@ -24,6 +26,10 @@ from .merge_identity import apply_dispatch_title
 
 class CollectionStopped(BaseException):
     """Cooperative stop, like KeyboardInterrupt: optional enrichment must not swallow it."""
+
+
+class CheckpointFailed(BaseException):
+    """Stop collection when publication fails; the workflow may retry the saved batch."""
 
 
 class BoundedGitHub(GitHub):
@@ -77,9 +83,18 @@ class BoundedGitHub(GitHub):
                 self.cache[key] = copy.deepcopy(result)
         return result
 
+    def fit_quota(self, reserve=200):
+        self.phase(1)
+        try:
+            remaining = self.get('rate_limit')['resources']['core']['remaining']
+            self.max_calls = min(self.max_calls, self.started+max(0, remaining-reserve))
+        except (CollectionStopped, Exception) as e:
+            self.max_calls = self.started
+            print(f'GitHub quota unavailable: {e}', flush=True)
+
     def phase(self, calls, seconds=None):
         self.phase_limit = min(self.max_calls, self.started + calls)
-        self.phase_deadline = min(self.deadline, time.monotonic()+seconds) if seconds else self.deadline
+        self.phase_deadline = min(self.deadline, time.monotonic()+min(seconds,max(0,(self.deadline-time.monotonic())/2))) if seconds else self.deadline
 
 
 def read_state(name):
@@ -107,11 +122,14 @@ class Checkpoint:
     def __call__(self, force=False):
         if not self.push or not force and time.monotonic()-self.last < self.interval:
             return
-        if self.prepare:
-            self.prepare()
-        # Fail rather than silently collect another half hour after a failed
-        # checkpoint. The workflow's final step retries this same publication.
-        subprocess.run(['python3', '-m', 'collector.checkpoint'], check=True)
+        # Fail rather than silently collecting after a failed publication.
+        # The workflow's final step retries this same completed batch.
+        try:
+            if self.prepare:
+                self.prepare()
+            subprocess.run(['python3', '-m', 'collector.checkpoint'], check=True, timeout=300)
+        except Exception as e:
+            raise CheckpointFailed(str(e)) from e
         self.last = time.monotonic()
 
 
@@ -127,15 +145,17 @@ def listing_source(run):
     return out
 
 
-def inventory_record(repo, run):
-    r = {'schema': collect.SCHEMA, 'repo': repo, 'run_id': run['id'],
+def inventory_record(repo, run, jobs_for='all'):
+    r = {'schema': collect.SCHEMA, 'collection_stage': 'inventory', 'repo': repo, 'run_id': run['id'],
          'run_attempt': run.get('run_attempt', 1), 'workflow': run.get('path') or run.get('name'),
          'event': run['event'], 'trigger': collect.trigger_class(run),
          'conclusion': run.get('conclusion'), 'head_sha': run['head_sha'],
          'head_branch': run.get('head_branch'), 'head_repo': (run.get('head_repository') or {}).get('full_name'),
          'created_at': run['created_at'], 'updated_at': run.get('updated_at'),
          'title': (run.get('display_title') or '')[:200],
-         'jobs': [], 'jobs_fetched': False, '_listing': listing_source(run)}
+         'jobs': [], '_listing': listing_source(run), 'jobs_for': jobs_for}
+    if run.get('conclusion') != 'skipped':
+        r['jobs_fetched'] = False
     apply_dispatch_title(r, r['title'])
     return r
 
@@ -143,7 +163,12 @@ def inventory_record(repo, run):
 def persist(index, kind, repo, records, stamp):
     if not records:
         return
-    collect.write_records(kind, repo, records, 'created_at', stamp)
+    for r in records:
+        r['collection_stage'] = kind
+    written = collect.write_records(kind, repo, records, 'created_at', stamp)
+    for path in written:
+        index.db.execute('INSERT OR REPLACE INTO files VALUES (?,?)',
+                         (str(path.relative_to(index.records)), path.stat().st_size))
     for r in records:
         index.ingest(kind, r)
     index.db.commit()
@@ -182,16 +207,17 @@ def list_window(gh, repo, since, until, page_done):
         raise RuntimeError(f'{repo}: incomplete listing; coverage left open')
 
 
-def scan(gh, index, repo, since, until, stamp, checkpoint, cursor=None):
+def scan(gh, index, repo, since, until, stamp, checkpoint, cursor=None, cursor_name='inventory-cursor.json', jobs_for='all'):
     """Small chronological windows; interrupted windows are replayed and deduplicated."""
     def page_done(items):
         records = []
         for run in items:
-            old = index.db.execute('SELECT updated,status FROM runs WHERE repo=? AND id=? AND attempt=?',
+            old = index.db.execute('SELECT updated,status,required FROM runs WHERE repo=? AND id=? AND attempt=?',
                                    (repo, run['id'], run.get('run_attempt', 1))).fetchone()
-            if old == (run.get('updated_at'), run.get('status')):
+            required = run.get('conclusion') != 'skipped' and collect.needs_jobs(run, jobs_for)
+            if old and old[:2] == (run.get('updated_at'), run.get('status')) and old[2] >= required:
                 continue
-            records.append(inventory_record(repo, run))
+            records.append(inventory_record(repo, run, jobs_for))
         persist(index, 'inventory', repo, records, stamp)
         checkpoint()
 
@@ -207,7 +233,7 @@ def scan(gh, index, repo, since, until, stamp, checkpoint, cursor=None):
             covered_to = end
             if cursor is not None:
                 cursor[repo] = collect.iso(end)
-                save_state('inventory-cursor.json', cursor)
+                save_state(cursor_name, cursor)
             since = end
             checkpoint()
     finally:
@@ -280,17 +306,66 @@ def merge_members(gh, index, stamp, checkpoint, limit=80):
         checkpoint()
 
 
+def refresh_active(gh,index,stamp,checkpoint,until):
+    rows = index.db.execute("""SELECT r.repo,r.id,MIN(r.created) FROM runs r
+        LEFT JOIN active_refresh a ON a.repo=r.repo AND a.id=r.id
+        WHERE r.status!='completed' AND r.created<? AND COALESCE(a.next_refresh,0)<=?
+        GROUP BY r.repo,r.id ORDER BY COALESCE(a.next_refresh,0),r.created LIMIT 50""",
+        (collect.iso(until-collect.OVERLAP),time.time())).fetchall()
+    for repo,number,created in rows:
+        gh.check()
+        try:
+            source = gh.get(f'repos/{collect.ORG}/{repo}/actions/runs/{number}')
+            if source['id'] != number:
+                raise ValueError('run endpoint returned mismatched identity')
+            persist(index,'inventory',repo,[inventory_record(repo,source)],stamp)
+        except CollectionStopped:
+            raise
+        except Exception as e:
+            print(f'{repo} active run {number}: deferred {type(e).__name__}: {e}',flush=True)
+        index.db.execute('INSERT OR REPLACE INTO active_refresh VALUES (?,?,?)',(repo,number,time.time()+3600))
+        index.db.commit()
+        checkpoint()
+
+
+def earlier_attempts(gh, index, stamp, checkpoint):
+    while True:
+        pending = index.attempts()
+        if not pending:
+            return
+        for repo, number, attempt, created in pending:
+            gh.check()
+            run = {'id': number, 'run_attempt': attempt}
+            try:
+                source = gh.get(f'repos/{collect.ORG}/{repo}/actions/runs/{number}/attempts/{attempt}')
+                if source['id'] != number or source.get('run_attempt',1) != attempt:
+                    raise ValueError('attempt endpoint returned mismatched identity')
+                persist(index, 'inventory', repo, [inventory_record(repo, source)], stamp)
+            except CollectionStopped:
+                raise
+            except Exception as e:
+                failures = index.failures(repo,run,'attempt')+1
+                permanent = isinstance(e,urllib.error.HTTPError) and e.code in (404,410)
+                record = {'repo': repo, 'run_id': number, 'run_attempt': attempt,
+                          'created_at': created, 'stream': 'attempt', 'failures': failures,
+                          'reason': f'{type(e).__name__}: {e}'[:500], 'retry_after': time.time()+3600}
+                persist(index, 'attempt-gaps' if permanent or failures >= 3 else 'collection-errors', repo, [record], stamp)
+            checkpoint()
+
+
 def enrich(gh, index, stamp, checkpoint, *, build, detail=False, recent=None):
     enrichers = {}
     completed = {}
     last_flush = time.monotonic()
+    publication_failure = None
     def flush():
         nonlocal last_flush
         for repo, records in completed.items():
             persist(index, 'runs' if detail else 'jobs', repo, records, stamp)
         completed.clear()
         last_flush = time.monotonic()
-        checkpoint()
+        if publication_failure is None:
+            checkpoint()
     while True:
         gh.check()
         pending = index.pending(build=build, detail=detail, recent=recent)
@@ -324,33 +399,56 @@ def enrich(gh, index, stamp, checkpoint, *, build, detail=False, recent=None):
                 except Exception as e:
                     item = pending[futures.index(future)]
                     repo, run, _ = item
-                    index.db.execute('''UPDATE runs SET retry_after=?
-                        WHERE repo=? AND id=? AND attempt=?''',
-                        (time.time()+3600, repo, run['id'], run.get('run_attempt', 1)))
-                    index.db.commit()
-                    print(f'{repo} run {run["id"]}: deferred {type(e).__name__}', flush=True)
+                    stream = 'details' if detail else 'jobs'
+                    failures = index.failures(repo, run, stream)+1
+                    message = f'{type(e).__name__}: {e}'[:500]
+                    permanent = isinstance(e, urllib.error.HTTPError) and e.code in (404,410)
+                    if permanent or failures >= 3:
+                        record = copy.deepcopy(item[2])
+                        record[stream+'_gap'] = {'reason': message, 'failures': failures}
+                        if not detail:
+                            record['jobs_fetched'] = False
+                        persist(index, 'runs' if detail else 'jobs', repo, [record], stamp)
+                        print(f'{repo} run {run["id"]}: {stream} unavailable ({message})', flush=True)
+                    else:
+                        receipt = {'repo': repo, 'run_id': run['id'], 'run_attempt': run.get('run_attempt',1),
+                                   'stream': stream, 'created_at': run['created_at'], 'failures': failures,
+                                   'retry_after': time.time()+3600, 'reason': message}
+                        persist(index, 'collection-errors', repo, [receipt], stamp)
+                        print(f'{repo} run {run["id"]}: deferred {message}', flush=True)
                     continue
                 completed.setdefault(repo, []).append(record)
                 if sum(map(len, completed.values())) >= 16 or time.monotonic()-last_flush >= 5:
-                    flush()
+                    try:
+                        flush()
+                    except CheckpointFailed as e:
+                        publication_failure = e
+                        gh.stop_requested = True
         flush()
+        if publication_failure:
+            raise publication_failure
         if stopped:
             raise stopped
 
 
-def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False):
+def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False, jobs_for='all'):
     index.sync()
     legacy = read_state('cursor.json')
     inventory = read_state('inventory-cursor.json') or dict(legacy)
     errors = []
+    backfill_name = 'backfills/'+hashlib.sha256((collect.iso(since)+'..'+collect.iso(until)+'..'+jobs_for).encode()).hexdigest()[:32]+'.json' if since else None
+    backfill = read_state(backfill_name) if since else None
     def coverage():
         if not since:
             full, builds = dict(legacy), read_state('build-cursor.json')
+            details = read_state('details-cursor.json')
             for repo, end in inventory.items():
                 full[repo] = index.coverage(repo, end)
                 builds[repo] = index.coverage(repo, end, build=True)
+                details[repo] = index.coverage(repo, end, build=True, detail=True)
             save_state('cursor.json', full)
             save_state('build-cursor.json', builds)
+            save_state('details-cursor.json', details)
     if isinstance(checkpoint, Checkpoint):
         checkpoint.prepare = coverage
     def phase(label, calls, work, seconds=None):
@@ -360,57 +458,70 @@ def run(gh, index, repos, until, stamp, checkpoint, since=None, discover=False):
         except (CollectionStopped, RateLimitUnavailable) as e:
             print(f'{label}: {e}', flush=True)
         except Exception as e:
-            errors.append(f'{label}: {type(e).__name__}')
+            errors.append(f'{label}: {type(e).__name__}: {e}')
             print(errors[-1], flush=True)
         finally:
             checkpoint()
 
     phase('observations', 0, lambda: observations(gh, stamp, checkpoint, until), seconds=120)
+    if hasattr(gh, 'fit_quota'):
+        gh.fit_quota()
     if discover:
         def discover_repositories():
             active = [r['name'] for r in gh.paginate(f'orgs/{collect.ORG}/repos') if not r.get('archived')]
             repos[:] = active
+            save_state('repositories.json', {'observed_at': stamp, 'active': sorted(active)})
         # Repository discovery is optional when GitHub's quota is exhausted;
         # saved repositories and the independent Bors stream remain collectable.
         phase('repository discovery', 20, discover_repositories, seconds=30)
+    # Main history is needed for landing dates and throughput, so reserve its
+    # small budget before optional artifact/log enrichment.
+    def main_history():
+        main_cursor = read_state('main-cursor.json')
+        for repo in set(repos) & collect.DETAIL_REPOS:
+            start = since or collect.parse_time(main_cursor.get(repo, legacy.get(repo, collect.iso(until)))) - collect.OVERLAP
+            collect.collect_main(gh, repo, start, until, stamp, False)
+            if not since:
+                main_cursor[repo] = collect.iso(until)
+                save_state('main-cursor.json', main_cursor)
+            collect.snapshot_settings(gh, repo, stamp, False)
+    phase('main history', max(1, gh.max_calls//20), main_history, seconds=120)
+    phase('older active metadata',max(1,gh.max_calls//50),
+          lambda: refresh_active(gh,index,stamp,checkpoint,until),seconds=60)
     # Give every repository a recent scan before spending the discovery budget
     # on an older backlog. This never advances the historical cursor across a gap.
     inventory_budget = max(1, gh.max_calls*2//5)
     gh.phase(inventory_budget, seconds=600)
-    for repo in sorted(repos, key=lambda r: r not in collect.DETAIL_REPOS):
+    for repo in sorted(repos, key=lambda r: r not in collect.DETAIL_REPOS) if not since else []:
         try:
             scan(gh, index, repo, since or until-collect.OVERLAP, until, stamp, checkpoint)
         except CollectionStopped as e:
             print(f'recent inventory: {e}', flush=True)
             break
         except Exception as e:
-            errors.append(f'{repo} recent inventory: {type(e).__name__}')
+            errors.append(f'{repo} recent inventory: {type(e).__name__}: {e}')
             print(errors[-1], flush=True)
     for repo in repos:
-        start = since or collect.parse_time(inventory.get(repo, collect.iso(until-dt.timedelta(days=1))))
+        start = collect.parse_time(backfill.get(repo, collect.iso(since))) if since else collect.parse_time(inventory.get(repo, collect.iso(until-dt.timedelta(days=1))))
         try:
-            scan(gh, index, repo, start, until, stamp, checkpoint, None if since else inventory)
+            scan(gh, index, repo, start, until, stamp, checkpoint, backfill if since else inventory,
+                 backfill_name if since else 'inventory-cursor.json', jobs_for=jobs_for)
         except CollectionStopped as e:
             print(f'historical inventory: {e}', flush=True)
             break
         except Exception as e:
-            errors.append(f'{repo} historical inventory: {type(e).__name__}')
+            errors.append(f'{repo} historical inventory: {type(e).__name__}: {e}')
             print(errors[-1], flush=True)
     phase('merge membership', 0, lambda: merge_members(gh, index, stamp, checkpoint), seconds=60)
-    # Main history is needed for landing dates and throughput, so reserve its
-    # small budget before optional artifact/log enrichment.
-    def main_history():
-        for repo in set(repos) & collect.DETAIL_REPOS:
-            start = since or collect.parse_time(legacy.get(repo, collect.iso(until-collect.OVERLAP)))
-            collect.collect_main(gh, repo, start, until, stamp, False)
-            collect.snapshot_settings(gh, repo, stamp, False)
-    phase('main history', max(1, gh.max_calls//20), main_history, seconds=120)
+    phase('earlier attempt metadata', max(1, gh.max_calls//20),
+          lambda: earlier_attempts(gh,index,stamp,checkpoint), seconds=120)
     remaining = max(0, gh.max_calls-gh.started)
     phase('recent build jobs', remaining//4, lambda: enrich(
         gh, index, stamp, checkpoint, build=True, recent=collect.iso(until-collect.OVERLAP)))
     phase('historical build jobs', remaining//4,
           lambda: enrich(gh, index, stamp, checkpoint, build=True))
-    phase('sampled auxiliary jobs', max(0, gh.max_calls-gh.started-min(200, remaining//10)),
+    if jobs_for == 'all':
+        phase('sampled auxiliary jobs', max(0, gh.max_calls-gh.started-min(200, remaining//10)),
           lambda: enrich(gh, index, stamp, checkpoint, build=False))
     phase('optional details', max(0, gh.max_calls-gh.started),
           lambda: enrich(gh, index, stamp, checkpoint, build=True, detail=True))
@@ -430,6 +541,7 @@ def main(argv=None):
     ap.add_argument('--index', default='.cache/collector.sqlite')
     ap.add_argument('--push', action='store_true', help='publish checkpoints at most two minutes apart')
     ap.add_argument('--repos', default=None)
+    ap.add_argument('--jobs-for', choices=['build', 'all'], default='all')
     ap.add_argument('--since')
     ap.add_argument('--until')
     args = ap.parse_args(argv)
@@ -442,15 +554,18 @@ def main(argv=None):
     checkpoint = Checkpoint(args.push)
     try:
         repos = args.repos.split(',') if args.repos else sorted(
-            set(read_state('cursor.json')) | set(read_state('inventory-cursor.json')) | {'TauCeti'})
+            set(read_state('repositories.json').get('active') or
+                (set(read_state('cursor.json')) | set(read_state('inventory-cursor.json')) | {'TauCeti'})))
         until = collect.parse_time(args.until) if args.until else dt.datetime.now(collect.UTC).replace(microsecond=0)
         stamp = dt.datetime.now(collect.UTC).strftime('%Y%m%dT%H%M%S%fZ')
         run(gh, index, repos, until, stamp, checkpoint,
             collect.parse_time(args.since).replace(microsecond=0) if args.since else None,
-            discover=not args.repos)
+            discover=not args.repos, jobs_for=args.jobs_for)
     finally:
-        checkpoint(force=True)
-        index.close()
+        try:
+            checkpoint(force=True)
+        finally:
+            index.close()
 
 
 if __name__ == '__main__':

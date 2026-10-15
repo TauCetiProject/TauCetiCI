@@ -96,7 +96,7 @@ class Report:
         unknown_post = self.db.execute("""SELECT COALESCE(SUM(j.run_s),0)/60 FROM jobs j
             JOIN post_merge_runs p USING(repo,run_id) WHERE p.engine IS NULL""").fetchone()[0]
         missing_jobs = self.db.execute("""SELECT COUNT(*) FROM runs r WHERE r.repo='TauCeti'
-            AND r.jobs_fetched=0 AND (r.trigger='main' OR EXISTS
+            AND r.jobs_fetched=0 AND r.conclusion IS NOT NULL AND (r.trigger='main' OR EXISTS
               (SELECT 1 FROM merge_builds m WHERE m.repo=r.repo AND m.run_id=r.run_id))""").fetchone()[0]
         self.p(f"Unattributed or ambiguous main-push cost: {unknown_post:.1f} job minutes "
                f"(shown separately, never assigned from MERGE_BACKEND). "
@@ -279,7 +279,7 @@ class Report:
                 if hi <= lo:
                     continue
                 incomplete = self.db.execute("""SELECT COUNT(*) FROM runs WHERE repo='TauCeti'
-                    AND jobs_fetched=0 AND created_at>=? AND created_at<?""", (e[start], endpoint)).fetchone()[0]
+                    AND jobs_fetched=0 AND conclusion IS NOT NULL AND created_at>=? AND created_at<?""", (e[start], endpoint)).fetchone()[0]
                 samples = [o for o in observations if lo <= ts(o[0]) < hi]
                 arrivals = sum(lo <= at < hi for at in first_ready.values())
                 pending = [o[1] for o in samples if o[1] is not None]

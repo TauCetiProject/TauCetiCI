@@ -70,21 +70,29 @@ The disposable `.cache/collector.sqlite` index remembers known files, pending at
 batch membership; a cache miss rebuilds it from git. Warm invocations read only new record
 files. Job fetching uses attempt-specific endpoints, persists small completed batches, retries
 individual failures later, and reserves work for both current builds and sampled auxiliary
-jobs before optional enrichment. Completed artifact listings and immutable comparisons are
-shared within an invocation. Bors observations and batch membership have independent budgets
+jobs before optional enrichment. Missing earlier attempts get their own metadata and job work
+items; already archived attempt jobs are not fetched again. Known workflows still active after
+six hours are polled by run id with an hourly backoff. Completed artifact listings and immutable
+comparisons are shared within an invocation. Bors observations and batch membership have independent budgets
 and do not require GitHub API quota.
 
 `state/inventory-cursor.json` tracks contiguous discovery, `state/build-cursor.json` tracks
-build-job completeness, and `state/cursor.json` retains all sampled-job completeness.
+build-job completeness, `state/details-cursor.json` tracks optional detail work, and
+`state/cursor.json` retains all sampled-job completeness. Main history has its own
+`state/main-cursor.json` with overlap for commits created before they reached main. The active
+repository catalog keeps archived repositories from pinning current fleet coverage.
 Inventory coverage receipts also expose newer discovery islands across an older backlog.
 The observation cursor advances only after every page of an archive day was read. A separate
 page position resumes interrupted archives and replays the current tail page to discover new
 observations, instead of downloading the entire day again. External reads and inventory also
-have phase time limits, leaving time for job collection. Recent
-active workflows hold job coverage open; historical stuck runs remain visible in inventory
+have phase time limits, leaving time for job collection. Recent active workflows hold job coverage open; historical stuck runs remain visible in inventory
 but stop pinning the watermark after the six-hour overlap. Reruns of runs created outside
 that overlap require an explicit backfill; no claim of continuous historical rerun monitoring
-is made. Earlier attempts without snapshots remain explicitly missing.
+is made. Permanently unavailable attempts and jobs are explicit gaps. A 404/410 ends that work item;
+other errors retain durable retry receipts and become explicit gaps after three failures,
+instead of pinning every later chart indefinitely. The published database retains their
+reasons, and chart freshness metadata and visible notes report these gaps. Resource records
+awaiting enrichment are labelled pending, separately from missing historical artifacts.
 
 If the installation token is too small for the organisation's volume, configure
 `COLLECTOR_APP_ID` and `COLLECTOR_APP_PRIVATE_KEY` for an App installed on the organisation.
@@ -93,8 +101,12 @@ write records and keep existing coverage cursors conservative; add `--push` only
 main checkout where completed records may be published:
 
 ```bash
-python3 -m collector.incremental --since 2026-09-01 --until 2026-09-08
+python3 -m collector.incremental --since 2026-09-01 --until 2026-09-08 --jobs-for build
 ```
+
+The manual `backfill` workflow uses this same collector and checkpoint path. Re-dispatching
+the same range and job mode resumes its separate inventory cursor, rather than restarting
+the range. It shares the collection lock so checkpoint writers do not overlap.
 
 Job logs are kept by GitHub for 90 days, so failure excerpts can be backfilled only that far.
 Run and job metadata do not expire.

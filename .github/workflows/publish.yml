@@ -6,7 +6,7 @@ name: publish
 
 on:
   workflow_run:
-    workflows: [collect]
+    workflows: [collect, backfill]
     types: [completed]
     branches: [main]
   schedule:
