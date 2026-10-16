@@ -1,12 +1,12 @@
 {
- "TauCeti": "2026-10-14T22:02:45Z",
- "TauCetiCI": "2026-10-15T23:18:31Z",
+ "TauCeti": "2026-10-15T01:32:42Z",
+ "TauCetiCI": "2026-10-16T01:31:14Z",
  "TauCetiData": "2026-10-16T01:31:26Z",
  "TauCetiFleet": "2026-10-16T01:31:26Z",
  "TauCetiProgress": "2026-10-16T01:31:26Z",
  "TauCetiReview": "2026-10-16T01:31:26Z",
- "TauCetiRoadmap": "2026-10-15T23:37:56Z",
+ "TauCetiRoadmap": "2026-10-16T00:22:21Z",
  "TauCetiWorker": "2026-10-16T01:31:26Z",
- "bors-ng": "2026-10-16T00:03:32Z",
+ "bors-ng": "2026-10-16T00:20:22Z",
  "tauceti-claims": "2026-10-16T01:31:26Z"
 }
