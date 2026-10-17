@@ -1,0 +1,43 @@
+{
+  "already_recorded": 109,
+  "api_calls": 132,
+  "api_limit": 150,
+  "attempted": 16,
+  "deferred": null,
+  "error": null,
+  "explicit_run_ids": [],
+  "gaps": [
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39070092868
+    }
+  ],
+  "list_limit_per_workflow": 100,
+  "listings": [
+    {
+      "returned": 100,
+      "total_count": 328,
+      "truncated": true,
+      "workflow": "pr-build.yml"
+    },
+    {
+      "returned": 25,
+      "total_count": 25,
+      "truncated": false,
+      "workflow": "ci.yml"
+    }
+  ],
+  "max_runs": 20,
+  "mode": "bounded-recent-resources",
+  "recorded": 15,
+  "request_attempts": 132,
+  "request_start_budget_seconds": 300,
+  "since": "2026-10-17T15:45:08Z",
+  "until": "2026-10-17T21:45:08Z",
+  "unverified_producers": 0,
+  "without_artifacts": 1
+}
