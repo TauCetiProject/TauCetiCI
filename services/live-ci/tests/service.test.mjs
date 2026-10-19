@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createHmac, generateKeyPairSync } from "node:crypto";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { build } from "esbuild";
+import { includeDedicatedFleet } from "./dedicated-reference.mjs";
 const repo = "TauCetiProject/TauCeti";
 const clock = Math.floor(Date.now() / 1000),
   date = new Date((clock - 300) * 1000).toISOString().slice(0, 10);
@@ -41,7 +42,7 @@ const job = (id = "200", run_id = "100") => ({
     },
   ],
 });
-async function runtime(t, bindings = {}, upstream) {
+async function runtime(t, bindings = {}, upstream, borsUpstream) {
   let github = 0;
   const options = convertV4MiniflareOptions({
     modules: true,
@@ -70,6 +71,8 @@ async function runtime(t, bindings = {}, upstream) {
         github++;
         if (upstream) return upstream(req);
       }
+      if (new URL(req.url).hostname === "bors.taucetiproject.org" && borsUpstream)
+        return borsUpstream(req);
       return Response.json({ observations: [], truncated: false });
     },
   });
@@ -127,6 +130,69 @@ async function runtime(t, bindings = {}, upstream) {
     github: () => github,
   };
 }
+test("membership repair and coverage progress while GitHub quota is exhausted", async (t) => {
+  const r = await runtime(t, {
+    GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2",
+    GITHUB_PRIVATE_KEY: "unused", GITHUB_HOURLY_BUDGET: "500",
+  }, undefined, (req) => Response.json(new URL(req.url).pathname.endsWith("active-batches") ? {
+    repo, requested_batch: { id: 42, head_sha: "b".repeat(40), members: [{ pr: 7 }, { pr: 8 }, { pr: 7 }] },
+  } : { observations: [], truncated: false }));
+  assert.equal((await r.post("/lease", { publisher: "1/1", run_id: "999", attempt: 1 })).granted, true);
+  await r.updateBindings({ GITHUB_HOURLY_BUDGET: "6" });
+  const raw = { ...run(), event: "repository_dispatch",
+    display_title: `bors branch=main batch=42 head=${"b".repeat(40)} base=${"a".repeat(40)}` };
+  await r.ingest({ historical: true, run: raw, jobs: [job()] });
+  await r.notify();
+  await r.post("/publish");
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  let manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.groups.staging.pending, 1);
+  const svg = await (await bucket.get("public" + manifest.assets["ci-bors-staging.svg"].url)).text();
+  assert.match(svg, /data-ci-membership-pending/);
+  await r.post("/tick");
+  assert.deepEqual((await r.summary()).staging[0].members, [7, 8]);
+  assert.equal((await r.post("/repairs", { kind: "members" })).length, 0);
+  manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.groups.staging.pending, 0);
+  assert.equal(r.github(), 0);
+  await r.ingest({ historical: true, run: raw });
+  assert.equal((await r.post("/repairs", { kind: "members" })).length, 0);
+});
+test("mismatched bors identity keeps its membership repair pending", async (t) => {
+  const r = await runtime(t, {}, undefined, () => Response.json({
+    repo, requested_batch: { id: 42, head_sha: "c".repeat(40), members: [{ pr: 7 }] },
+  }));
+  await r.ingest({ historical: true, run: { ...run(), event: "repository_dispatch",
+    display_title: `bors branch=main batch=42 head=${"b".repeat(40)} base=${"a".repeat(40)}` } });
+  const result = await r.post("/repair-members");
+  assert.equal(result.repaired, 0);
+  assert.equal(result.pending, 1);
+  assert.equal((await r.post("/repairs", { kind: "members" }))[0].failures, 1);
+  assert.equal(r.github(), 0);
+});
+test("stored self-hosted job recomputation is bounded, authenticated and idempotent", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({ run: run(), jobs: Array.from({ length: 45 }, (_, i) => ({
+    ...job(String(1000 + i)), labels: ["self-hosted", "tauceti"],
+  })) });
+  const request = async (b, token = "admin") => r.mf.dispatchFetch("https://example.com/admin/recompute", {
+    method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(b),
+  });
+  assert.equal((await request({ repo, day: date }, "wrong")).status, 401);
+  assert.equal((await request({ repo: "other/repo", day: date })).status, 400);
+  const first = await (await request({ repo, day: date })).json();
+  assert.equal(first.processed, 40);
+  assert.ok(first.cursor);
+  const second = await (await request({ repo, day: date, cursor: first.cursor })).json();
+  assert.equal(second.processed, 5);
+  assert.equal(second.cursor, null);
+  await request({ repo, day: date });
+  const summary = await r.summary();
+  assert.equal(summary.daily["pr-total"], 45);
+  assert.equal(summary.daily["picker/self-hosted"], 45);
+  assert.equal(summary.daily["minutes/self-hosted"], 135);
+  assert.equal(r.github(), 0);
+});
 test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
   const r = await runtime(t);
   for (const [i, scanning, snapshot] of [
@@ -1057,7 +1123,7 @@ test("orphaned inbox writes recover and duplicate queue messages find the archiv
 });
 test("SQL projections match archived production metrics and timeline bins", async (t) => {
   const r = await runtime(t),
-    f = JSON.parse(readFileSync("tests/reference.json", "utf8"));
+    f = includeDedicatedFleet(JSON.parse(readFileSync("tests/reference.json", "utf8")));
   for (const [i, event] of f.events.entries())
     await r.ingest({ ...event, delivery: "fixture/" + i });
   const ns = await r.mf.getDurableObjectNamespace("DAYS"),

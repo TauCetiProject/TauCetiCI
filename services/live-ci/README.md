@@ -45,6 +45,13 @@ is provisional. An unavailable or unfinished input remains explicit.
 Publication runs independently of repair batches, so initial reconciliation
 cannot hold up snapshots of incoming webhook activity.
 
+Self-hosted jobs have their own fleet and runner-minute series. Their build
+outcomes, durations and waits contribute to the same PR and merge statistics as
+GitHub-hosted and Namespace jobs.
+Bors membership repairs run in a separate bounded lane, independent of GitHub
+quota. Staging coverage counts missing membership and pending repairs; completed
+runs with unknown batch sizes remain visible as diamonds below the scatter plot.
+
 General facts move to compressed R2 archives after 30 days; build facts retain
 90 days. Archival operates in bounded run batches, retaining the old contribution
 with each archived fact. A correction restores those facts before calculating
@@ -111,6 +118,13 @@ removes only satisfied work; follow its returned cursor to scan the backlog.
 follow its returned cursor for additional pages. These operations require the
 admin bearer token and make no GitHub requests. Successful replay moves the body
 back to the normal delivery archive; duplicate messages remain idempotent.
+
+`POST /admin/repair-members` processes up to eight due bors membership repairs.
+`POST /admin/recompute` with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-17"}`
+recalculates at most forty stored self-hosted jobs using reversible metric deltas.
+Pass its returned `cursor` until null; retries cannot duplicate totals. These
+authenticated maintenance operations do not read GitHub. After a historical
+repair, a bootstrap completion checkpoint requests a fresh chart generation.
 
 ## Setup and bootstrap
 

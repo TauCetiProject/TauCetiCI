@@ -223,7 +223,9 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     j.name,
   );
   const series =
-    j.kind === "github"
+    j.kind === "self-hosted"
+      ? "self-hosted"
+      : j.kind === "github"
       ? isBuild
         ? ["pr", "workflow_dispatch"].includes(run.trigger)
           ? "gh-build-pr"
@@ -274,7 +276,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
       }
     }
   };
-  if (["github", "namespace"].includes(j.kind))
+  if (["github", "namespace", "self-hosted"].includes(j.kind))
     for (const step of [600, 7200]) {
       if (started) interval(Math.max(created, started), end, "running", step);
       if (!j.estimated)
@@ -318,7 +320,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     run.workflow === WORKFLOW &&
     j.name === BUILD &&
     ["pr", "merge_queue", "bors_staging"].includes(run.trigger);
-  if (prBuild && ["github", "namespace"].includes(j.kind)) {
+  if (prBuild && ["github", "namespace", "self-hosted"].includes(j.kind)) {
     if (run.trigger === "pr") {
       if (j.conclusion === "success" && seconds !== null)
         daily(`duration/${j.kind}`, seconds / 60);

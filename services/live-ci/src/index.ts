@@ -429,6 +429,17 @@ async function handle(
       );
     if (path === "/admin/prune-repairs" && request.method === "POST")
       return json(await call(env.CONTROL, "control", "/prune-repairs", b));
+    if (path === "/admin/repair-members" && request.method === "POST")
+      return json(await call(env.CONTROL, "control", "/repair-members"));
+    if (path === "/admin/recompute" && request.method === "POST") {
+      if (!allowed(env).includes(b.repo) ||
+          typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||
+          !Number.isFinite(Date.parse(b.day)) ||
+          (b.cursor !== undefined && b.cursor !== null &&
+            (typeof b.cursor !== "string" || !/^\d{0,30}$/.test(b.cursor))))
+        return json({ error: "Invalid recompute partition or cursor" }, 400);
+      return json(await call(env.FACTS, `${b.repo}/${b.day}`, "/recompute", b));
+    }
     if (path === "/admin/compare" && request.method === "POST")
       return json(await call(env.CONTROL, "control", "/comparison", b));
     if (path === "/admin/activation-check")

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { buildSync } from "esbuild";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { includeDedicatedFleet } from "./dedicated-reference.mjs";
 const output = buildSync({
   entryPoints: ["src/model.ts"],
   bundle: true,
@@ -56,6 +57,23 @@ function apply(state, rows) {
     else state.set(key, v);
   }
 }
+test("dedicated runner jobs contribute to fleet, merge outcomes and PR statistics", () => {
+  const rows = ["pr", "bors_staging"].flatMap((trigger) => m.contributions(
+    { ...run, trigger }, { ...job, kind: "self-hosted" }, t + 600,
+  ));
+  const summary = m.summarize(rows);
+  assert.equal(summary.daily["merge/success"], 1);
+  assert.equal(summary.daily["duration/merge"].median, 4);
+  assert.equal(summary.daily["wait/merge"].median, 1);
+  assert.equal(summary.daily["duration/self-hosted"].median, 4);
+  assert.equal(summary.daily["pr-total"], 1);
+  assert.equal(summary.daily["picker/self-hosted"], 1);
+  assert.equal(summary.daily["minutes/self-hosted"], 8);
+  const bin = summary.fleet.find((b) => b.step === 600 && b.at === t);
+  assert.equal(bin.running["self-hosted"], 0.8);
+  assert.equal(bin.queued["self-hosted"], 2);
+  assert.equal(bin.wait.build, 1);
+});
 test("archive sampling stops at cutover without double-counting overlapping live jobs", () => {
   const cutoff = t + 600;
   const sampled = { ...run, archiveSampling: { until: cutoff, weight: 3 } };
@@ -303,8 +321,8 @@ test("archived production cohort matches the existing daily report metrics", () 
     else assert.deepEqual(actual[key], value, key);
   }
 });
-test("archived production fleet bins match the existing sweep-line report", () => {
-  const f = JSON.parse(readFileSync("tests/reference.json", "utf8")),
+test("archived production fleet matches the legacy report plus an independent dedicated-runner sweep", () => {
+  const f = includeDedicatedFleet(JSON.parse(readFileSync("tests/reference.json", "utf8"))),
     state = new Map();
   for (const event of f.events) {
     const r = m.normalizeRun(event.repo, event.run);
@@ -399,4 +417,23 @@ test("queue history breaks at startup partials and shows isolated observations i
   const segments = [...svg.matchAll(/<polyline[^>]*points="([^"]+)"/g)].map((match) => match[1].split(" "));
   assert.deepEqual(segments.map((points) => points.length), [40, 1, 77]);
   assert.equal([...svg.matchAll(/<circle /g)].length, 1);
+});
+test("charts include dedicated work and retain pending staging observations", async () => {
+  const code = buildSync({ entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false }).outputFiles[0].text;
+  const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+  const assets = renderCharts([{ day: m.day(t), data: {
+    daily: { "minutes/self-hosted": 60, "picker/github": 1, "picker/self-hosted": 1 },
+    fleet: [{ at: t - 600, step: 600, running: { "self-hosted": 1 }, queued: { "self-hosted": 2 }, wait: {} }],
+    staging: [
+      { created: t - 300, conclusion: "success", members: [7, 8], url: "known" },
+      { created: t - 200, conclusion: "success", url: "pending" },
+    ],
+  } }], t);
+  assert.match(assets["ci-runner-minutes.svg"], /self-hosted/);
+  assert.match(assets["ci-fleet-72h.svg"], /Self-hosted jobs/);
+  assert.match(assets["ci-build-duration.svg"], /self-hosted, median/);
+  assert.match(assets["ci-picker.svg"], /cy="260"/); // Half the PR builds use GitHub.
+  assert.match(assets["ci-bors-staging.svg"], /data-ci-membership-pending="true"/);
+  assert.match(assets["ci-bors-staging.svg"], /1 completed runs awaiting batch size/);
+  assert.doesNotMatch(assets["ci-bors-staging.svg"], /NaN/);
 });

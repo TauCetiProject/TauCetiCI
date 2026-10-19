@@ -457,6 +457,21 @@ export class FactPartition {
       await this.alarm();
       return json({ ok: true });
     }
+    if (path === "/recompute") {
+      if (!this.meta("partition")) return json({ processed: 0, cursor: null });
+      const rows = this.sql.exec<{ id: string; run: string; attempt: number; data: string }>(
+        "SELECT id,run,attempt,data FROM jobs WHERE id>? AND json_extract(data,'$.kind')='self-hosted' ORDER BY id LIMIT 40",
+        b.cursor || "",
+      ).toArray();
+      this.ctx.storage.transactionSync(() => {
+        for (const row of rows) {
+          const run = this.run(row.run, row.attempt);
+          if (run) this.replaceJob(run, JSON.parse(row.data), now());
+        }
+      });
+      await this.flush(true);
+      return json({ processed: rows.length, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
+    }
     if (path === "/event") {
       const runID = String(
           b.run?.id ?? b.run?.run_id ?? b.run_id ?? b.jobs?.[0]?.run_id,
