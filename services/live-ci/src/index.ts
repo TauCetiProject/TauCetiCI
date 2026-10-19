@@ -76,6 +76,10 @@ function validateEvent(b: any, env: Env) {
     throw new Error("Invalid run ID");
   if (b.run && !Number.isFinite(Date.parse(b.run.created_at)))
     throw new Error("Invalid run timestamp");
+  const sampling = b.run?.archive_sampling;
+  if (sampling && (!b.historical || !Number.isFinite(sampling.until) ||
+    !Number.isFinite(sampling.weight) || sampling.weight < 0))
+    throw new Error("Invalid archive sampling");
   if (
     b.jobs &&
     (!Array.isArray(b.jobs) ||

@@ -10,6 +10,7 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import sqlite3
@@ -20,15 +21,16 @@ from itertools import zip_longest
 from pathlib import Path
 
 
-def events(db, since, interleave_days=4):
+def events(db, since, interleave_days=4, sampling_cutover=None):
     db.row_factory = sqlite3.Row
     weights = {
         (r["workflow"], r["hour"]): (r["total"], r["fetched"] or 0)
         for r in db.execute(
             """
         SELECT workflow,substr(created_at,1,13) hour,COUNT(*) total,SUM(jobs_fetched) fetched
-        FROM runs WHERE created_at>=? AND conclusion!='skipped' GROUP BY 1,2""",
-            (since,),
+        FROM runs WHERE (created_at>=? OR ? IS NOT NULL) AND (? IS NULL OR created_at<?)
+        AND conclusion!='skipped' GROUP BY 1,2""",
+            (since, sampling_cutover, sampling_cutover, sampling_cutover),
         )
     }
     typical = {}
@@ -45,10 +47,11 @@ def events(db, since, interleave_days=4):
     # every concurrent request to one day just creates another hot-object queue.
     streams = [
         db.execute(
-            """SELECT * FROM runs WHERE created_at>=?
+            """SELECT * FROM runs WHERE (created_at>=? OR (? IS NOT NULL AND updated_at>=?))
+        AND (? IS NULL OR created_at<?)
         AND COALESCE(CAST(strftime('%s',created_at) AS INTEGER)/86400,0)%?=?
         ORDER BY created_at DESC,repo,run_id""",
-            (since, interleave_days, shard),
+            (since, sampling_cutover, since, sampling_cutover, sampling_cutover, interleave_days, shard),
         )
         for shard in range(interleave_days)
     ]
@@ -105,8 +108,6 @@ def events(db, since, interleave_days=4):
             and r["conclusion"] != "skipped"
             and r["updated_at"]
         ):
-            from datetime import datetime, timedelta
-
             end = datetime.fromisoformat(r["updated_at"])
             created = datetime.fromisoformat(r["created_at"])
             start = max(
@@ -128,7 +129,7 @@ def events(db, since, interleave_days=4):
                     "estimated": True,
                 }
             ]
-        if not grouped and not merge:
+        if not grouped and not merge and not sampling_cutover:
             # Sample weights already represent these runs. Their original
             # metadata remains in git and the downloadable database.
             continue
@@ -141,6 +142,12 @@ def events(db, since, interleave_days=4):
                 "tested": tested,
                 "status": "completed" if r["conclusion"] else "queued",
             }
+            if sampling_cutover:
+                run["archive_sampling"] = {
+                    "until": datetime.fromisoformat(sampling_cutover).timestamp(),
+                    "weight": total / fetched if fetched and attempt_jobs
+                    else 1 if any(j.get("estimated") for j in attempt_jobs) else 0,
+                }
             # Only the latest run's conclusion is known in the legacy runs table;
             # job conclusions retain the results of every earlier execution.
             record = {
@@ -175,8 +182,6 @@ def events(db, since, interleave_days=4):
         WHERE l.repo='TauCeti' AND c.pr IS NOT NULL GROUP BY c.pr HAVING MIN(l.landed_at)>=?""",
         (since,),
     ):
-        from datetime import datetime
-
         yield {
             "repo": "TauCetiProject/TauCeti",
             "landing": {
@@ -189,8 +194,6 @@ def events(db, since, interleave_days=4):
         "SELECT repo,stream,since,complete_to FROM stream_coverage WHERE stream='inventory' AND complete_to>=?",
         (since,),
     ):
-        from datetime import datetime
-
         yield {
             "repo": "TauCetiProject/" + row["repo"],
             "coverage": {
@@ -201,8 +204,6 @@ def events(db, since, interleave_days=4):
             "historical": True,
         }
     for row in db.execute("SELECT at,text FROM annotations WHERE at>=?", (since,)):
-        from datetime import datetime
-
         yield {
             "repo": "TauCetiProject/TauCeti",
             "annotation": {
@@ -217,6 +218,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", type=Path, required=True)
     ap.add_argument("--since", default="2026-07-20T00:00:00Z")
+    ap.add_argument("--sampling-cutover", help="Import runs before this UTC time; archive sampling weights stop there and live jobs count once afterwards")
     ap.add_argument("--url", default="https://ci-data.taucetiproject.org")
     ap.add_argument(
         "--token-file",
@@ -232,6 +234,20 @@ def main():
     ap.add_argument("--concurrency", type=int, choices=range(1, 9), default=4)
     ap.add_argument("--interleave-days", type=int, choices=range(1, 9), default=4)
     args = ap.parse_args()
+    if args.sampling_cutover:
+        try:
+            cutoff = datetime.fromisoformat(args.sampling_cutover)
+            if cutoff.tzinfo is None:
+                raise ValueError("sampling cutover needs an explicit timezone")
+            cutoff = cutoff.astimezone(timezone.utc)
+            since = datetime.fromisoformat(args.since)
+            since = since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
+            if cutoff <= since:
+                raise ValueError("sampling cutover must be after --since")
+            args.sampling_cutover = cutoff.isoformat().replace("+00:00", "Z")
+            args.since = since.isoformat().replace("+00:00", "Z")
+        except ValueError as error:
+            ap.error(str(error))
     args.receipts.parent.mkdir(parents=True, exist_ok=True)
     receipts = sqlite3.connect(args.receipts)
     receipts.execute("CREATE TABLE IF NOT EXISTS imported(id TEXT PRIMARY KEY)")
@@ -289,7 +305,7 @@ def main():
         with closing(
             sqlite3.connect(f"file:{args.db.resolve()}?mode=ro", uri=True)
         ) as db:
-            for event in events(db, args.since, args.interleave_days):
+            for event in events(db, args.since, args.interleave_days, args.sampling_cutover):
                 payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
                 identity = "bootstrap/" + hashlib.sha256(payload.encode()).hexdigest()
                 if receipts.execute(

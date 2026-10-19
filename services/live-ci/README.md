@@ -156,6 +156,15 @@ starts growing during catch-up.
 The original archives and SQLite release remain the historical export. Do not
 rebuild that input database between retries of the same bootstrap operation.
 
+To close an archive-to-webhook gap with a newer immutable database, use a new
+receipt file and `--sampling-cutover 2026-10-19T01:00:00Z` (the first complete
+live hour), with `--since` before the missing period. This mode imports older
+runs updated since that point as well. Sample weights apply before cutover;
+each observed job counts once afterwards. Unsampled run metadata records a zero
+historical weight, so overlapping webhook jobs do not duplicate the sampled
+cohort. Actual jobs and their timestamps remain stored, and later events retain
+the cutover metadata. Completion republishes charts after every batch is saved.
+
 Deploy the TauCeti page and summary-workflow changes through their normal PR.
 No page credentials or API tokens are needed. The page remains on its fallbacks
 while the service is in shadow mode.

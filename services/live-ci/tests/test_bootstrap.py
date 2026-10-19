@@ -21,6 +21,45 @@ from collector.build_db import SCHEMA
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_archive_cutover_bounds_sampling_and_keeps_unsampled_run_metadata(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(SCHEMA)
+            for identity, minute, fetched in [(1, 0, 1), (2, 10, 0), (3, 40, 1)]:
+                created = f"2026-10-18T12:{minute:02}:00Z"
+                db.execute(
+                    """INSERT INTO runs(repo,run_id,run_attempt,workflow,conclusion,
+                    created_at,updated_at,jobs_fetched) VALUES ('TauCeti',?,1,'aux','success',?,?,?)""",
+                    (identity, created, created, fetched),
+                )
+                if fetched:
+                    db.execute(
+                        """INSERT INTO jobs(repo,run_id,job_id,run_attempt,name,conclusion,
+                        created_at,started_at,completed_at,run_s,runner_kind,labels)
+                        VALUES ('TauCeti',?,?,1,'aux','success',?,?,?,0,'github','[]')""",
+                        (identity, identity, created, created, created),
+                    )
+            for identity, fetched, updated in [(4, 1, "2026-10-18T12:01:00Z"), (5, 0, "2026-10-17T12:01:00Z")]:
+                db.execute(
+                    """INSERT INTO runs(repo,run_id,run_attempt,workflow,conclusion,
+                    created_at,updated_at,jobs_fetched) VALUES ('TauCeti',?,1,'aux','success','2026-10-17T12:00:00Z',?,?)""",
+                    (identity, updated, fetched),
+                )
+                if fetched:
+                    db.execute(
+                        """INSERT INTO jobs(repo,run_id,job_id,run_attempt,name,conclusion,
+                        created_at,started_at,completed_at,run_s,runner_kind,labels)
+                        VALUES ('TauCeti',?,?,1,'aux','success','2026-10-17T12:00:00Z',
+                        '2026-10-17T12:00:00Z','2026-10-17T12:00:00Z',0,'github','[]')""",
+                        (identity, identity),
+                    )
+            events = list(bootstrap.events(db, "2026-10-18", 4, "2026-10-18T12:30:00Z"))
+            by_id = {event["run"]["id"]: event for event in events}
+            self.assertEqual(set(by_id), {"1", "2", "4"})
+            self.assertEqual(by_id["1"]["run"]["archive_sampling"]["weight"], 2)
+            self.assertEqual(by_id["2"]["run"]["archive_sampling"]["weight"], 0)
+            self.assertEqual(by_id["2"]["jobs"], [])
+            self.assertEqual(by_id["4"]["run"]["archive_sampling"]["weight"], 2)
+
     def test_day_interleaving_preserves_every_historical_event(self):
         with contextlib.closing(sqlite3.connect(":memory:")) as db:
             db.executescript(SCHEMA)

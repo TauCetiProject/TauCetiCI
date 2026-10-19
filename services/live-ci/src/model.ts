@@ -26,6 +26,7 @@ export type Run = {
   batch?: number;
   members?: number[];
   telemetry?: Telemetry;
+  archiveSampling?: { until: number; weight: number };
 };
 export type Job = {
   id: string;
@@ -108,6 +109,7 @@ export function normalizeRun(repo: string, r: any): Run {
     created: time(r.created_at),
     started: time(r.run_started_at || r.created_at),
     updated: time(r.updated_at || r.created_at),
+    archiveSampling: r.archive_sampling,
     head: r.head_sha || "",
     branch: r.head_branch || "",
     url:
@@ -240,6 +242,12 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
   );
   const created = Math.max(j.created, until - 30 * DAY);
   const started = j.started && j.assigned ? j.started : null;
+  // The archive's sampled cohort represents all jobs before cutover. After
+  // cutover each observed job contributes once, including unsampled runs.
+  const weightAt = (at: number) =>
+    run.archiveSampling
+      ? at < run.archiveSampling.until ? run.archiveSampling.weight : 1
+      : j.weight;
   const interval = (
     a: number,
     b: number,
@@ -247,20 +255,22 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     step: number,
   ) => {
     if (b <= a) return;
-    for (let bucket = Math.floor(a / step) * step; bucket < b; bucket += step) {
-      const lo = Math.max(a, bucket),
-        hi = Math.min(b, bucket + step);
-      if (kind === "running")
-        add(
-          bucket,
-          bucket,
-          `fleet/${step}/running/${series}`,
-          0,
-          (j.weight * (hi - lo)) / step,
-        );
-      else {
-        add(bucket, bucket, `fleet/${step}/queued/${j.kind}`, lo, j.weight);
-        add(bucket, bucket, `fleet/${step}/queued/${j.kind}`, hi, -j.weight);
+    const cutoff = run.archiveSampling?.until;
+    const spans = cutoff && a < cutoff && cutoff < b
+      ? [[a, cutoff], [cutoff, b]] : [[a, b]];
+    for (const [since, until] of spans) {
+      const weight = weightAt(since);
+      if (!weight) continue;
+      for (let bucket = Math.floor(since / step) * step; bucket < until; bucket += step) {
+        const lo = Math.max(since, bucket),
+          hi = Math.min(until, bucket + step);
+        if (kind === "running")
+          add(bucket, bucket, `fleet/${step}/running/${series}`, 0,
+            (weight * (hi - lo)) / step);
+        else {
+          add(bucket, bucket, `fleet/${step}/queued/${j.kind}`, lo, weight);
+          add(bucket, bucket, `fleet/${step}/queued/${j.kind}`, hi, -weight);
+        }
       }
     }
   };
@@ -277,7 +287,8 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
           bucket < last;
           bucket += step
         ) {
-          if (bucket + step >= started && bucket + step < started + window)
+          if (bucket + step >= started && bucket + step < started + window &&
+            weightAt(Math.max(started, bucket + step - 0.000001)) > 0)
             add(
               bucket,
               bucket,
@@ -299,7 +310,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     !j.estimated &&
     !["sandboxed-build", "verify", "build"].includes(j.name) &&
     j.kind === "github" &&
-    wait !== null
+    wait !== null && weightAt(started!) > 0
   )
     daily("wait/other", wait / 60);
   if (!run.repo.endsWith("/TauCeti")) return rows;

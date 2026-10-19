@@ -127,6 +127,22 @@ async function runtime(t, bindings = {}, upstream) {
     github: () => github,
   };
 }
+test("archive sampling survives newer live metadata and retracts prior overlap contributions", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({ run: run(), jobs: [job()] });
+  await r.ingest({
+    historical: true,
+    run: { ...run(), updated_at: iso(clock - 10),
+      archive_sampling: { until: clock - 120, weight: 2 } },
+    jobs: [job()],
+  });
+  await r.ingest({ run: run(), jobs: [job()] });
+  const summary = await r.summary();
+  const amount = summary.fleet.filter((row) => row.step === 600)
+    .reduce((n, row) => n + (row.running["gh-build-pr"] || 0), 0);
+  assert.ok(Math.abs(amount - 0.5) < 1e-9);
+  assert.equal(summary.daily["pr-total"], 1);
+});
 test("duplicate delivery, late queued job and telemetry corrections preserve totals", async (t) => {
   const r = await runtime(t),
     j = job();

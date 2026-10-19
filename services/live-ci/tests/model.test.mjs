@@ -56,6 +56,35 @@ function apply(state, rows) {
     else state.set(key, v);
   }
 }
+test("archive sampling stops at cutover without double-counting overlapping live jobs", () => {
+  const cutoff = t + 600;
+  const sampled = { ...run, archiveSampling: { until: cutoff, weight: 3 } };
+  const unsampled = { ...run, id: "2", archiveSampling: { until: cutoff, weight: 0 } };
+  const running = { ...job, name: "aux", created: t, started: t, completed: t + 1200 };
+  const state = new Map();
+  for (const r of [sampled, unsampled]) apply(state, m.contributions(r, running, t + 1800));
+  const sum = (bucket) => [...state.values()].filter((row) =>
+    row.bucket === bucket && row.metric === "fleet/600/running/gh-other"
+  ).reduce((n, row) => n + row.amount, 0);
+  assert.equal(sum(t), 3); // The archive sample represents three historical runs.
+  assert.equal(sum(cutoff), 2); // Each of the two observed live jobs counts once.
+  const queued = { ...running, started: t + 900 };
+  const rows = [sampled, unsampled].flatMap((r) => m.contributions(r, queued, t + 1800));
+  const peak = (bucket) => {
+    const points = new Map();
+    for (const row of rows.filter((r) => r.bucket === bucket && r.metric === "fleet/600/queued/github"))
+      points.set(row.value, (points.get(row.value) || 0) + row.amount);
+    let depth = 0, high = 0;
+    for (const [, delta] of [...points].sort(([a], [b]) => a - b)) high = Math.max(high, depth += delta);
+    return high;
+  };
+  assert.equal(peak(t), 3);
+  assert.equal(peak(cutoff), 2);
+  const trailing = m.contributions(unsampled, { ...running, started: t + 300 }, t + 1800)
+    .filter((row) => row.metric === "fleet/600/wait/other");
+  assert.ok(!trailing.some((row) => row.bucket === t));
+  assert.ok(trailing.some((row) => row.bucket === cutoff));
+});
 test("incremental corrections equal a complete recomputation across midnight and reruns", () => {
   const facts = new Map(),
     incremental = new Map();
