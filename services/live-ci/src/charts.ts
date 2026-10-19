@@ -370,6 +370,10 @@ export function renderCharts(
       (o) => o.at >= clock - 30 * DAY && o.at <= clock,
     )
     .sort((a, b) => a.at - b.at);
+  const queueSince = Math.max(
+    clock - 30 * DAY,
+    observations.length ? Math.floor(observations[0].at / DAY) * DAY : 0,
+  );
   const queueLabels = observations.map((o) =>
     iso(o.at).slice(5, 16).replace("T", " "),
   );
@@ -390,10 +394,10 @@ export function renderCharts(
   render("ci-queue-size.svg", () =>
     frame(
       "Observed ready-to-merge PR backlog",
-      `Distinct ready-labelled PRs, including staging; gaps are missing observations. ${iso(clock)}`,
+      `Ready-labelled PRs, including staging; recorded since ${iso(queueSince).slice(0, 10)}. Gaps are unavailable snapshots. ${iso(clock)}`,
       panel([{ name: "ready PRs", values: queueValues }], queueTimes, {
         times: queuePositions,
-        since: clock - 30 * DAY,
+        since: queueSince,
         until: clock,
       }),
     ),

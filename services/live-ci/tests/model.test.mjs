@@ -372,7 +372,9 @@ test("report SVGs parse and irregular observations keep their actual time positi
   const positions = [
     ...assets["ci-queue-size.svg"].matchAll(/<circle cx="([\d.]+)"/g),
   ].map((m) => Number(m[1]));
-  assert.ok(Math.abs(positions[1] - positions[0] - (864 * 2) / 30) < 1e-7);
+  const span = t - Math.floor((t - 3 * m.DAY) / m.DAY) * m.DAY;
+  assert.ok(Math.abs(positions[1] - positions[0] - (864 * 2 * m.DAY) / span) < 1e-7);
+  assert.match(assets["ci-queue-size.svg"], /recorded since 2026-10-15/);
   assert.equal(assets["ci-bors-staging.svg"].includes('opacity=".16"'), false);
   const parsed = spawnSync(
     "python3",
