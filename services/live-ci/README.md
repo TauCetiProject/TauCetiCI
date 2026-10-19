@@ -87,6 +87,13 @@ Assets live at `/v1/ci/assets/<revision>/<filename>`. They are uploaded before t
 manifest pointer changes. Public reads use R2 only, support ETags and CORS, and
 carry no GitHub credentials. `/healthz` exposes service identity/version only.
 Protected `/admin/health` exposes scheduler and processing diagnostics.
+`GET /admin/repairs?kind=run` returns at most 20 pending repair records.
+`POST /admin/prune-repairs` checks up to 100 repairs against stored facts and
+removes only satisfied work; follow its returned cursor to scan the backlog.
+`POST /admin/replay-failed` requeues up to 100 retained failed deliveries;
+follow its returned cursor for additional pages. These operations require the
+admin bearer token and make no GitHub requests. Successful replay moves the body
+back to the normal delivery archive; duplicate messages remain idempotent.
 
 ## Setup and bootstrap
 
@@ -130,6 +137,8 @@ python3 services/live-ci/scripts/bootstrap.py --db /path/to/bootstrap.sqlite
 Use a snapshot preceding webhook cutover. The importer preserves historical
 sampling weights and running-only estimates. It streams records in bounded
 batches and maintains disposable local receipts so interruptions are resumable.
+Four HTTP batches run concurrently by default (`--concurrency 1` serializes
+them). The completion checkpoint waits for every batch acknowledgement.
 The original archives and SQLite release remain the historical export. Do not
 rebuild that input database between retries of the same bootstrap operation.
 
