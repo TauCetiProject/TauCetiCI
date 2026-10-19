@@ -298,9 +298,13 @@ def build(out: Path):
             # Labels are derived. Reapply current rules to archived evidence so
             # classifier repairs also correct historical charts without rewriting records.
             failure_class = f.get("class")
-            if f and f.get("excerpt") is not None:
-                failure_class = classify.classify(j.get("conclusion"), f.get("failed_step"),
-                                                  f["excerpt"])
+            if f:
+                derived = classify.classify(j.get("conclusion"), f.get("failed_step"),
+                                            f.get("excerpt"))
+                # Step names can establish a cause even when the log was unavailable.
+                # Otherwise keep archived evidence rather than replacing it with a fallback.
+                if f.get("excerpt") is not None or derived not in ("build-unknown", "other"):
+                    failure_class = derived
             db.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 r["repo"], r["run_id"], j["id"], j.get("run_attempt"), j["name"], j.get("conclusion"),
                 j.get("created_at"), j.get("started_at"), j.get("completed_at"),

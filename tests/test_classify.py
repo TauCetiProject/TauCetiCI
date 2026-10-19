@@ -18,6 +18,12 @@ SUCCESS_LINES = [
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_source_option_check_is_policy_even_without_logs(self):
+        step = "Reject option overrides and heartbeat instrumentation"
+        for lines in (None, [], ["##[group]Run set -euo pipefail"]):
+            with self.subTest(lines=lines):
+                self.assertEqual(classify.classify("failure", step, lines), "policy")
+
     def test_successful_module_names_do_not_override_actual_failure(self):
         for expected, diagnostic in [
             ("lean-error", "error: TauCeti/A.lean:95:11: Unknown constant `example`"),
@@ -77,6 +83,13 @@ class ClassifierTests(unittest.TestCase):
                   "event": "pull_request_target", "trigger": "pr", "head_sha": "a" * 40,
                   "workflow": ".github/workflows/pr-build.yml", "conclusion": "failure",
                   "created_at": "2026-10-07T10:00:00Z", "jobs": [job, missing]}
+        for job_id, lines in [(12, None), (13, []),
+                              (14, ["##[group]Run set -euo pipefail"])]:
+            record["jobs"].append({**job, "id": job_id, "failure": {
+                "class": "other", "classifier": 2,
+                "failed_step": "Reject option overrides and heartbeat instrumentation",
+                "excerpt": lines,
+            }})
         original = copy.deepcopy(record)
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -87,7 +100,8 @@ class ClassifierTests(unittest.TestCase):
                 build_db.build(root / "ci.sqlite")
             with closing(sqlite3.connect(root / "ci.sqlite")) as db:
                 self.assertEqual(db.execute("SELECT job_id,failure_class FROM jobs ORDER BY job_id")
-                                 .fetchall(), [(10, "lint-env"), (11, "timeout")])
+                                 .fetchall(), [(10, "lint-env"), (11, "timeout"),
+                                              (12, "policy"), (13, "policy"), (14, "policy")])
                 self.assertEqual(db.execute("SELECT excerpt FROM jobs WHERE job_id=10").fetchone()[0],
                                  "\n".join(job["failure"]["excerpt"]))
         self.assertEqual(record, original)
