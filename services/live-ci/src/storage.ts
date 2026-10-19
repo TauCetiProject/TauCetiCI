@@ -113,7 +113,8 @@ export class FactPartition {
       .exec<{
         data: string;
         contribution: string;
-      }>("SELECT data,contribution FROM jobs WHERE id=?", j.id)
+        active: number;
+      }>("SELECT data,contribution,active FROM jobs WHERE id=?", j.id)
       .toArray()[0];
     const old: Job | undefined = before ? JSON.parse(before.data) : undefined;
     const next = before ? newer<Job>(old, j) : j;
@@ -124,13 +125,21 @@ export class FactPartition {
     }
     const after = contributions(run, next, clock),
       delta = difference(before ? JSON.parse(before.contribution) : [], after);
-    if (!delta.length && before && before.data === JSON.stringify(next)) return;
+    const active =
+      next.status !== "completed" && run.status !== "completed" ? 1 : 0;
+    if (
+      !delta.length &&
+      before &&
+      before.data === JSON.stringify(next) &&
+      before.active === active
+    )
+      return;
     this.sql.exec(
       "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?)",
       next.id,
       run.id,
       run.attempt,
-      next.status === "completed" ? 0 : 1,
+      active,
       JSON.stringify(next),
       JSON.stringify(after),
     );

@@ -35,6 +35,7 @@ export class Control {
       CREATE TABLE IF NOT EXISTS summaries(day TEXT PRIMARY KEY,data TEXT);
       CREATE TABLE IF NOT EXISTS repairs(key TEXT PRIMARY KEY,repo TEXT,kind TEXT,args TEXT,due INTEGER,failures INTEGER DEFAULT 0);
       CREATE INDEX IF NOT EXISTS repairs_due ON repairs(due);
+      CREATE INDEX IF NOT EXISTS repairs_attempt ON repairs(repo,kind,CAST(json_extract(args,'$.id') AS TEXT),json_extract(args,'$.attempt'));
       CREATE TABLE IF NOT EXISTS gaps(key TEXT PRIMARY KEY,kind TEXT,reason TEXT,at INTEGER);
       CREATE TABLE IF NOT EXISTS attempts(at INTEGER,id INTEGER PRIMARY KEY AUTOINCREMENT,status INTEGER);
       CREATE INDEX IF NOT EXISTS attempts_at ON attempts(at);
@@ -102,6 +103,32 @@ export class Control {
         partition,
       });
       await call(this.env.FACTS, partition, "/event", { ...b, partition });
+      // Metadata and trusted summaries satisfy repairs that were queued while
+      // those deliveries were still in flight. Do not spend quota on them later.
+      this.sql.exec(
+        `DELETE FROM repairs WHERE repo=? AND kind='run'
+        AND CAST(json_extract(args,'$.id') AS TEXT)=?
+        AND (json_extract(args,'$.attempt')=? OR json_extract(args,'$.attempt') IS NULL)`,
+        repo,
+        run.id,
+        run.attempt,
+      );
+      if (b.verified_jobs)
+        this.sql.exec(
+          `DELETE FROM repairs WHERE repo=? AND kind='jobs'
+          AND CAST(json_extract(args,'$.id') AS TEXT)=? AND json_extract(args,'$.attempt')=?`,
+          repo,
+          run.id,
+          run.attempt,
+        );
+      if (b.telemetry?.coverage === "complete" || b.telemetry?.phases?.length)
+        this.sql.exec(
+          `DELETE FROM repairs WHERE repo=? AND kind='details'
+          AND CAST(json_extract(args,'$.id') AS TEXT)=? AND json_extract(args,'$.attempt')=?`,
+          repo,
+          run.id,
+          run.attempt,
+        );
       if (run.trigger === "bors_staging") {
         const stored = await call(this.env.FACTS, partition, "/status", {
           id: run.id,
@@ -177,7 +204,10 @@ export class Control {
         { id },
       );
       if (!location.partition) {
-        this.enqueue(repo, "run", { id });
+        this.enqueue(repo, "run", {
+          id,
+          attempt: b.attempt || b.jobs?.[0]?.run_attempt || 1,
+        });
         throw new Error("Run metadata not available yet; retry delivery");
       }
       try {

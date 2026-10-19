@@ -120,8 +120,9 @@ test("active intervals extend, then retract correctly after a late completion", 
     conclusion: null,
     completed: null,
   };
-  const initial = m.contributions(run, active, t + 600),
-    later = m.contributions(run, active, t + 1200);
+  const running = { ...run, status: "in_progress", conclusion: null };
+  const initial = m.contributions(running, active, t + 600),
+    later = m.contributions(running, active, t + 1200);
   const state = new Map();
   apply(state, initial);
   apply(state, m.difference(initial, later));
@@ -130,6 +131,28 @@ test("active intervals extend, then retract correctly after a late completion", 
   const expected = new Map();
   apply(expected, m.contributions(run, terminal, t + 1500));
   assert.deepEqual([...state].sort(), [...expected].sort());
+});
+test("a terminal parent bounds an unobserved job until its exact completion arrives", () => {
+  const active = {
+    ...job,
+    status: "in_progress",
+    conclusion: null,
+    completed: null,
+  };
+  const bounded = m.contributions(run, active, t + 600);
+  assert.deepEqual(bounded, m.contributions(run, active, t + 1200));
+  assert.equal(m.summarize(bounded).daily["duration/github"], undefined);
+  const actual = { ...job, completed: t + 240 };
+  const state = new Map();
+  apply(state, bounded);
+  apply(state, m.difference(bounded, m.contributions(run, actual, t + 1200)));
+  const expected = new Map();
+  apply(expected, m.contributions(run, actual, t + 1200));
+  assert.deepEqual([...state].sort(), [...expected].sort());
+  assert.equal(
+    m.summarize([...state.values()]).daily["duration/github"].median,
+    3,
+  );
 });
 test("failure denominator excludes cancelled builds and includes timeouts", () => {
   const rows = [];
