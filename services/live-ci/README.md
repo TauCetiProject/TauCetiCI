@@ -58,7 +58,11 @@ spends GitHub quota. Bootstrap is deliberately separate from the freshness path.
 The trusted `ci-live-summary.yml` workflow in TauCeti reserves six requests before
 reading run metadata, jobs, artifacts or failed-job logs. Its OIDC token must
 identify that exact main-branch workflow and repository. Reservations count the
-full allowance conservatively even when fewer requests are used. It reports
+full allowance conservatively even when fewer requests are used.
+At the default budget, publisher reservations use at most 360 of the 500 slots
+per rolling hour, leaving 140 for reconciliation and token exchanges. Deferred
+summaries remain repairable from webhooks and the attempt-specific repair queue.
+The publisher reports
 quota rejections to the shared scheduler. A fresh runner parses bounded JSON
 artifacts; it neither checks out nor executes candidate code. Candidate phase
 measurements remain statistics and cannot establish producer or merge identity.

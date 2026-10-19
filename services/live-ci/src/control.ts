@@ -1437,14 +1437,23 @@ export class Control {
         existing = prior ? JSON.parse(prior.data) : null;
       if (existing) return json(existing);
       const clock = now(),
+        budget = Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500),
         used = this.sql
           .exec<{
             n: number;
           }>("SELECT COUNT(*) n FROM attempts WHERE at>?", clock - 3600)
+          .one().n,
+        reserved = this.sql
+          .exec<{ n: number }>(
+            "SELECT COUNT(*) n FROM attempts WHERE at>? AND status=-1",
+            clock - 3600,
+          )
           .one().n;
       if (
-        used + 6 >
-          Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500) ||
+        used + 6 > budget ||
+        // At 500/hour, admit at most 60 six-read summaries. Leave 140 reads
+        // for inventory, stale active runs, comparisons and token exchanges.
+        reserved + 6 > Math.floor((budget * 0.72) / 6) * 6 ||
         (this.get("github_pause") || 0) > clock
       )
         return json({ granted: false, retry_after: 300 });

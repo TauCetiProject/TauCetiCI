@@ -438,7 +438,21 @@ test("queued cancellations with synthetic started_at do not accrue runner minute
   assert.equal(s.daily["duration/github"], undefined);
 });
 test("publisher read leases share the rolling budget and cannot be multiplied by retry", async (t) => {
-  const r = await runtime(t);
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    async (req) =>
+      new URL(req.url).pathname.endsWith("/access_tokens")
+        ? Response.json({ token: "test", expires_at: iso(clock + 3600) })
+        : Response.json({ total_count: 0, workflow_runs: [] }),
+  );
   const first = await r.post("/lease", {
     publisher: "1/1",
     run_id: "100",
@@ -451,7 +465,7 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
     health.requests.reduce((n, x) => n + x.count, 0),
     6,
   );
-  for (let i = 2; i <= 83; i++)
+  for (let i = 2; i <= 60; i++)
     assert.equal(
       (
         await r.post("/lease", {
@@ -463,10 +477,20 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
       true,
     );
   assert.equal(
-    (await r.post("/lease", { publisher: "84/1", run_id: "100", attempt: 1 }))
+    (await r.post("/lease", { publisher: "61/1", run_id: "100", attempt: 1 }))
       .granted,
     false,
   );
+  // Publisher saturation must leave room for the current inventory and its
+  // installation-token exchange, under the same global ceiling.
+  await r.post("/tick");
+  health = await r.post("/health");
+  assert.equal(health.repair_error, null);
+  assert.equal(
+    health.requests.reduce((n, x) => n + x.count, 0),
+    362,
+  );
+  assert.equal(r.github(), 2);
 });
 test("cold fact archive restores prior contributions before a historical correction", async (t) => {
   const r = await runtime(t),
