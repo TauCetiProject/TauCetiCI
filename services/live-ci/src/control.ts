@@ -1071,6 +1071,7 @@ export class Control {
       if (clock - (this.get("bors_checked") || 0) >= 60)
         try {
           await this.bors();
+          this.set("bors_error", null);
         } catch (error) {
           this.set("bors_error", String(error));
         }
