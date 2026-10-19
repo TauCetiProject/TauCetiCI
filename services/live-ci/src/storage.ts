@@ -502,6 +502,8 @@ export class FactPartition {
           const next = normalizeRun(b.repo, b.run),
             old = this.run(next.id, next.attempt);
           const run = newer(old, next);
+          if (next.archiveSampling || old?.archiveSampling)
+            run.archiveSampling = next.archiveSampling || old!.archiveSampling;
           if (old?.telemetry) run.telemetry = old.telemetry;
           if (
             old?.members &&
