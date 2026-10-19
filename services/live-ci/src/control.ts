@@ -927,7 +927,7 @@ export class Control {
         requests_last_hour: this.sql
           .exec<{
             n: number;
-          }>("SELECT COUNT(*) n FROM attempts WHERE at>?", clock - 3600)
+          }>("SELECT COUNT(*) n FROM attempts WHERE at>?", now() - 3600)
           .one().n,
         budget: Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500),
         paused_until: this.get("github_pause") || null,
