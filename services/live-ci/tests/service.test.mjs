@@ -195,6 +195,47 @@ test("outbox retry cannot apply the same delta twice", async (t) => {
     );
   assert.equal((await r.summary()).daily["pr-total"], 1);
 });
+test("overlapping outbox batches retain individual receipts and reversible corrections", async (t) => {
+  const r = await runtime(t),
+    ns = await r.mf.getDurableObjectNamespace("DAYS"),
+    stub = ns.get(ns.idFromName(date));
+  const delta = (id, amount) => ({
+    id,
+    day: date,
+    rows: [{ bucket: 0, metric: "pr-total", value: 0, amount }],
+  });
+  const send = async (path, body) => {
+    const response = await stub.fetch("https://internal" + path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+  };
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("a", 1), delta("b", 2)],
+  });
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("b", 2), delta("c", 3)],
+  });
+  await send("/delta", delta("a", 1));
+  assert.equal((await r.summary()).daily["pr-total"], 6);
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("correction", -2), delta("c", 3)],
+  });
+  assert.equal((await r.summary()).daily["pr-total"], 4);
+  const oversized = await stub.fetch("https://internal/delta-batch", {
+    method: "POST",
+    body: JSON.stringify({
+      day: date,
+      deltas: Array.from({ length: 41 }, (_, i) => delta(String(i), 1)),
+    }),
+  });
+  assert.equal(oversized.status, 400);
+  assert.equal((await r.summary()).daily["pr-total"], 4);
+});
 test("manifest and immutable charts support conditional public reads without GitHub", async (t) => {
   const r = await runtime(t);
   await r.ingest({ run: run(), jobs: [job()] });
