@@ -142,6 +142,7 @@ export class Control {
     if (b.run) {
       const run = normalizeRun(repo, b.run),
         partition = `${repo}/${day(run.created)}`;
+      let needsMembers = !run.members?.length;
       await call(this.env.DIRECTORIES, directory(repo, run.id), "/put", {
         id: run.id,
         partition,
@@ -182,6 +183,12 @@ export class Control {
           ...stored.run,
           day: day(run.created),
         });
+        needsMembers = !stored.run?.members?.length;
+        if (!needsMembers)
+          this.sql.exec(
+            "DELETE FROM repairs WHERE repo=? AND kind='members' AND CAST(json_extract(args,'$.id') AS TEXT)=? AND json_extract(args,'$.attempt')=?",
+            repo, run.id, run.attempt,
+          );
       }
       if (
         !b.historical &&
@@ -222,7 +229,7 @@ export class Control {
           { id: run.id, attempt: run.attempt - 1 },
           now() + 180,
         );
-      if (run.trigger === "bors_staging" && run.batch && !run.members?.length)
+      if (run.trigger === "bors_staging" && run.batch && needsMembers)
         this.enqueue(repo, "members", {
           id: run.id,
           attempt: run.attempt,
@@ -580,6 +587,17 @@ export class Control {
         telemetry,
       });
     } else if (row.kind === "members") {
+      const partition = `${row.repo}/${day(args.created)}`;
+      const status = await call(this.env.FACTS, partition, "/status", {
+        id: args.id,
+        attempt: args.attempt,
+      });
+      if (!status.run || status.run.batch !== args.batch)
+        throw new Error("Missing or mismatched staging run");
+      if (status.run.members?.length) {
+        this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+        return;
+      }
       const response = await fetch(
         `https://bors.taucetiproject.org/repositories/1/active-batches?base=main&batch_id=${args.batch}`,
         { signal: AbortSignal.timeout(10000) },
@@ -588,15 +606,14 @@ export class Control {
         throw new Error(`Batch membership HTTP ${response.status}`);
       const data: any = await response.json(),
         batch = data.requested_batch;
-      if (data.repo !== row.repo || !batch || batch.id !== args.batch)
+      if (data.repo !== row.repo || !batch || batch.id !== args.batch ||
+          status.run.testedHead !== batch.head_sha)
         throw new Error("Batch identity not available");
-      const partition = `${row.repo}/${day(args.created)}`;
-      const status = await call(this.env.FACTS, partition, "/status", {
-        id: args.id,
-        attempt: args.attempt,
-      });
-      if (status.run && status.run.testedHead === batch.head_sha) {
-        const members = [...new Set(batch.members.map((m: any) => m.pr))];
+      {
+        const members = [...new Set<number>((batch.members || [])
+          .map((m: any) => m.pr)
+          .filter((pr: any) => Number.isInteger(pr) && pr > 0))];
+        if (!members.length) throw new Error("Batch membership unavailable");
         await call(this.env.FACTS, partition, "/members", {
           id: args.id,
           attempt: args.attempt,
@@ -609,6 +626,10 @@ export class Control {
           members,
           day: day(args.created),
         });
+        this.sql.exec(
+          "INSERT INTO dirty VALUES (?,1) ON CONFLICT(day) DO UPDATE SET revision=revision+1",
+          day(args.created),
+        );
       }
     } else if (row.kind === "inventory") {
       const { data } = await this.github(
@@ -747,6 +768,30 @@ export class Control {
       // one final attempt-specific enumeration to recover omitted jobs/steps.
     }
     this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+  }
+  async repairMembers() {
+    const deadline = Date.now() + 10000;
+    let repaired = 0;
+    for (const row of this.sql.exec(
+      "SELECT * FROM repairs WHERE kind='members' AND due<=? ORDER BY due LIMIT 8", now(),
+    ).toArray()) {
+      if (Date.now() > deadline) break;
+      try {
+        await this.repair(row);
+        repaired++;
+        this.set("members_error", null);
+      } catch (error) {
+        this.set("members_error", String(error));
+        this.sql.exec(
+          "UPDATE repairs SET failures=failures+1,due=? WHERE key=?",
+          now() + Math.min(3600, 60 * 2 ** Math.min(6, Number(row.failures))), row.key,
+        );
+      }
+    }
+    if (repaired) this.set("charts_at", 0);
+    return { repaired, pending: this.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) n FROM repairs WHERE kind='members'",
+    ).one().n };
   }
   async bors() {
     const clock = now(),
@@ -976,6 +1021,11 @@ export class Control {
         const pending = days
           .filter((d) => d.day >= day(clock - DAY))
           .reduce((n, d) => n + (d.data.daily["failure/pending"] || 0), 0);
+        const missingMembers = days.flatMap((d) => d.data.staging || [])
+          .filter((r) => r.created >= clock - 30 * DAY && !r.members?.length).length;
+        const membershipRepairs = this.sql.exec<{ n: number }>(
+          "SELECT COUNT(*) n FROM repairs WHERE kind='members'",
+        ).one().n;
         const gaps = this.sql
           .exec<{
             kind: string;
@@ -1006,7 +1056,8 @@ export class Control {
             source_through: through ? iso(through) : null,
             coverage: "observed_with_reconciliation",
             complete: false,
-            pending: group === "details" ? pending : 0,
+            pending: group === "details" ? pending :
+              group === "staging" ? Math.max(missingMembers, membershipRepairs) : 0,
             gaps: gaps
               .filter((g) =>
                 group === "details"
@@ -1049,7 +1100,7 @@ export class Control {
               status:
                 !through || clock - through > 1800
                   ? "stale"
-                  : group === "details" && pending
+                  : metadata.pending
                     ? "pending"
                     : "updated",
             };
@@ -1220,10 +1271,12 @@ export class Control {
         } catch (error) {
           this.set("bors_error", String(error));
         }
+      // Bors reads have their own bounded lane: GitHub quota cannot block them.
+      await this.repairMembers();
       const deadline = Date.now() + 20000;
       for (const row of this.sql
         .exec(
-          `SELECT * FROM repairs WHERE due<=?
+          `SELECT * FROM repairs WHERE due<=? AND kind!='members'
           ORDER BY CASE
             WHEN kind='run' AND json_extract(args,'$.urgent')=1 THEN 0
             WHEN kind='inventory' AND COALESCE(json_extract(args,'$.archival'),0)=0
@@ -1362,6 +1415,8 @@ export class Control {
       await this.publish();
       return json({ ok: true });
     }
+    if (path === "/repair-members")
+      return json(await this.repairMembers());
     if (path === "/repairs")
       return json(
         this.sql
@@ -1388,6 +1443,7 @@ export class Control {
         published: this.get("published"),
         repair_error: this.get("repair_error"),
         bors_error: this.get("bors_error"),
+        members_error: this.get("members_error"),
         comparison_error: this.get("comparison_error"),
         last_comparison: this.get("compared"),
         active_partitions: this.sql

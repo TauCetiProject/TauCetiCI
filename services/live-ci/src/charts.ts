@@ -108,11 +108,11 @@ function panel(
   });
   return out;
 }
-function legend(series: Series[]): string {
+function legend(series: Series[], top = 77, left = 64): string {
   return series
     .map(
       (s, i) =>
-        `<rect x="${64 + (i % 4) * 215}" y="${77 + Math.floor(i / 4) * 19}" width="12" height="3" fill="${s.color || colors[i % colors.length]}"/><text x="${81 + (i % 4) * 215}" y="${83 + Math.floor(i / 4) * 19}">${escape(s.name)}</text>`,
+        `<rect x="${left + (i % 4) * 215}" y="${top + Math.floor(i / 4) * 19}" width="12" height="3" fill="${s.color || colors[i % colors.length]}"/><text x="${left + 17 + (i % 4) * 215}" y="${top + 6 + Math.floor(i / 4) * 19}">${escape(s.name)}</text>`,
     )
     .join("");
 }
@@ -159,6 +159,7 @@ export function renderCharts(
     for (const [i, kind] of [
       "github",
       "namespace",
+      "self-hosted",
       "merge",
       ...(metric === "wait" ? ["other"] : []),
     ].entries())
@@ -201,6 +202,7 @@ export function renderCharts(
   // Separate rate plot avoids mixing counts and shares on one axis.
   const rate: Series = {
     name: "failure rate",
+    dashed: true,
     values: days.map((d) =>
       d.data.daily["pr-total"]
         ? keys("failure/").reduce((n, k) => n + (d.data.daily[k] || 0), 0) /
@@ -231,7 +233,7 @@ export function renderCharts(
   plot(
     "ci-runner-minutes.svg",
     "Build minutes per day",
-    ["namespace", "github", "cancelled"].map((k) => ({
+    ["namespace", "github", "self-hosted", "cancelled"].map((k) => ({
       name: k,
       values: daily("minutes/" + k),
     })),
@@ -244,8 +246,9 @@ export function renderCharts(
         name: "GitHub share",
         values: days.map((d) => {
           const gh = d.data.daily["picker/github"] || 0,
-            ns = d.data.daily["picker/namespace"] || 0;
-          return gh + ns ? gh / (gh + ns) : null;
+            ns = d.data.daily["picker/namespace"] || 0,
+            self = d.data.daily["picker/self-hosted"] || 0;
+          return gh + ns + self ? gh / (gh + ns + self) : null;
         }),
       },
     ],
@@ -258,6 +261,7 @@ export function renderCharts(
   }));
   const landed: Series = {
     name: "PR arrivals on main",
+    dashed: true,
     values: days.map((d) => d.data.landings?.length || 0),
   };
   render("ci-merge-queue.svg", () =>
@@ -293,6 +297,7 @@ export function renderCharts(
       "PR jobs on Namespace",
       "Merge validation on Namespace",
       "Other Namespace jobs",
+      "Self-hosted jobs",
     ];
     const running = [
       "gh-build-pr",
@@ -301,14 +306,15 @@ export function renderCharts(
       "ns-pr",
       "ns-mq",
       "ns-other",
+      "self-hosted",
     ].map((k, i) => ({
       name: names[i],
-      color: colors[i],
+      color: i === 6 ? "#e879f9" : colors[i],
       values: data.map((b) => (b.running ? b.running[k] || 0 : null)),
     }));
-    const queued = ["github", "namespace"].map((k, i) => ({
+    const queued = ["github", "namespace", "self-hosted"].map((k, i) => ({
       name: k,
-      color: colors[i],
+      color: i === 2 ? "#e879f9" : colors[i],
       values: data.map((b) => (b.queued ? b.queued[k] || 0 : null)),
     }));
     const waits = ["build", "other"].map((k, i) => ({
@@ -356,8 +362,10 @@ export function renderCharts(
           `<path stroke="#facc15" stroke-dasharray="5 4" d="M64 ${capY}H928"/><text x="923" y="${capY - 4}" text-anchor="end">20 GitHub-hosted jobs</text>` +
           picks +
           '<text x="64" y="330">Queued</text>' +
+          legend(queued, 324, 150) +
           panel(queued, labels, { top: 345, bottom: 470 }) +
           '<text x="64" y="520">Longest wait (minutes)</text>' +
+          legend(waits, 514, 260) +
           panel(waits, labels, { top: 535, bottom: 660 }) +
           marks,
         710,
@@ -402,28 +410,31 @@ export function renderCharts(
       }),
     ),
   );
-  const staging = days
+  const recordedStaging = days
     .flatMap((d) => d.data.staging || [])
     .filter(
       (r) =>
-        r.members?.length &&
         r.conclusion &&
         r.created >= clock - 30 * DAY &&
         r.created <= clock,
-    );
-  const lo = clock - 30 * DAY,
+    ).sort((a, b) => a.created - b.created);
+  const staging = recordedStaging.filter((r) => r.members?.length);
+  const pendingStaging = recordedStaging.filter((r) => !r.members?.length);
+  const lo = Math.max(clock - 30 * DAY,
+      recordedStaging.length ? Math.floor(recordedStaging[0].created / DAY) * DAY : 0),
+    span = Math.max(1, clock - lo),
     max = Math.max(1, ...staging.map((r) => r.members.length));
   const dots = staging
     .map(
       (r) =>
-        `<circle cx="${64 + 864 * Math.max(0, (r.created - lo) / (30 * DAY))}" cy="${380 - (240 * r.members.length) / max}" r="4" fill="${r.conclusion === "success" ? colors[5] : r.conclusion === "failure" ? colors[3] : colors[7]}"><title>${escape(r.url)}: ${r.members.length} PRs, ${escape(r.conclusion)}</title></circle>`,
+        `<circle cx="${64 + 864 * Math.max(0, (r.created - lo) / span)}" cy="${380 - (240 * r.members.length) / max}" r="4" fill="${r.conclusion === "success" ? colors[5] : r.conclusion === "failure" ? colors[3] : colors[7]}"><title>${escape(r.url)}: ${r.members.length} PRs, ${escape(r.conclusion)}</title></circle>`,
     )
     .join("");
   let cursor = lo,
     shading = "";
   const shade = (a: number, b: number) => {
     if (b > a)
-      shading += `<rect x="${64 + (864 * (a - lo)) / (30 * DAY)}" y="140" width="${(864 * (b - a)) / (30 * DAY)}" height="240" fill="#94a3b8" opacity=".16"><title>Incomplete run inventory</title></rect>`;
+      shading += `<rect x="${64 + (864 * (a - lo)) / span}" y="140" width="${(864 * (b - a)) / span}" height="240" fill="#94a3b8" opacity=".16"><title>Incomplete run inventory</title></rect>`;
   };
   for (const interval of [...inventory].sort((a, b) => a.since - b.since)) {
     const start = Math.max(lo, interval.since),
@@ -433,18 +444,26 @@ export function renderCharts(
     cursor = Math.max(cursor, end);
   }
   shade(cursor, clock);
+  const stagingTicks = Array.from({ length: 7 }, (_, i) => lo + span * i / 6);
+  const pendingMarks = pendingStaging.map((r) => {
+    const x = 64 + 864 * (r.created - lo) / span;
+    return `<path data-ci-membership-pending="true" d="M${x} 418l4 5-4 5-4-5Z" fill="none" stroke="#94a3b8"><title>${escape(r.url)}: batch size pending</title></path>`;
+  }).join("");
   render("ci-bors-staging.svg", () =>
     frame(
       "Bors staging runs",
       `Production main batches, latest attempt; shading marks incomplete inventory. ${iso(clock)}`,
-      panel([], ["30 days ago", "now"], {
+      panel([], stagingTicks.map((at) => iso(at).slice(5, 16).replace("T", " ")), {
         max,
-        times: [lo, clock],
+        times: stagingTicks,
         since: lo,
         until: clock,
       }) +
         shading +
-        dots,
+        dots +
+        (pendingStaging.length ? pendingMarks +
+          `<text x="64" y="454" class="muted">${pendingStaging.length} completed runs awaiting batch size; diamonds mark their times.</text>` : ""),
+      pendingStaging.length ? 480 : 440,
     ),
   );
   return out;
