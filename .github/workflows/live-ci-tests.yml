@@ -1,0 +1,24 @@
+name: live CI service tests
+on:
+  push:
+    paths: ['services/live-ci/**', '.github/workflows/live-ci-tests.yml']
+  pull_request:
+    paths: ['services/live-ci/**', '.github/workflows/live-ci-tests.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/live-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: services/live-ci/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'

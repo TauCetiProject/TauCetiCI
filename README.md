@@ -39,6 +39,12 @@ work is explicit; missing optional artifacts do not pin job coverage.
 
 ## Querying
 
+The [live reporting service](services/live-ci/README.md) maintains incremental CI
+charts and current activity on Cloudflare. Its public manifest is served from
+`https://ci-data.taucetiproject.org/v1/ci/manifest.json`; browser reads spend no
+GitHub quota. It begins in shadow mode while the existing collector and SQLite
+release continue serving as the historical reference.
+
 A SQLite database is rebuilt after collection, with a three-hour fallback schedule, and published as `ci.sqlite.gz` on the
 [`db` release](https://github.com/TauCetiProject/TauCetiCI/releases/tag/db):
 

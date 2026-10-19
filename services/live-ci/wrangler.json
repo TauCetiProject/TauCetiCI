@@ -1,0 +1,53 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tauceti-live-ci",
+  "account_id": "ec2169bdf033f56b009956d4b64ba8ef",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-15",
+  "observability": { "enabled": true },
+  "keep_vars": true,
+  "routes": [
+    { "pattern": "ci-data.taucetiproject.org", "custom_domain": true }
+  ],
+  "version_metadata": { "binding": "CF_VERSION" },
+  "vars": {
+    "PUBLIC_ORIGIN": "https://taucetiproject.org",
+    "PUBLICATION_MODE": "shadow",
+    "GITHUB_HOURLY_BUDGET": "500",
+    "ALLOWED_REPOSITORIES": "[]"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DIRECTORIES", "class_name": "RunDirectory" },
+      { "name": "FACTS", "class_name": "FactPartition" },
+      { "name": "DAYS", "class_name": "DayAggregate" },
+      { "name": "CONTROL", "class_name": "Control" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "RunDirectory",
+        "FactPartition",
+        "DayAggregate",
+        "Control"
+      ]
+    }
+  ],
+  "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "tauceti-live-ci" }],
+  "queues": {
+    "producers": [{ "binding": "EVENTS", "queue": "tauceti-live-ci-events" }],
+    "consumers": [
+      {
+        "queue": "tauceti-live-ci-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_concurrency": 4,
+        "max_retries": 20,
+        "dead_letter_queue": "tauceti-live-ci-events-dlq"
+      }
+    ]
+  },
+  "triggers": { "crons": ["* * * * *"] }
+}
