@@ -277,8 +277,27 @@ def deploy():
         print("Complete dedicated App registration:", URL + "/setup/register")
 
 
+def watch():
+    """Finish the one-time interactive installation without a further CLI step."""
+    prepare()
+    while True:
+        try:
+            finish()
+            deploy()
+            private(DIRECTORY / "installation-complete", str(time.time()))
+            print("Dedicated App connected; shadow validation is running.", flush=True)
+            return
+        except (SystemExit, OSError, ValueError, subprocess.CalledProcessError):
+            # A missing registration costs only a protected R2 read. Once the
+            # App exists, installation discovery runs at most twelve times/hour.
+            print(
+                "Waiting for dedicated App registration and installation.", flush=True
+            )
+            time.sleep(300)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=["prepare", "deploy", "finish"])
+    p.add_argument("action", choices=["prepare", "deploy", "finish", "watch"])
     a = p.parse_args()
-    {"prepare": prepare, "deploy": deploy, "finish": finish}[a.action]()
+    {"prepare": prepare, "deploy": deploy, "finish": finish, "watch": watch}[a.action]()

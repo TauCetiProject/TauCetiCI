@@ -91,6 +91,11 @@ npm test
 python3 scripts/setup.py deploy
 ```
 
+Alternatively, `python3 scripts/setup.py watch` waits for registration and
+installation and performs these two finishing steps once. It checks at most
+every five minutes and exits after connecting the App. This is an optional
+one-time setup helper; serving reports has no host dependency.
+
 The setup tool explicitly selects the TauCeti Cloudflare account, creates its
 queues/bucket, applies retention, deploys the Worker and uploads secrets through
 stdin. Private files live under `~/.config/tauceti-live-ci`, with mode 0600.
