@@ -423,6 +423,8 @@ async function handle(
           kind: url.searchParams.get("kind"),
         }),
       );
+    if (path === "/admin/prune-repairs" && request.method === "POST")
+      return json(await call(env.CONTROL, "control", "/prune-repairs", b));
     if (path === "/admin/compare" && request.method === "POST")
       return json(await call(env.CONTROL, "control", "/comparison", b));
     if (path === "/admin/activation-check")

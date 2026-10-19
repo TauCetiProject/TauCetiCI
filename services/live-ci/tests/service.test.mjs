@@ -316,6 +316,30 @@ test("trusted metadata and summaries cancel satisfied repairs for the same attem
   );
   assert.equal(r.github(), 0);
 });
+test("repair recovery prunes settled work without reading GitHub or dropping unresolved attempts", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({
+    run: run(),
+    jobs: [job()],
+    verified_jobs: true,
+    telemetry: { phases: [{ phase: "build", seconds: 180 }] },
+  });
+  // Simulate the pre-recovery backlog, created before summaries arrived.
+  for (const [kind, attempt] of [
+    ["run", 1],
+    ["run", 2],
+    ["jobs", 1],
+    ["jobs", 2],
+    ["details", 1],
+  ])
+    await r.post("/repair", { repo, kind, args: { id: "100", attempt } });
+  const result = await r.post("/prune-repairs");
+  assert.deepEqual(result, { scanned: 5, removed: 3, cursor: null });
+  const remaining = await r.post("/repairs");
+  assert.equal(remaining.length, 2);
+  assert.ok(remaining.every((row) => row.args.attempt === 2));
+  assert.equal(r.github(), 0);
+});
 test("publication refreshes observed activity while an inventory request is blocked", async (t) => {
   const key = generateKeyPairSync("rsa", {
     modulusLength: 2048,

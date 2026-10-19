@@ -83,6 +83,50 @@ export class Control {
       due,
     );
   }
+  async pruneRepairs(cursor = "") {
+    const rows = this.sql
+      .exec<{ key: string; repo: string; kind: string; args: string }>(
+        "SELECT key,repo,kind,args FROM repairs WHERE key>? AND kind IN ('run','jobs','details') ORDER BY key LIMIT 100",
+        cursor,
+      )
+      .toArray();
+    let removed = 0;
+    for (let i = 0; i < rows.length; i += 4)
+      await Promise.all(
+        rows.slice(i, i + 4).map(async (row) => {
+          const args = JSON.parse(row.args);
+          const location = await call(
+            this.env.DIRECTORIES,
+            directory(row.repo, args.id),
+            "/get",
+            { id: args.id },
+          );
+          if (!location.partition) return;
+          const status = await call(
+            this.env.FACTS,
+            location.partition,
+            "/status",
+            { id: String(args.id), attempt: args.attempt || 1 },
+          );
+          const satisfied =
+            row.kind === "run"
+              ? status.run?.status === "completed"
+              : row.kind === "jobs"
+                ? status.verified
+                : status.run?.telemetry?.coverage === "complete" ||
+                  status.run?.telemetry?.phases?.length;
+          if (satisfied) {
+            this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+            removed++;
+          }
+        }),
+      );
+    return {
+      scanned: rows.length,
+      removed,
+      cursor: rows.length === 100 ? rows.at(-1)!.key : null,
+    };
+  }
   async ingest(b: any) {
     if (
       this.sql.exec("SELECT 1 FROM deliveries WHERE id=?", b.delivery).toArray()
@@ -624,6 +668,24 @@ export class Control {
           );
       }
     } else if (row.kind === "run") {
+      const location = await call(
+        this.env.DIRECTORIES,
+        directory(row.repo, args.id),
+        "/get",
+        { id: args.id },
+      );
+      if (location.partition) {
+        const status = await call(
+          this.env.FACTS,
+          location.partition,
+          "/status",
+          { id: String(args.id), attempt: args.attempt || 1 },
+        );
+        if (status.run?.status === "completed") {
+          this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+          return;
+        }
+      }
       const { data } = await this.github(
         `${base}/runs/${args.id}${args.attempt ? "/attempts/" + args.attempt : ""}`,
       );
@@ -800,7 +862,11 @@ export class Control {
       ]) {
         const key = `active_checked/${repo}/${r.id}/${r.attempt}`;
         if (clock - r.updated > 900 && clock - (this.get(key) || 0) > 900) {
-          this.enqueue(repo, "run", { id: r.id, attempt: r.attempt });
+          this.enqueue(repo, "run", {
+            id: r.id,
+            attempt: r.attempt,
+            urgent: true,
+          });
           this.set(key, clock);
         }
       }
@@ -1147,6 +1213,7 @@ export class Control {
           `SELECT * FROM repairs WHERE due<=?
           ORDER BY COALESCE(json_extract(args,'$.archival'),0),
             CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
+            COALESCE(json_extract(args,'$.urgent'),0) DESC,
             CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 12`,
           clock,
         )
@@ -1282,6 +1349,8 @@ export class Control {
           .toArray()
           .map((row) => ({ ...row, args: JSON.parse(String(row.args)) })),
       );
+    if (path === "/prune-repairs")
+      return json(await this.pruneRepairs(b.cursor || ""));
     if (path === "/health")
       return json({
         version: this.env.CF_VERSION?.id,
