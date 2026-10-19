@@ -81,6 +81,10 @@ function panel(
       const flush = () => {
         if (points.length)
           out += `<polyline fill="none" stroke="${color}" stroke-width="2" ${s.dashed ? 'stroke-dasharray="5 4"' : ""} points="${points.join(" ")}"/>`;
+        if (points.length === 1 && n > 90) {
+          const [cx, cy] = points[0].split(",");
+          out += `<circle cx="${cx}" cy="${cy}" r="2" fill="${color}"/>`;
+        }
         points = [];
       };
       s.values.forEach((v, i) => {
@@ -363,7 +367,7 @@ export function renderCharts(
   const observations = days
     .flatMap((d) => d.data.observations || [])
     .filter(
-      (o) => o.complete !== false && o.at >= clock - 30 * DAY && o.at <= clock,
+      (o) => o.at >= clock - 30 * DAY && o.at <= clock,
     )
     .sort((a, b) => a.at - b.at);
   const queueLabels = observations.map((o) =>
@@ -379,7 +383,7 @@ export function renderCharts(
       queueTimes.push("gap");
       queuePositions.push(observations[i - 1].at + 1);
     }
-    queueValues.push(o.count);
+    queueValues.push(o.complete === false ? null : o.count);
     queueTimes.push(queueLabels[i]);
     queuePositions.push(o.at);
   });

@@ -127,6 +127,44 @@ async function runtime(t, bindings = {}, upstream) {
     github: () => github,
   };
 }
+test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
+  const r = await runtime(t);
+  for (const [i, scanning, snapshot] of [
+    [0, true, null],
+    [1, false, iso(clock - 300)],
+    [2, 0, iso(clock - 300)],
+    [3, false, null],
+  ]) {
+    await r.ingest({
+      observation: {
+        observed_at: iso(clock - 300 + i),
+        eligible_count: 7,
+        candidate_scan_complete: scanning,
+        candidate_snapshot_at: snapshot,
+      },
+    });
+    await r.post("/publish");
+    const bucket = await r.mf.getR2Bucket("ARCHIVE");
+    const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+    assert.equal(manifest.current.ready_to_merge.complete, i !== 3);
+  }
+  const rows = (await r.summary()).observations;
+  assert.deepEqual(rows.map((o) => o.complete), [true, true, true, false]);
+  assert.deepEqual(rows.map((o) => o.count), [7, 7, 7, 7]);
+  await r.ingest({
+    observation: {
+      observed_at: iso(clock - 296),
+      candidate_scan_complete: false,
+      candidate_snapshot_at: iso(clock - 300),
+      eligible: [{ pr: 1, ready: true }, { pr: 1, queued: true }, { pr: 2, ready: true }],
+    },
+  });
+  await r.post("/publish");
+  const manifest = await (await r.mf.dispatchFetch("https://example.com/v1/ci/manifest.json")).json();
+  assert.equal(manifest.current.ready_to_merge.complete, true);
+  assert.equal(manifest.current.ready_to_merge.count, 2);
+  assert.equal(r.github(), 0);
+});
 test("archive sampling survives newer live metadata and retracts prior overlap contributions", async (t) => {
   const r = await runtime(t);
   await r.ingest({ run: run(), jobs: [job()] });

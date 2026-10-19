@@ -384,3 +384,17 @@ test("report SVGs parse and irregular observations keep their actual time positi
   );
   assert.equal(parsed.status, 0, parsed.stderr);
 });
+test("queue history breaks at startup partials and shows isolated observations in long series", async () => {
+  const code = buildSync({
+    entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false,
+  }).outputFiles[0].text;
+  const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+  const observations = Array.from({ length: 120 }, (_, i) => ({
+    at: t - (120 - i) * 60, count: 7, complete: i !== 40 && i !== 42,
+  }));
+  const assets = renderCharts([{ day: m.day(t), data: { daily: {}, fleet: [], observations } }], t);
+  const svg = assets["ci-queue-size.svg"];
+  const segments = [...svg.matchAll(/<polyline[^>]*points="([^"]+)"/g)].map((match) => match[1].split(" "));
+  assert.deepEqual(segments.map((points) => points.length), [40, 1, 77]);
+  assert.equal([...svg.matchAll(/<circle /g)].length, 1);
+});
