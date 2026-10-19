@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import re
 
-CLASSIFIER_VERSION = 2
+CLASSIFIER_VERSION = 3
 
 # (class, regex on the first failing step's name). First match wins.
 STEP_RULES: list[tuple[str, str]] = [
     ("infra-report", r"^Report|^Post "),
+    ("policy", r"^Reject option overrides and heartbeat instrumentation$"),
     ("policy", r"guard|Scope|shim|Attest|Validate the Lake-pin|Normalise|bump"),
     ("dot-notation", r"Dot-notation"),
     ("toolchain-incompat", r"Build the trusted environment-lint driver|watchdog toolchain"),
