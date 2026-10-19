@@ -43,7 +43,7 @@
         "queue": "tauceti-live-ci-events",
         "max_batch_size": 10,
         "max_batch_timeout": 1,
-        "max_concurrency": 4,
+        "max_concurrency": 16,
         "max_retries": 20,
         "dead_letter_queue": "tauceti-live-ci-events-dlq"
       }
