@@ -1270,6 +1270,18 @@ export class Control {
       await this.publish();
       return json({ ok: true });
     }
+    if (path === "/repairs")
+      return json(
+        this.sql
+          .exec(
+            `SELECT repo,kind,args,due,failures FROM repairs
+        WHERE (? IS NULL OR kind=?) ORDER BY due LIMIT 20`,
+            b.kind || null,
+            b.kind || null,
+          )
+          .toArray()
+          .map((row) => ({ ...row, args: JSON.parse(String(row.args)) })),
+      );
     if (path === "/health")
       return json({
         version: this.env.CF_VERSION?.id,
