@@ -9,16 +9,18 @@ skips confirmed imports. Existing SQLite release/export remains available.
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import json
 import sqlite3
 import time
 import urllib.error
 import urllib.request
+from itertools import zip_longest
 from pathlib import Path
 
 
-def events(db, since):
+def events(db, since, interleave_days=4):
     db.row_factory = sqlite3.Row
     weights = {
         (r["workflow"], r["hour"]): (r["total"], r["fetched"] or 0)
@@ -33,13 +35,25 @@ def events(db, since):
     for (
         workflow,
         duration,
-    ) in db.execute("""SELECT r.workflow,j.run_s FROM jobs j JOIN runs r USING(repo,run_id)
-        WHERE j.run_s IS NOT NULL AND j.runner_kind='github' ORDER BY r.workflow,j.run_s"""):
+    ) in db.execute(
+        """SELECT r.workflow,j.run_s FROM jobs j JOIN runs r USING(repo,run_id)
+        WHERE j.run_s IS NOT NULL AND j.runner_kind='github' ORDER BY r.workflow,j.run_s"""
+    ):
         typical.setdefault(workflow, []).append(duration)
     medians = {k: v[len(v) // 2] for k, v in typical.items()}
-    for row in db.execute(
-        "SELECT * FROM runs WHERE created_at>=? ORDER BY created_at DESC,repo,run_id",
-        (since,),
+    # Spread each bounded HTTP batch over independent UTC-day objects. Sending
+    # every concurrent request to one day just creates another hot-object queue.
+    streams = [
+        db.execute(
+            """SELECT * FROM runs WHERE created_at>=?
+        AND COALESCE(CAST(strftime('%s',created_at) AS INTEGER)/86400,0)%?=?
+        ORDER BY created_at DESC,repo,run_id""",
+            (since, interleave_days, shard),
+        )
+        for shard in range(interleave_days)
+    ]
+    for row in (
+        row for group in zip_longest(*streams) for row in group if row is not None
     ):
         r = dict(row)
         repo = "TauCetiProject/" + r["repo"]
@@ -71,9 +85,7 @@ def events(db, since):
             j["status"] = (
                 "completed"
                 if j["conclusion"]
-                else "in_progress"
-                if j["started_at"]
-                else "queued"
+                else "in_progress" if j["started_at"] else "queued"
             )
             j["steps"] = [
                 dict(s)
@@ -218,6 +230,7 @@ def main():
     )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--concurrency", type=int, choices=range(1, 9), default=4)
+    ap.add_argument("--interleave-days", type=int, choices=range(1, 9), default=4)
     args = ap.parse_args()
     args.receipts.parent.mkdir(parents=True, exist_ok=True)
     receipts = sqlite3.connect(args.receipts)
@@ -273,8 +286,10 @@ def main():
             confirm()
 
     try:
-        with sqlite3.connect(f"file:{args.db.resolve()}?mode=ro", uri=True) as db:
-            for event in events(db, args.since):
+        with closing(
+            sqlite3.connect(f"file:{args.db.resolve()}?mode=ro", uri=True)
+        ) as db:
+            for event in events(db, args.since, args.interleave_days):
                 payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
                 identity = "bootstrap/" + hashlib.sha256(payload.encode()).hexdigest()
                 if receipts.execute(
@@ -285,7 +300,9 @@ def main():
                 if args.dry_run:
                     count += 1
                     continue
-                if batch and (len(batch) >= 50 or batch_bytes + len(payload) > 1_000_000):
+                if batch and (
+                    len(batch) >= 50 or batch_bytes + len(payload) > 1_000_000
+                ):
                     publish()
                 batch.append(event)
                 identities.append(identity)
@@ -302,7 +319,9 @@ def main():
                 "bootstrap": {"since": args.since},
             }
             payload = json.dumps(completion, sort_keys=True, separators=(",", ":"))
-            identity = "bootstrap/complete/" + hashlib.sha256(payload.encode()).hexdigest()
+            identity = (
+                "bootstrap/complete/" + hashlib.sha256(payload.encode()).hexdigest()
+            )
             completion["delivery"] = identity
             batch.append(completion)
             identities.append(identity)
@@ -311,6 +330,7 @@ def main():
                 confirm()
     finally:
         pool.shutdown(wait=True)
+        receipts.close()
     print(
         ("Would import" if args.dry_run else "Imported"),
         count,
