@@ -18,7 +18,11 @@ by an earlier summary.
 
 Every fact replacement commits its previous/new metric contribution and an
 outbox together. Day objects apply outbox deltas with persistent receipts.
-Retries across either object boundary cannot double-count. Daily duration/wait
+Retries across either object boundary cannot double-count. Fact activity and
+dirty-day notifications return to the scheduler through durable alarms, starting
+new request chains instead of reentering ingestion. Notifications coalesce by
+revision, survive failures and do not postpone an earlier scheduled alarm when
+more events arrive. Daily duration/wait
 distributions retain exact nearest-rank percentiles; sums and counts are
 reversible. Fleet bins retain running-time integrals, queue interval boundaries,
 wait distributions and Namespace picker ticks. Matching queue departures are

@@ -102,7 +102,30 @@ async function runtime(t, bindings = {}, upstream) {
     await mf.setOptions(options);
     ns = await mf.getDurableObjectNamespace("CONTROL");
   };
-  return { mf, post, ingest, summary, updateBindings, github: () => github };
+  const notify = async () => {
+    for (const [binding, name] of [
+      ["FACTS", repo + "/" + date],
+      ["DAYS", date],
+    ]) {
+      const ns = await mf.getDurableObjectNamespace(binding);
+      const response = await ns
+        .get(ns.idFromName(name))
+        .fetch("https://internal/tick", {
+          method: "POST",
+          body: "{}",
+        });
+      assert.equal(response.status, 200, await response.clone().text());
+    }
+  };
+  return {
+    mf,
+    post,
+    ingest,
+    summary,
+    notify,
+    updateBindings,
+    github: () => github,
+  };
 }
 test("duplicate delivery, late queued job and telemetry corrections preserve totals", async (t) => {
   const r = await runtime(t),
@@ -175,6 +198,7 @@ test("outbox retry cannot apply the same delta twice", async (t) => {
 test("manifest and immutable charts support conditional public reads without GitHub", async (t) => {
   const r = await runtime(t);
   await r.ingest({ run: run(), jobs: [job()] });
+  await r.notify();
   await r.post("/tick");
   const response = await r.mf.dispatchFetch(
     "https://example.com/v1/ci/manifest.json",
@@ -200,6 +224,29 @@ test("manifest and immutable charts support conditional public reads without Git
   for (let i = 0; i < 20; i++)
     await r.mf.dispatchFetch("https://example.com/v1/ci/manifest.json");
   assert.equal(r.github(), 0);
+});
+test("alarm notifications publish active state and late completion corrections", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({
+    run: { ...run(), status: "in_progress", conclusion: null },
+    jobs: [
+      { ...job(), status: "in_progress", conclusion: null, completed_at: null },
+    ],
+  });
+  await r.notify();
+  await r.post("/tick");
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  let manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.current.running.github, 1);
+  assert.equal((await r.post("/health")).active_partitions, 1);
+  await r.ingest({ run: run(), jobs: [job()] });
+  await r.notify();
+  await r.post("/tick");
+  manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.deepEqual(manifest.current.running, {});
+  assert.equal((await r.post("/health")).active_partitions, 0);
+  assert.equal((await r.summary()).daily["pr-total"], 1);
+  assert.equal((await r.summary()).daily["duration/github"].median, 3);
 });
 test("webhooks verify HMAC and persist the delivery before queueing", async (t) => {
   const r = await runtime(t),
@@ -404,6 +451,7 @@ test("cold aggregate pages restore exact distributions and idempotency receipts"
     ],
   };
   await send("/delta", delta);
+  await send("/tick", {});
   let result;
   for (let i = 0; i < 10; i++) {
     result = await send("/compact", { day: date });

@@ -14,6 +14,12 @@ import {
   type Job,
 } from "./model";
 import { call, json, now, type Env } from "./types";
+async function scheduleSoon(ctx: DurableObjectState) {
+  const next = Date.now() + 1000;
+  const scheduled = await ctx.storage.getAlarm();
+  // A busy partition must not keep postponing its notification indefinitely.
+  if (scheduled === null || scheduled > next) await ctx.storage.setAlarm(next);
+}
 async function archiveRead(env: Env, key: string): Promise<any> {
   const object = await env.ARCHIVE.get(key + ".gz");
   return object
@@ -142,7 +148,7 @@ export class FactPartition {
           JSON.stringify(rows.slice(i, i + 200)),
         );
   }
-  async flush() {
+  async flush(notify = false) {
     const partition = this.meta("partition");
     for (const row of this.sql
       .exec<{
@@ -171,11 +177,19 @@ export class FactPartition {
         .one().n;
     const revision = (this.meta("partition_revision") || 0) + 1;
     this.set("partition_revision", revision);
-    await call(this.env.CONTROL, "control", "/partition", {
-      partition,
-      active,
-      revision,
-    });
+    this.set("partition_pending", revision);
+    // Notify from an alarm, whose request context starts a fresh call chain.
+    // Calling Control here during Control -> Facts -> Days ingestion creates
+    // reentrant chains that exhaust the production Workers depth budget.
+    if (notify) {
+      await call(this.env.CONTROL, "control", "/partition", {
+        partition,
+        active,
+        revision,
+      });
+      if (this.meta("partition_pending") === revision)
+        this.set("partition_pending", null);
+    }
     const stillActive =
       this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray()
         .length ||
@@ -184,11 +198,11 @@ export class FactPartition {
           "SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1",
         )
         .toArray().length;
-    if (
-      stillActive ||
-      this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length
-    )
-      await this.ctx.storage.setAlarm(Date.now() + 60000);
+    const pending =
+      this.meta("partition_pending") ||
+      this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
+    if (pending) await scheduleSoon(this.ctx);
+    else if (stillActive) await this.ctx.storage.setAlarm(Date.now() + 60000);
     else await this.ctx.storage.deleteAlarm();
   }
   async alarm() {
@@ -215,7 +229,7 @@ export class FactPartition {
       full = rows.length === 1000;
       this.set("alarm_cursor", full ? rows.at(-1)!.id : "");
     });
-    await this.flush();
+    await this.flush(true);
     if (full) await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
   async fetch(request: Request) {
@@ -543,7 +557,7 @@ export class FactPartition {
         this.sql.exec("INSERT INTO deliveries VALUES (?,?)", b.delivery, now());
         this.sql.exec("DELETE FROM deliveries WHERE at<?", now() - 14 * DAY);
       });
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
+      await scheduleSoon(this.ctx);
       await this.flush();
       return json({ ok: true });
     }
@@ -613,7 +627,10 @@ export class DayAggregate {
               this.sql
                 .exec<{
                   n: number;
-                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=? AND amount>0", metric)
+                }>(
+                  "SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=? AND amount>0",
+                  metric,
+                )
                 .one().n || 0;
             const quantile = (q: number) =>
               this.sql
@@ -631,7 +648,10 @@ export class DayAggregate {
               this.sql
                 .exec<{
                   n: number;
-                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=?", metric)
+                }>(
+                  "SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=?",
+                  metric,
+                )
                 .one().n || 0;
         }
       } else {
@@ -652,7 +672,11 @@ export class DayAggregate {
               this.sql
                 .exec<{
                   n: number;
-                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=? AND metric=?", bucket, metric)
+                }>(
+                  "SELECT SUM(amount) n FROM metrics WHERE bucket=? AND metric=?",
+                  bucket,
+                  metric,
+                )
                 .one().n || 0;
           if (type === "queued")
             b.queued[key] = Math.max(
@@ -660,7 +684,11 @@ export class DayAggregate {
               this.sql
                 .exec<{
                   n: number;
-                }>(`SELECT MAX(depth) n FROM (SELECT SUM(amount) OVER (ORDER BY value ROWS UNBOUNDED PRECEDING) depth FROM metrics WHERE bucket=? AND metric=?)`, bucket, metric)
+                }>(
+                  `SELECT MAX(depth) n FROM (SELECT SUM(amount) OVER (ORDER BY value ROWS UNBOUNDED PRECEDING) depth FROM metrics WHERE bucket=? AND metric=?)`,
+                  bucket,
+                  metric,
+                )
                 .one().n || 0,
             );
           if (type === "wait")
@@ -668,7 +696,11 @@ export class DayAggregate {
               this.sql
                 .exec<{
                   n: number;
-                }>("SELECT MAX(value) n FROM metrics WHERE bucket=? AND metric=? AND amount>0", bucket, metric)
+                }>(
+                  "SELECT MAX(value) n FROM metrics WHERE bucket=? AND metric=? AND amount>0",
+                  bucket,
+                  metric,
+                )
                 .one().n || 0;
           if (type === "picked")
             b.picked = this.sql
@@ -750,11 +782,22 @@ export class DayAggregate {
   }
   async alarm() {
     await this.ctx.storage.setAlarm(Date.now() + 60000);
-    if (await this.restore()) await this.ctx.storage.deleteAlarm();
+    const restored = await this.restore();
+    const pending = this.meta("notification");
+    if (pending) {
+      await call(this.env.CONTROL, "control", "/dirty", { day: pending.day });
+      if (this.meta("notification")?.revision === pending.revision)
+        this.set("notification", null);
+    }
+    if (restored && !this.meta("notification"))
+      await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
   async compact(date: string) {
     if (date >= day(now() - 90 * DAY))
       return { done: false, reason: "inside detail retention" };
+    if (this.meta("notification"))
+      return { done: false, reason: "notification pending" };
     if (this.meta("cold")) return { done: true };
     const revision = this.meta("revision") || 0;
     let state = this.meta("compaction");
@@ -812,6 +855,10 @@ export class DayAggregate {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
+    if (path === "/tick") {
+      await this.alarm();
+      return json({ ok: true });
+    }
     if (path === "/compact") return json(await this.compact(b.day));
     if (path === "/summary" && this.meta("cold")) {
       const object = await this.env.ARCHIVE.get(`summaries/${b.day}.json`);
@@ -898,10 +945,13 @@ export class DayAggregate {
     } else if (path === "/summary") {
       return json(this.summary());
     } else return json({ error: "unknown operation" }, 404);
-    this.set("revision", (this.meta("revision") || 0) + 1);
-    await call(this.env.CONTROL, "control", "/dirty", {
+    const revision = (this.meta("revision") || 0) + 1;
+    this.set("revision", revision);
+    this.set("notification", {
       day: b.day || day(b.at),
+      revision,
     });
+    await scheduleSoon(this.ctx);
     return json({ ok: true });
   }
 }
