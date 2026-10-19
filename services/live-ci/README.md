@@ -149,6 +149,10 @@ sampling weights and running-only estimates. It streams records in bounded
 batches and maintains disposable local receipts so interruptions are resumable.
 Four HTTP batches run concurrently by default (`--concurrency 1` serializes
 them). The completion checkpoint waits for every batch acknowledgement.
+Records interleave four independent UTC days to avoid concentrating every
+request on the same day object; `--interleave-days 1` restores strict recent-first
+ordering. Lower `--concurrency` or pause/resume the importer if live queue age
+starts growing during catch-up.
 The original archives and SQLite release remain the historical export. Do not
 rebuild that input database between retries of the same bootstrap operation.
 
