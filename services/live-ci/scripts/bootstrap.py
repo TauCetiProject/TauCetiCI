@@ -7,6 +7,8 @@ skips confirmed imports. Existing SQLite release/export remains available.
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import sqlite3
@@ -215,6 +217,7 @@ def main():
         default=Path.home() / ".local/state/tauceti-live-ci/import.sqlite",
     )
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--concurrency", type=int, choices=range(1, 9), default=4)
     args = ap.parse_args()
     args.receipts.parent.mkdir(parents=True, exist_ok=True)
     receipts = sqlite3.connect(args.receipts)
@@ -224,14 +227,13 @@ def main():
     batch = []
     identities = []
     batch_bytes = 0
+    pending = deque()
+    pool = ThreadPoolExecutor(max_workers=args.concurrency)
 
-    def publish():
-        nonlocal count, batch_bytes
-        if not batch:
-            return
+    def send(records):
         request = urllib.request.Request(
             args.url + "/admin/import",
-            data=json.dumps(batch).encode(),
+            data=json.dumps(records).encode(),
             headers={
                 "Authorization": "Bearer " + token,
                 "Content-Type": "application/json",
@@ -247,46 +249,68 @@ def main():
                 if attempt == 5:
                     raise
                 time.sleep(min(30, 2**attempt))
+
+    def confirm():
+        nonlocal count
+        future, confirmed = pending.popleft()
+        future.result()
         receipts.executemany(
-            "INSERT OR IGNORE INTO imported VALUES (?)", [(v,) for v in identities]
+            "INSERT OR IGNORE INTO imported VALUES (?)", [(v,) for v in confirmed]
         )
         receipts.commit()
-        count += len(batch)
+        count += len(confirmed)
+        print("Imported", count, "events", flush=True)
+
+    def publish():
+        nonlocal batch_bytes
+        if not batch:
+            return
+        pending.append((pool.submit(send, list(batch)), list(identities)))
         batch.clear()
         identities.clear()
         batch_bytes = 0
-        print("Imported", count, "events", flush=True)
+        if len(pending) >= args.concurrency:
+            confirm()
 
-    with sqlite3.connect(f"file:{args.db.resolve()}?mode=ro", uri=True) as db:
-        for event in events(db, args.since):
-            payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
-            identity = "bootstrap/" + hashlib.sha256(payload.encode()).hexdigest()
-            if receipts.execute(
-                "SELECT 1 FROM imported WHERE id=?", (identity,)
-            ).fetchone():
-                continue
-            event["delivery"] = identity
-            if args.dry_run:
-                count += 1
-                continue
-            if batch and (len(batch) >= 50 or batch_bytes + len(payload) > 1_000_000):
-                publish()
-            batch.append(event)
+    try:
+        with sqlite3.connect(f"file:{args.db.resolve()}?mode=ro", uri=True) as db:
+            for event in events(db, args.since):
+                payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+                identity = "bootstrap/" + hashlib.sha256(payload.encode()).hexdigest()
+                if receipts.execute(
+                    "SELECT 1 FROM imported WHERE id=?", (identity,)
+                ).fetchone():
+                    continue
+                event["delivery"] = identity
+                if args.dry_run:
+                    count += 1
+                    continue
+                if batch and (len(batch) >= 50 or batch_bytes + len(payload) > 1_000_000):
+                    publish()
+                batch.append(event)
+                identities.append(identity)
+                batch_bytes += len(payload)
+        if not args.dry_run:
+            publish()
+            # Completion is a barrier: every earlier request must be acknowledged
+            # before live charts may replace the complete static report.
+            while pending:
+                confirm()
+            completion = {
+                "repo": "TauCetiProject/TauCeti",
+                "historical": True,
+                "bootstrap": {"since": args.since},
+            }
+            payload = json.dumps(completion, sort_keys=True, separators=(",", ":"))
+            identity = "bootstrap/complete/" + hashlib.sha256(payload.encode()).hexdigest()
+            completion["delivery"] = identity
+            batch.append(completion)
             identities.append(identity)
-            batch_bytes += len(payload)
-    if not args.dry_run:
-        publish()
-        completion = {
-            "repo": "TauCetiProject/TauCeti",
-            "historical": True,
-            "bootstrap": {"since": args.since},
-        }
-        payload = json.dumps(completion, sort_keys=True, separators=(",", ":"))
-        identity = "bootstrap/complete/" + hashlib.sha256(payload.encode()).hexdigest()
-        completion["delivery"] = identity
-        batch.append(completion)
-        identities.append(identity)
-        publish()
+            publish()
+            while pending:
+                confirm()
+    finally:
+        pool.shutdown(wait=True)
     print(
         ("Would import" if args.dry_run else "Imported"),
         count,

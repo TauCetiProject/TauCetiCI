@@ -248,6 +248,74 @@ test("alarm notifications publish active state and late completion corrections",
   assert.equal((await r.summary()).daily["pr-total"], 1);
   assert.equal((await r.summary()).daily["duration/github"].median, 3);
 });
+test("terminal parents retire unobserved children without inventing job results", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({
+    run: {
+      ...run(),
+      status: "in_progress",
+      conclusion: null,
+      updated_at: iso(clock - 180),
+    },
+    jobs: [
+      {
+        ...job(),
+        status: "in_progress",
+        conclusion: null,
+        completed_at: null,
+        steps: [],
+      },
+    ],
+  });
+  await r.notify();
+  const facts = await r.mf.getDurableObjectNamespace("FACTS"),
+    partition = facts.get(facts.idFromName(repo + "/" + date));
+  const current = async () =>
+    (
+      await partition.fetch("https://internal/current", {
+        method: "POST",
+        body: "{}",
+      })
+    ).json();
+  assert.equal((await current()).counts[0].count, 1);
+  await r.ingest({ run: { ...run(), updated_at: iso(clock - 120) } });
+  assert.deepEqual((await current()).counts, []);
+  const bounded = await r.summary();
+  assert.equal(bounded.daily["duration/github"], undefined);
+  // An unchanged payload still stays inactive on subsequent alarm refreshes.
+  await r.notify();
+  assert.deepEqual((await current()).counts, []);
+  await r.ingest({ jobs: [job()] });
+  const settled = await r.summary();
+  assert.equal(settled.daily["duration/github"].median, 3);
+  assert.equal(settled.daily["pr-total"], 1);
+  assert.deepEqual((await current()).counts, []);
+  assert.equal(r.github(), 0);
+});
+test("trusted metadata and summaries cancel satisfied repairs for the same attempt", async (t) => {
+  const r = await runtime(t);
+  for (const [kind, attempt] of [
+    ["run", 1],
+    ["jobs", 1],
+    ["details", 1],
+    ["run", 2],
+  ])
+    await r.post("/repair", { repo, kind, args: { id: "100", attempt } });
+  await r.ingest({
+    run: run(),
+    jobs: [job()],
+    verified_jobs: true,
+    telemetry: { phases: [{ phase: "build", seconds: 180 }] },
+  });
+  assert.deepEqual(
+    (await r.post("/health")).pending.map(({ kind, count }) => ({
+      kind,
+      count,
+    })),
+    [{ kind: "run", count: 1 }],
+  );
+  assert.equal(r.github(), 0);
+});
 test("publication refreshes observed activity while an inventory request is blocked", async (t) => {
   const key = generateKeyPairSync("rsa", {
     modulusLength: 2048,
@@ -725,6 +793,41 @@ test("orphaned inbox writes recover and duplicate queue messages find the archiv
   assert.equal(ack, 2);
   assert.equal(await bucket.get(key), null);
   assert.ok(await bucket.get(key.replace("inbox/", "deliveries/")));
+  const failed = key.replace("inbox/", "failed/");
+  await bucket.put(
+    failed,
+    JSON.stringify({ repo, delivery: "orphan", run: run() }),
+  );
+  assert.equal(
+    (
+      await r.mf.dispatchFetch("https://example.com/admin/replay-failed", {
+        method: "POST",
+        body: "{}",
+      })
+    ).status,
+    401,
+  );
+  const replay = await r.mf.dispatchFetch(
+    "https://example.com/admin/replay-failed",
+    {
+      method: "POST",
+      headers: { Authorization: "Bearer admin" },
+      body: "{}",
+    },
+  );
+  assert.equal(replay.status, 202);
+  assert.deepEqual(await replay.json(), { enqueued: 1, cursor: null });
+  await worker.queue(
+    { messages: [{ ...message, body: { key: failed } }] },
+    env,
+  );
+  assert.equal(await bucket.get(failed), null);
+  await worker.queue(
+    { messages: [{ ...message, body: { key: failed } }] },
+    env,
+  );
+  assert.equal(ack, 4);
+  assert.equal(r.github(), 0);
 });
 test("SQL projections match archived production metrics and timeline bins", async (t) => {
   const r = await runtime(t),

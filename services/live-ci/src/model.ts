@@ -232,7 +232,12 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
         : run.trigger === "pr"
           ? "ns-pr"
           : "ns-other";
-  const end = Math.min(j.completed ?? until, until);
+  // A terminal parent proves that an unobserved child is no longer running.
+  // Keep its conclusion unknown until the authoritative job delivery arrives.
+  const end = Math.min(
+    j.completed ?? (run.status === "completed" ? run.updated : until),
+    until,
+  );
   const created = Math.max(j.created, until - 30 * DAY);
   const started = j.started && j.assigned ? j.started : null;
   const interval = (

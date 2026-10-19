@@ -390,6 +390,24 @@ async function handle(
       await env.EVENTS.send({ key: b.key });
       return json({ accepted: true }, 202);
     }
+    if (path === "/admin/replay-failed" && request.method === "POST") {
+      const page = await env.ARCHIVE.list({
+        prefix: "failed/",
+        limit: 100,
+        cursor: b.cursor || undefined,
+      });
+      if (page.objects.length)
+        await env.EVENTS.sendBatch(
+          page.objects.map(({ key }) => ({ body: { key } })),
+        );
+      return json(
+        {
+          enqueued: page.objects.length,
+          cursor: page.truncated ? page.cursor : null,
+        },
+        202,
+      );
+    }
     if (
       ["/admin/tick", "/admin/publish"].includes(path) &&
       request.method === "POST"
@@ -447,19 +465,19 @@ export default {
     }
   },
   async queue(batch: MessageBatch<{ key: string }>, env: Env) {
-    for (const message of batch.messages) {
+    const consume = async (message: Message<{ key: string }>) => {
       try {
         const object =
           (await env.ARCHIVE.get(message.body.key)) ||
           (await env.ARCHIVE.get(
-            message.body.key.replace(/^inbox\//, "deliveries/"),
+            message.body.key.replace(/^(inbox|failed)\//, "deliveries/"),
           ));
         if (!object) throw new Error("Archived delivery missing");
         const event = await object.json();
         await call(env.CONTROL, "control", "/event", event);
-        if (message.body.key.startsWith("inbox/")) {
+        if (/^(inbox|failed)\//.test(message.body.key)) {
           await env.ARCHIVE.put(
-            message.body.key.replace(/^inbox\//, "deliveries/"),
+            message.body.key.replace(/^(inbox|failed)\//, "deliveries/"),
             JSON.stringify(event),
           );
           await env.ARCHIVE.delete(message.body.key);
@@ -483,7 +501,9 @@ export default {
         }
         message.retry({ delaySeconds: 60 });
       }
-    }
+    };
+    for (let i = 0; i < batch.messages.length; i += 4)
+      await Promise.all(batch.messages.slice(i, i + 4).map(consume));
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Publication has its own single-flight operation: slow reconciliation
