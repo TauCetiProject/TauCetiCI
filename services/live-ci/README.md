@@ -18,8 +18,12 @@ by an earlier summary.
 
 Every fact replacement commits its previous/new metric contribution and an
 outbox together. Day objects apply outbox deltas with persistent receipts.
-Retries across either object boundary cannot double-count. Fact activity and
-dirty-day notifications return to the scheduler through durable alarms, starting
+Retries across either object boundary cannot double-count.
+Outbox delivery groups at most 40 updates for the same day into one request,
+retaining each update's individual receipt. Overlapping batches are safe to
+replay, and deployment skew falls back to individual updates.
+Fact activity and dirty-day notifications return to the scheduler through durable
+alarms, starting
 new request chains instead of reentering ingestion. Notifications coalesce by
 revision, survive failures and do not postpone an earlier scheduled alarm when
 more events arrive. Daily duration/wait
@@ -175,6 +179,8 @@ completion checkpoint. Import prioritizes recent runs and overlaps four event
 deliveries at a time; it consumes no GitHub quota. Current inventory and missing
 run metadata take priority over older job and detail repairs within the same
 500-request rolling budget.
+Current inventory and stale active runs also precede old inventory pages, so
+initial catch-up cannot starve activity reconciliation.
 
 Keep existing collection/publication schedules during rollout. Retire overlapping
 collection schedules only after live

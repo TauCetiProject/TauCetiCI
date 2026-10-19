@@ -533,6 +533,55 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
   );
   assert.equal(r.github(), 2);
 });
+test("old inventory pages cannot starve reconciliation of a stale active run", async (t) => {
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const reads = [];
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith("/access_tokens"))
+        return Response.json({ token: "test", expires_at: iso(clock + 3600) });
+      reads.push(url);
+      return Response.json(
+        url.pathname.endsWith("/attempts/1")
+          ? run()
+          : { total_count: 0, workflow_runs: [] },
+      );
+    },
+  );
+  await r.ingest({
+    run: { ...run(), status: "in_progress", conclusion: null },
+  });
+  for (let i = 1; i <= 15; i++)
+    await r.post("/repair", {
+      repo,
+      kind: "inventory",
+      args: { since: clock - 7200 - i, until: clock - 3600 - i },
+    });
+  await r.post("/repair", {
+    repo,
+    kind: "run",
+    args: { id: "100", attempt: 1, urgent: true },
+  });
+  await r.post("/tick");
+  const refresh = reads.findIndex((url) =>
+    url.pathname.endsWith("/attempts/1"),
+  );
+  const oldInventory = reads.findIndex((url) => {
+    const since = url.searchParams.get("created")?.split("..")[0];
+    return since && Date.parse(since) / 1000 < clock - 3600;
+  });
+  assert.ok(refresh >= 0);
+  assert.ok(oldInventory > refresh);
+});
 test("cold fact archive restores prior contributions before a historical correction", async (t) => {
   const r = await runtime(t),
     then = clock - 60 * 86400,
