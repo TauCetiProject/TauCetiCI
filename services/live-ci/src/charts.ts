@@ -81,6 +81,10 @@ function panel(
       const flush = () => {
         if (points.length)
           out += `<polyline fill="none" stroke="${color}" stroke-width="2" ${s.dashed ? 'stroke-dasharray="5 4"' : ""} points="${points.join(" ")}"/>`;
+        if (points.length === 1 && n > 90) {
+          const [cx, cy] = points[0].split(",");
+          out += `<circle cx="${cx}" cy="${cy}" r="2" fill="${color}"/>`;
+        }
         points = [];
       };
       s.values.forEach((v, i) => {
@@ -363,9 +367,13 @@ export function renderCharts(
   const observations = days
     .flatMap((d) => d.data.observations || [])
     .filter(
-      (o) => o.complete !== false && o.at >= clock - 30 * DAY && o.at <= clock,
+      (o) => o.at >= clock - 30 * DAY && o.at <= clock,
     )
     .sort((a, b) => a.at - b.at);
+  const queueSince = Math.max(
+    clock - 30 * DAY,
+    observations.length ? Math.floor(observations[0].at / DAY) * DAY : 0,
+  );
   const queueLabels = observations.map((o) =>
     iso(o.at).slice(5, 16).replace("T", " "),
   );
@@ -379,17 +387,17 @@ export function renderCharts(
       queueTimes.push("gap");
       queuePositions.push(observations[i - 1].at + 1);
     }
-    queueValues.push(o.count);
+    queueValues.push(o.complete === false ? null : o.count);
     queueTimes.push(queueLabels[i]);
     queuePositions.push(o.at);
   });
   render("ci-queue-size.svg", () =>
     frame(
       "Observed ready-to-merge PR backlog",
-      `Distinct ready-labelled PRs, including staging; gaps are missing observations. ${iso(clock)}`,
+      `Ready-labelled PRs, including staging; recorded since ${iso(queueSince).slice(0, 10)}. Gaps are unavailable snapshots. ${iso(clock)}`,
       panel([{ name: "ready PRs", values: queueValues }], queueTimes, {
         times: queuePositions,
-        since: clock - 30 * DAY,
+        since: queueSince,
         until: clock,
       }),
     ),

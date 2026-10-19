@@ -305,12 +305,16 @@ export class Control {
               .filter((p: any) => p.ready || p.queued)
               .map((p: any) => p.pr),
           ).size;
+      // An in-progress scan reuses the last completed candidate snapshot.
+      // Only the first scan after a restart has no trustworthy baseline.
+      const complete =
+        (o.candidate_scan_complete !== false &&
+          o.candidate_scan_complete !== 0) ||
+        !!o.candidate_snapshot_at;
       await call(this.env.DAYS, day(at), "/observation", {
         at,
         count,
-        complete:
-          o.candidate_scan_complete !== false &&
-          o.candidate_scan_complete !== 0,
+        complete,
         day: day(at),
       });
       if (at >= (this.get("bors_observed") || 0)) {
@@ -318,9 +322,7 @@ export class Control {
         this.set("bors_current", {
           at: iso(at),
           count,
-          complete:
-            o.candidate_scan_complete !== false &&
-            o.candidate_scan_complete !== 0,
+          complete,
         });
       }
     } else if (b.landing) {

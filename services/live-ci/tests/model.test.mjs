@@ -372,7 +372,9 @@ test("report SVGs parse and irregular observations keep their actual time positi
   const positions = [
     ...assets["ci-queue-size.svg"].matchAll(/<circle cx="([\d.]+)"/g),
   ].map((m) => Number(m[1]));
-  assert.ok(Math.abs(positions[1] - positions[0] - (864 * 2) / 30) < 1e-7);
+  const span = t - Math.floor((t - 3 * m.DAY) / m.DAY) * m.DAY;
+  assert.ok(Math.abs(positions[1] - positions[0] - (864 * 2 * m.DAY) / span) < 1e-7);
+  assert.match(assets["ci-queue-size.svg"], /recorded since 2026-10-15/);
   assert.equal(assets["ci-bors-staging.svg"].includes('opacity=".16"'), false);
   const parsed = spawnSync(
     "python3",
@@ -383,4 +385,18 @@ test("report SVGs parse and irregular observations keep their actual time positi
     { input: JSON.stringify(assets), encoding: "utf8" },
   );
   assert.equal(parsed.status, 0, parsed.stderr);
+});
+test("queue history breaks at startup partials and shows isolated observations in long series", async () => {
+  const code = buildSync({
+    entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false,
+  }).outputFiles[0].text;
+  const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+  const observations = Array.from({ length: 120 }, (_, i) => ({
+    at: t - (120 - i) * 60, count: 7, complete: i !== 40 && i !== 42,
+  }));
+  const assets = renderCharts([{ day: m.day(t), data: { daily: {}, fleet: [], observations } }], t);
+  const svg = assets["ci-queue-size.svg"];
+  const segments = [...svg.matchAll(/<polyline[^>]*points="([^"]+)"/g)].map((match) => match[1].split(" "));
+  assert.deepEqual(segments.map((points) => points.length), [40, 1, 77]);
+  assert.equal([...svg.matchAll(/<circle /g)].length, 1);
 });

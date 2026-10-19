@@ -93,6 +93,13 @@ Inventory coverage, detail completeness and rendering timestamps are distinct.
 An empty observation is not proof of zero activity. The browser labels stale
 coverage, preserves working images after failures and pauses polling when hidden.
 
+Ready-to-merge history uses the last completed candidate snapshot while bors
+scans for changes, matching the legacy report. A partial startup scan without a
+completed snapshot remains a gap. Explicit partial observations break the line,
+as do missing observations more than three minutes apart; isolated valid samples
+remain visible. The time axis starts at the first recorded day, within the
+thirty-day window. Queue snapshots were first recorded on 2026-10-04.
+
 Assets live at `/v1/ci/assets/<revision>/<filename>`. They are uploaded before the
 manifest pointer changes. Public reads use R2 only, support ETags and CORS, and
 carry no GitHub credentials. `/healthz` exposes service identity/version only.
