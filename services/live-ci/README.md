@@ -10,8 +10,10 @@ that transition.
 
 ## Processing and storage
 
-Signed GitHub deliveries are archived before they enter the queue. A sharded
-run directory routes job events to their repository/UTC-day fact object. Each
+Signed GitHub deliveries are archived before they enter the queue.
+Up to 16 consumer invocations process at most four messages concurrently each;
+this capacity does not change the separate GitHub read budget.
+A sharded run directory routes job events to their repository/UTC-day fact object. Each
 run attempt and job has its own identity. Terminal observations cannot be
 reopened by older deliveries. Later summaries preserve metadata already enriched
 by an earlier summary.
