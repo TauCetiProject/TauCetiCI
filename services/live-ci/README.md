@@ -36,6 +36,8 @@ into the Worker heap. Publishing reads at most 90 materialized daily summaries,
 rather than raw jobs or all historical records. Current activity publishes each
 minute; changed chart generations publish every ten minutes. The current UTC day
 is provisional. An unavailable or unfinished input remains explicit.
+Publication runs independently of repair batches, so initial reconciliation
+cannot hold up snapshots of incoming webhook activity.
 
 General facts move to compressed R2 archives after 30 days; build facts retain
 90 days. Archival operates in bounded run batches, retaining the old contribution

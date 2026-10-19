@@ -18,6 +18,7 @@ import { env as runtimeEnv } from "cloudflare:workers";
 export class Control {
   private sql: SqlStorage;
   private ticking?: Promise<void>;
+  private publishing?: Promise<void>;
   // Binding-only deployments can reuse an existing isolate. Read the current
   // bindings rather than retaining the constructor's pre-installation env.
   private get env(): Env {
@@ -682,6 +683,15 @@ export class Control {
     this.set("bors_checked", clock);
   }
   async publish() {
+    if (this.publishing) return this.publishing;
+    this.publishing = this.performPublish();
+    try {
+      return await this.publishing;
+    } finally {
+      this.publishing = undefined;
+    }
+  }
+  private async performPublish() {
     const clock = now();
     // Materialize only changed days, bounded across ticks. A revision test
     // preserves dirtiness if an event arrived during the cross-object read.
@@ -1224,6 +1234,10 @@ export class Control {
     }
     if (path === "/tick") {
       await this.tick();
+      return json({ ok: true });
+    }
+    if (path === "/publish") {
+      await this.publish();
       return json({ ok: true });
     }
     if (path === "/health")

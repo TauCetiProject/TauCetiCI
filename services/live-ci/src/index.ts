@@ -390,8 +390,11 @@ async function handle(
       await env.EVENTS.send({ key: b.key });
       return json({ accepted: true }, 202);
     }
-    if (path === "/admin/tick" && request.method === "POST") {
-      await call(env.CONTROL, "control", "/tick");
+    if (
+      ["/admin/tick", "/admin/publish"].includes(path) &&
+      request.method === "POST"
+    ) {
+      await call(env.CONTROL, "control", path.slice("/admin".length));
       return json({ ok: true });
     }
     if (path === "/admin/health")
@@ -483,6 +486,9 @@ export default {
     }
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    // Publication has its own single-flight operation: slow reconciliation
+    // must not prevent a fresh snapshot of concurrently arriving webhooks.
+    ctx.waitUntil(call(env.CONTROL, "control", "/publish"));
     ctx.waitUntil(call(env.CONTROL, "control", "/tick"));
     ctx.waitUntil(
       (async () => {

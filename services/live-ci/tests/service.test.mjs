@@ -248,6 +248,55 @@ test("alarm notifications publish active state and late completion corrections",
   assert.equal((await r.summary()).daily["pr-total"], 1);
   assert.equal((await r.summary()).daily["duration/github"].median, 3);
 });
+test("publication refreshes observed activity while an inventory request is blocked", async (t) => {
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  let entered, release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    async (req) => {
+      if (new URL(req.url).pathname.endsWith("/access_tokens"))
+        return Response.json({ token: "test", expires_at: iso(clock + 3600) });
+      entered();
+      await blocked;
+      return Response.json({ total_count: 0, workflow_runs: [] });
+    },
+  );
+  await r.ingest({
+    run: { ...run(), status: "in_progress", conclusion: null },
+    jobs: [
+      { ...job(), status: "in_progress", conclusion: null, completed_at: null },
+    ],
+  });
+  await r.notify();
+  const repairing = r.post("/tick");
+  try {
+    await started;
+    const reads = r.github();
+    await r.post("/publish");
+    const bucket = await r.mf.getR2Bucket("ARCHIVE");
+    const manifest = await (
+      await bucket.get("public/v1/ci/manifest.json")
+    ).json();
+    assert.equal(manifest.current.running.github, 1);
+    assert.equal(r.github(), reads);
+  } finally {
+    release();
+    await repairing;
+  }
+});
 test("webhooks verify HMAC and persist the delivery before queueing", async (t) => {
   const r = await runtime(t),
     body = JSON.stringify({
