@@ -197,6 +197,13 @@ export class Control {
         b.annotation.at,
         b.annotation.text,
       );
+    } else if (b.bootstrap) {
+      if (!b.historical || !Number.isFinite(Date.parse(b.bootstrap.since)))
+        throw new Error("Invalid bootstrap completion");
+      const previous = this.get("history_since");
+      const since = Date.parse(b.bootstrap.since) / 1000;
+      this.set("history_since", previous ? Math.min(previous, since) : since);
+      this.set("charts_at", 0);
     } else if (b.coverage) {
       if (b.coverage.stream === "inventory")
         this.sql.exec(
@@ -811,6 +818,13 @@ export class Control {
       pending_repairs: this.sql
         .exec<{ n: number }>("SELECT COUNT(*) n FROM repairs")
         .one().n,
+      history: {
+        status:
+          this.get("history_since") <= clock - 89 * DAY ? "ready" : "importing",
+        since: this.get("history_since")
+          ? iso(this.get("history_since"))
+          : null,
+      },
     });
     if (clock - (this.get("charts_at") || 0) >= 600) {
       const days = this.sql
@@ -941,6 +955,15 @@ export class Control {
         }
         this.set("charts_at", clock);
       }
+    }
+    // Live activity can launch before historical import finishes. Keep the
+    // site's complete static charts until the incremental history is ready.
+    // Their replacements are rendered again as soon as bootstrap completes.
+    if (manifest.mode === "live" && manifest.history.status !== "ready") {
+      manifest.assets = {};
+      manifest.series_url = undefined;
+      for (const group of Object.values(manifest.groups) as any[])
+        group.status = "importing";
     }
     // Publish pointer last; readers see a complete immutable generation.
     await this.env.ARCHIVE.put(
@@ -1081,7 +1104,10 @@ export class Control {
       const deadline = Date.now() + 20000;
       for (const row of this.sql
         .exec(
-          "SELECT * FROM repairs WHERE due<=? ORDER BY COALESCE(json_extract(args,'$.archival'),0),due LIMIT 12",
+          `SELECT * FROM repairs WHERE due<=?
+          ORDER BY COALESCE(json_extract(args,'$.archival'),0),
+            CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
+            CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 12`,
           clock,
         )
         .toArray()) {
@@ -1257,11 +1283,17 @@ export class Control {
         0,
       );
       return json({
-        ready:
-          span >= 7 * DAY &&
-          rows.every((r) => r.passed === 1) &&
-          maxGap <= 7200 &&
-          now() - (rows.at(-1)?.at || 0) < 7200,
+        ready: !!(
+          this.env.GITHUB_APP_ID &&
+          this.env.GITHUB_INSTALLATION_ID &&
+          this.env.GITHUB_PRIVATE_KEY &&
+          this.get("published") &&
+          now() - this.get("published") < 300
+        ),
+        publication_age_seconds: this.get("published")
+          ? now() - this.get("published")
+          : null,
+        latest_comparison_passed: rows.at(-1)?.passed === 1,
         comparison_count: rows.length,
         span_seconds: span,
         max_gap_seconds: maxGap,

@@ -155,12 +155,14 @@ def deploy():
             (DIRECTORY / "publication-mode").read_text().strip()
         )
     if config["vars"]["PUBLICATION_MODE"] == "live":
-        validation = http(
-            "/admin/activation-check", (DIRECTORY / "admin-token").read_text().strip()
+        health = http(
+            "/admin/health", (DIRECTORY / "admin-token").read_text().strip()
         )
-        if not validation["ready"]:
+        if not health.get("github_configured") or not (
+            0 <= time.time() - health.get("published", 0) < 300
+        ):
             raise SystemExit(
-                "Seven days of recent, successful shadow comparisons are required before live publication"
+                "Live publication requires a configured GitHub App and a report published within five minutes"
             )
     for queue in ["tauceti-live-ci-events-dlq", "tauceti-live-ci-events"]:
         result = run(
@@ -272,7 +274,7 @@ def deploy():
             }
         ),
     )
-    print("Deployed shadow reporting:", URL)
+    print("Deployed", config["vars"]["PUBLICATION_MODE"], "reporting:", URL)
     if not installation:
         print("Complete dedicated App registration:", URL + "/setup/register")
 

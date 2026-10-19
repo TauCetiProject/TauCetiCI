@@ -374,10 +374,14 @@ async function handle(
       const events = Array.isArray(b) ? b : [b];
       if (events.length > 100)
         return json({ error: "At most 100 events per import" }, 400);
-      for (const event of events) {
-        validateEvent(event, env);
-        await call(env.CONTROL, "control", "/event", event);
-      }
+      for (const event of events) validateEvent(event, env);
+      // Keep one-time import bounded while overlapping cross-object I/O.
+      for (let i = 0; i < events.length; i += 4)
+        await Promise.all(
+          events
+            .slice(i, i + 4)
+            .map((event: any) => call(env.CONTROL, "control", "/event", event)),
+        );
       return json({ imported: events.length });
     }
     if (path === "/admin/replay" && request.method === "POST") {

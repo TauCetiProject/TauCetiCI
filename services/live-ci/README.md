@@ -143,9 +143,10 @@ state, runner and timestamps without repairing the reference into the mirror
 first. Results are retained privately under `validation/`. Publication freshness
 is required as well as agreement.
 
-`GET /admin/activation-check` requires a continuous seven-day passing comparison
-window, no gap longer than two hours, and a recent comparison. Setup refuses a
-live deployment until this check passes. To activate after reviewing results:
+`GET /admin/activation-check` reports current readiness and comparison results.
+There is no mandatory comparison waiting period. Live activation requires the
+dedicated App to be configured and a report published within five minutes.
+Comparisons continue after launch. To activate:
 
 ```sh
 printf 'live\n' > ~/.config/tauceti-live-ci/publication-mode
@@ -153,8 +154,15 @@ python3 scripts/setup.py deploy
 ```
 
 Rollback changes that file to `shadow` and redeploys. It preserves facts, repair
-state and archives. Keep existing collection/publication schedules during the
-comparison period. Retire overlapping collection schedules only after live
+state and archives. Live activity can launch while historical import continues:
+the browser keeps the site's complete static charts until bootstrap sends its
+completion checkpoint. Import prioritizes recent runs and overlaps four event
+deliveries at a time; it consumes no GitHub quota. Current inventory and missing
+run metadata take priority over older job and detail repairs within the same
+500-request rolling budget.
+
+Keep existing collection/publication schedules during rollout. Retire overlapping
+collection schedules only after live
 freshness and archival/export continuity have been verified; manual backfills
 and SQLite export must remain available.
 
@@ -165,4 +173,4 @@ archive cohort is checked against the existing Python daily/fleet calculations.
 The 1x/10x fixture checks contribution growth and independence from retained
 history. Its local timings are not evidence of Cloudflare network capacity;
 observe production queue age, request usage, storage and processing costs during
-the shadow window before asserting a production throughput limit.
+rollout before asserting a production throughput limit.

@@ -36,7 +36,8 @@ def events(db, since):
         typical.setdefault(workflow, []).append(duration)
     medians = {k: v[len(v) // 2] for k, v in typical.items()}
     for row in db.execute(
-        "SELECT * FROM runs WHERE created_at>=? ORDER BY repo,run_id", (since,)
+        "SELECT * FROM runs WHERE created_at>=? ORDER BY created_at DESC,repo,run_id",
+        (since,),
     ):
         r = dict(row)
         repo = "TauCetiProject/" + r["repo"]
@@ -274,6 +275,17 @@ def main():
             identities.append(identity)
             batch_bytes += len(payload)
     if not args.dry_run:
+        publish()
+        completion = {
+            "repo": "TauCetiProject/TauCeti",
+            "historical": True,
+            "bootstrap": {"since": args.since},
+        }
+        payload = json.dumps(completion, sort_keys=True, separators=(",", ":"))
+        identity = "bootstrap/complete/" + hashlib.sha256(payload.encode()).hexdigest()
+        completion["delivery"] = identity
+        batch.append(completion)
+        identities.append(identity)
         publish()
     print(
         ("Would import" if args.dry_run else "Imported"),

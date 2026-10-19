@@ -424,10 +424,81 @@ test("connecting the App updates bindings without losing observed facts", async 
   assert.ok((await r.post("/health")).requests.some((x) => x.status === 200));
   assert.equal((await r.post("/health")).repair_error, null);
 });
-test("activation waits for a continuous seven-day comparison window", async (t) => {
+test("activation requires a configured App and a recent publication", async (t) => {
   const r = await runtime(t);
   await r.post("/comparison", { passed: true, samples: 3 });
   assert.equal((await r.post("/activation-check")).ready, false);
+});
+test("activation can proceed immediately without a comparison waiting period", async (t) => {
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    (req) =>
+      new URL(req.url).pathname.endsWith("/access_tokens")
+        ? Response.json({ token: "test", expires_at: iso(clock + 3600) })
+        : Response.json({ total_count: 0, workflow_runs: [] }),
+  );
+  assert.equal((await r.post("/activation-check")).ready, false);
+  await r.post("/tick");
+  const check = await r.post("/activation-check");
+  assert.equal(check.ready, true);
+  assert.equal(check.comparison_count, 0);
+});
+test("live activity launches while static charts cover unfinished historical import", async (t) => {
+  const r = await runtime(t, { PUBLICATION_MODE: "live" });
+  await r.ingest({
+    run: { ...run(), status: "in_progress", conclusion: null },
+    jobs: [
+      { ...job(), status: "in_progress", conclusion: null, completed_at: null },
+    ],
+  });
+  await r.notify();
+  await r.post("/tick");
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  let manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.mode, "live");
+  assert.equal(manifest.current.running.github, 1);
+  assert.equal(manifest.history.status, "importing");
+  assert.deepEqual(manifest.assets, {});
+  await r.ingest({
+    historical: true,
+    bootstrap: { since: iso(clock - 90 * 86400) },
+  });
+  await r.post("/tick");
+  manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.history.status, "ready");
+  assert.equal(Object.keys(manifest.assets).length, 11);
+});
+test("parallel historical import preserves duplicate receipts and exact totals", async (t) => {
+  const r = await runtime(t);
+  const events = ["100", "100", "101", "102"].map((id) => ({
+    repo,
+    delivery: "import/" + id,
+    historical: true,
+    run: run(id),
+    jobs: [job(String(Number(id) + 100), id)],
+  }));
+  const response = await r.mf.dispatchFetch(
+    "https://example.com/admin/import",
+    {
+      method: "POST",
+      headers: { Authorization: "Bearer admin" },
+      body: JSON.stringify(events),
+    },
+  );
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal((await response.json()).imported, 4);
+  const summary = await r.summary();
+  assert.equal(summary.daily["pr-total"], 3);
+  assert.equal(summary.daily["duration/github"].median, 3);
+  assert.equal(r.github(), 0);
 });
 test("cold aggregate pages restore exact distributions and idempotency receipts", async (t) => {
   const r = await runtime(t),
