@@ -375,6 +375,7 @@ test("connecting the App updates bindings without losing observed facts", async 
   assert.equal((await r.summary()).daily["pr-total"], 1);
   await r.post("/tick");
   assert.ok((await r.post("/health")).requests.some((x) => x.status === 200));
+  assert.equal((await r.post("/health")).repair_error, null);
 });
 test("activation waits for a continuous seven-day comparison window", async (t) => {
   const r = await runtime(t);

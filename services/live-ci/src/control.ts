@@ -1088,6 +1088,7 @@ export class Control {
         if (Date.now() > deadline) break;
         try {
           await this.repair(row);
+          this.set("repair_error", null);
         } catch (error) {
           this.set("repair_error", String(error));
           if (
@@ -1120,6 +1121,7 @@ export class Control {
       if (clock - (this.get("compared") || 0) >= 3600)
         try {
           await this.compare();
+          this.set("comparison_error", null);
         } catch (error) {
           this.set("comparison_error", String(error));
         }
