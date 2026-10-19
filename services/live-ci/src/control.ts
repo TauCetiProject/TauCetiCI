@@ -1257,9 +1257,16 @@ export class Control {
             this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
             continue;
           }
+          // Admission deferrals are not failures of this repair. The quota
+          // owner still gates every read, so retry promptly as slots reopen.
+          const deferred = /budget|quota/.test(String(error));
           this.sql.exec(
-            "UPDATE repairs SET failures=failures+1,due=? WHERE key=?",
-            now() + Math.min(3600, 60 * 2 ** Math.min(6, Number(row.failures))),
+            "UPDATE repairs SET failures=failures+?,due=? WHERE key=?",
+            deferred ? 0 : 1,
+            now() +
+              (deferred
+                ? 60
+                : Math.min(3600, 60 * 2 ** Math.min(6, Number(row.failures)))),
             row.key,
           );
           if (/budget|quota|configured|authentication/.test(String(error)))

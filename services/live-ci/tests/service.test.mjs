@@ -533,6 +533,40 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
   );
   assert.equal(r.github(), 2);
 });
+test("quota deferrals retry promptly without accumulating repair failures", async (t) => {
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+      GITHUB_HOURLY_BUDGET: "1",
+    },
+    async () => Response.json({ token: "test", expires_at: iso(clock + 3600) }),
+  );
+  await r.post("/tick");
+  const inventory = (await r.post("/repairs", { kind: "inventory" })).find(
+    (row) => !row.args.archival,
+  );
+  for (let i = 0; i < 3; i++) {
+    await r.post("/repair", {
+      repo,
+      kind: "inventory",
+      args: inventory.args,
+    });
+    await r.post("/tick");
+    const pending = (await r.post("/repairs", { kind: "inventory" })).find(
+      (row) => !row.args.archival,
+    );
+    assert.equal(pending.failures, 0);
+    const delay = pending.due - Math.floor(Date.now() / 1000);
+    assert.ok(delay >= 55 && delay <= 60, `Unexpected retry delay: ${delay}`);
+    assert.equal(r.github(), 1); // Only the first token exchange used a slot.
+  }
+});
 test("old inventory pages cannot starve reconciliation of a stale active run", async (t) => {
   const key = generateKeyPairSync("rsa", {
     modulusLength: 2048,
