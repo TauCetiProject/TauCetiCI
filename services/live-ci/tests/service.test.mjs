@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHmac, generateKeyPairSync } from "node:crypto";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { buildSync } from "esbuild";
+import { build } from "esbuild";
 const repo = "TauCetiProject/TauCeti";
 const clock = Math.floor(Date.now() / 1000),
   date = new Date((clock - 300) * 1000).toISOString().slice(0, 10);
@@ -43,40 +43,39 @@ const job = (id = "200", run_id = "100") => ({
 });
 async function runtime(t, bindings = {}, upstream) {
   let github = 0;
-  const mf = new Miniflare(
-    convertV4MiniflareOptions({
-      modules: true,
-      script: readFileSync("dist/index.js", "utf8"),
-      compatibilityDate: "2026-10-15",
-      durableObjects: {
-        DIRECTORIES: { className: "RunDirectory", useSQLite: true },
-        FACTS: { className: "FactPartition", useSQLite: true },
-        DAYS: { className: "DayAggregate", useSQLite: true },
-        CONTROL: { className: "Control", useSQLite: true },
-      },
-      r2Buckets: ["ARCHIVE"],
-      queueProducers: { EVENTS: "events" },
-      bindings: {
-        WEBHOOK_SECRET: "webhook",
-        ADMIN_TOKEN: "admin",
-        INGEST_TOKEN: "ingest",
-        ALLOWED_REPOSITORIES: JSON.stringify([repo]),
-        GITHUB_HOURLY_BUDGET: "500",
-        PUBLIC_ORIGIN: "https://taucetiproject.org",
-        PUBLICATION_MODE: "shadow",
-        ...bindings,
-      },
-      outboundService: async (req) => {
-        if (new URL(req.url).hostname === "api.github.com") {
-          github++;
-          if (upstream) return upstream(req);
-        }
-        return Response.json({ observations: [], truncated: false });
-      },
-    }),
-  );
+  const options = convertV4MiniflareOptions({
+    modules: true,
+    script: readFileSync("dist/index.js", "utf8"),
+    compatibilityDate: "2026-10-15",
+    durableObjects: {
+      DIRECTORIES: { className: "RunDirectory", useSQLite: true },
+      FACTS: { className: "FactPartition", useSQLite: true },
+      DAYS: { className: "DayAggregate", useSQLite: true },
+      CONTROL: { className: "Control", useSQLite: true },
+    },
+    r2Buckets: ["ARCHIVE"],
+    queueProducers: { EVENTS: "events" },
+    bindings: {
+      WEBHOOK_SECRET: "webhook",
+      ADMIN_TOKEN: "admin",
+      INGEST_TOKEN: "ingest",
+      ALLOWED_REPOSITORIES: JSON.stringify([repo]),
+      GITHUB_HOURLY_BUDGET: "500",
+      PUBLIC_ORIGIN: "https://taucetiproject.org",
+      PUBLICATION_MODE: "shadow",
+      ...bindings,
+    },
+    outboundService: async (req) => {
+      if (new URL(req.url).hostname === "api.github.com") {
+        github++;
+        if (upstream) return upstream(req);
+      }
+      return Response.json({ observations: [], truncated: false });
+    },
+  });
+  const mf = new Miniflare(options);
   t.after(() => mf.dispose());
-  const ns = await mf.getDurableObjectNamespace("CONTROL");
+  let ns = await mf.getDurableObjectNamespace("CONTROL");
   const post = async (path, b = {}) => {
     const r = await ns
       .get(ns.idFromName("control"))
@@ -97,7 +96,13 @@ async function runtime(t, bindings = {}, upstream) {
     assert.equal(r.status, 200, await r.clone().text());
     return r.json();
   };
-  return { mf, post, ingest, summary, github: () => github };
+  const updateBindings = async (values) => {
+    for (const [key, value] of Object.entries(values))
+      options.workers[0].config.env[key] = { type: "text", value };
+    await mf.setOptions(options);
+    ns = await mf.getDurableObjectNamespace("CONTROL");
+  };
+  return { mf, post, ingest, summary, updateBindings, github: () => github };
 }
 test("duplicate delivery, late queued job and telemetry corrections preserve totals", async (t) => {
   const r = await runtime(t),
@@ -350,6 +355,27 @@ test("secondary rate limits pause all repair reads and preserve pending work", a
   assert.ok(health.pending.length);
   assert.ok(health.requests.some((x) => x.status === 429));
 });
+test("connecting the App updates bindings without losing observed facts", async (t) => {
+  const r = await runtime(t, {}, (req) =>
+    new URL(req.url).pathname.endsWith("/access_tokens")
+      ? Response.json({ token: "test", expires_at: iso(clock + 3600) })
+      : Response.json({ total_count: 0, workflow_runs: [] }),
+  );
+  await r.ingest({ run: run(), jobs: [job()] });
+  assert.equal((await r.post("/health")).github_configured, false);
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  await r.updateBindings({
+    GITHUB_APP_ID: "1",
+    GITHUB_INSTALLATION_ID: "2",
+    GITHUB_PRIVATE_KEY: String(key),
+  });
+  assert.equal((await r.post("/health")).github_configured, true);
+  assert.equal((await r.summary()).daily["pr-total"], 1);
+  await r.post("/tick");
+  assert.ok((await r.post("/health")).requests.some((x) => x.status === 200));
+});
 test("activation waits for a continuous seven-day comparison window", async (t) => {
   const r = await runtime(t);
   await r.post("/comparison", { passed: true, samples: 3 });
@@ -471,13 +497,32 @@ test("orphaned inbox writes recover and duplicate queue messages find the archiv
   const r = await runtime(t),
     bucket = await r.mf.getR2Bucket("ARCHIVE"),
     control = await r.mf.getDurableObjectNamespace("CONTROL");
-  const code = buildSync({
-    entryPoints: ["src/index.ts"],
-    bundle: true,
-    format: "esm",
-    platform: "node",
-    write: false,
-  }).outputFiles[0].text;
+  const code = (
+    await build({
+      entryPoints: ["src/index.ts"],
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      write: false,
+      plugins: [
+        {
+          name: "unused-durable-object-bindings",
+          setup(build) {
+            // This test calls only entrypoint methods in Node; actual Durable
+            // Objects and their binding handling run in the Miniflare instance.
+            build.onResolve({ filter: /^cloudflare:workers$/ }, () => ({
+              path: "bindings",
+              namespace: "runtime-stub",
+            }));
+            build.onLoad({ filter: /.*/, namespace: "runtime-stub" }, () => ({
+              contents: "export const env = {};",
+              loader: "js",
+            }));
+          },
+        },
+      ],
+    })
+  ).outputFiles[0].text;
   const worker = (
     await import(
       "data:text/javascript;base64," + Buffer.from(code).toString("base64")

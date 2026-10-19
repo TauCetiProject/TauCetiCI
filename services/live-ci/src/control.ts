@@ -13,14 +13,17 @@ import { renderCharts } from "./charts";
 import { headers, installationToken, boundedBytes } from "./github";
 import { unzipSync } from "fflate";
 import { classify } from "./failure";
+import { env as runtimeEnv } from "cloudflare:workers";
 
 export class Control {
   private sql: SqlStorage;
   private ticking?: Promise<void>;
-  constructor(
-    private ctx: DurableObjectState,
-    private env: Env,
-  ) {
+  // Binding-only deployments can reuse an existing isolate. Read the current
+  // bindings rather than retaining the constructor's pre-installation env.
+  private get env(): Env {
+    return runtimeEnv as Env;
+  }
+  constructor(private ctx: DurableObjectState) {
     this.sql = ctx.storage.sql;
     this.sql
       .exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
@@ -1197,6 +1200,12 @@ export class Control {
     }
     if (path === "/health")
       return json({
+        version: this.env.CF_VERSION?.id,
+        github_configured: !!(
+          this.env.GITHUB_APP_ID &&
+          this.env.GITHUB_INSTALLATION_ID &&
+          this.env.GITHUB_PRIVATE_KEY
+        ),
         started: this.get("started"),
         published: this.get("published"),
         repair_error: this.get("repair_error"),
