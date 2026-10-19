@@ -159,19 +159,43 @@ export class FactPartition {
   }
   async flush(notify = false) {
     const partition = this.meta("partition");
-    for (const row of this.sql
+    const pending = this.sql
       .exec<{
         id: number;
         day: string;
         data: string;
       }>("SELECT * FROM outbox ORDER BY id LIMIT 40")
-      .toArray()) {
-      await call(this.env.DAYS, row.day, "/delta", {
+      .toArray();
+    const groups = new Map<string, typeof pending>();
+    for (const row of pending) {
+      const group = groups.get(row.day) || [];
+      group.push(row);
+      groups.set(row.day, group);
+    }
+    for (const [date, rows] of groups) {
+      const deltas = rows.map((row) => ({
         id: `${partition}/${row.id}`,
-        day: row.day,
+        day: date,
         rows: JSON.parse(row.data),
-      });
-      this.sql.exec("DELETE FROM outbox WHERE id=?", row.id);
+      }));
+      if (deltas.length === 1)
+        await call(this.env.DAYS, date, "/delta", deltas[0]);
+      else {
+        try {
+          await call(this.env.DAYS, date, "/delta-batch", {
+            day: date,
+            deltas,
+          });
+        } catch (error) {
+          // Durable Objects can adopt new code at different times. Old days
+          // still accept individual receipts during deployment and rollback.
+          if (!/Internal \/delta-batch: 404/.test(String(error))) throw error;
+          for (const delta of deltas)
+            await call(this.env.DAYS, date, "/delta", delta);
+        }
+      }
+      for (const row of rows)
+        this.sql.exec("DELETE FROM outbox WHERE id=?", row.id);
     }
     const active =
       this.sql
@@ -207,10 +231,10 @@ export class FactPartition {
           "SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1",
         )
         .toArray().length;
-    const pending =
+    const stillPending =
       this.meta("partition_pending") ||
       this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
-    if (pending) await scheduleSoon(this.ctx);
+    if (stillPending) await scheduleSoon(this.ctx);
     else if (stillActive) await this.ctx.storage.setAlarm(Date.now() + 60000);
     else await this.ctx.storage.deleteAlarm();
   }
@@ -879,35 +903,45 @@ export class DayAggregate {
     }
     if (path !== "/summary" && !(await this.restore()))
       throw new Error("Aggregate restoration in progress");
-    if (path === "/delta")
+    if (path === "/delta" || path === "/delta-batch") {
+      const deltas = path === "/delta" ? [b] : b.deltas;
+      if (
+        !Array.isArray(deltas) ||
+        deltas.length > 40 ||
+        deltas.reduce((n, delta) => n + (delta.rows?.length || 0), 0) > 8000
+      )
+        return json({ error: "Delta batch exceeds limit" }, 400);
       this.ctx.storage.transactionSync(() => {
-        if (
-          this.sql.exec("SELECT 1 FROM receipts WHERE id=?", b.id).toArray()
-            .length
-        )
-          return;
-        for (const row of b.rows) {
-          this.sql.exec(
-            "INSERT OR IGNORE INTO dirty_buckets VALUES (?)",
-            row.bucket,
-          );
-          this.sql.exec(
-            "INSERT INTO metrics VALUES (?,?,?,?) ON CONFLICT(bucket,metric,value) DO UPDATE SET amount=amount+excluded.amount",
-            row.bucket,
-            row.metric,
-            row.value,
-            row.amount,
-          );
-          this.sql.exec(
-            "DELETE FROM metrics WHERE bucket=? AND metric=? AND value=? AND ABS(amount)<0.000000001",
-            row.bucket,
-            row.metric,
-            row.value,
-          );
+        for (const delta of deltas) {
+          if (
+            this.sql
+              .exec("SELECT 1 FROM receipts WHERE id=?", delta.id)
+              .toArray().length
+          )
+            continue;
+          for (const row of delta.rows) {
+            this.sql.exec(
+              "INSERT OR IGNORE INTO dirty_buckets VALUES (?)",
+              row.bucket,
+            );
+            this.sql.exec(
+              "INSERT INTO metrics VALUES (?,?,?,?) ON CONFLICT(bucket,metric,value) DO UPDATE SET amount=amount+excluded.amount",
+              row.bucket,
+              row.metric,
+              row.value,
+              row.amount,
+            );
+            this.sql.exec(
+              "DELETE FROM metrics WHERE bucket=? AND metric=? AND value=? AND ABS(amount)<0.000000001",
+              row.bucket,
+              row.metric,
+              row.value,
+            );
+          }
+          this.sql.exec("INSERT INTO receipts VALUES (?)", delta.id);
         }
-        this.sql.exec("INSERT INTO receipts VALUES (?)", b.id);
       });
-    else if (path === "/observation")
+    } else if (path === "/observation")
       this.sql.exec(
         "INSERT OR REPLACE INTO observations VALUES (?,?)",
         b.at,

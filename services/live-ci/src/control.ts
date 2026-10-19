@@ -861,6 +861,17 @@ export class Control {
         })),
       ]) {
         const key = `active_checked/${repo}/${r.id}/${r.attempt}`;
+        if (clock - r.updated > 900)
+          // Upgrade an existing repair even while the 15-minute admission
+          // timer is running. Preserve its retry backoff and request count.
+          this.sql.exec(
+            `UPDATE repairs SET args=json_set(args,'$.urgent',json('true'))
+            WHERE repo=? AND kind='run' AND CAST(json_extract(args,'$.id') AS TEXT)=?
+            AND json_extract(args,'$.attempt')=?`,
+            repo,
+            String(r.id),
+            r.attempt,
+          );
         if (clock - r.updated > 900 && clock - (this.get(key) || 0) > 900) {
           this.enqueue(repo, "run", {
             id: r.id,
@@ -1211,11 +1222,16 @@ export class Control {
       for (const row of this.sql
         .exec(
           `SELECT * FROM repairs WHERE due<=?
-          ORDER BY COALESCE(json_extract(args,'$.archival'),0),
+          ORDER BY CASE
+            WHEN kind='run' AND json_extract(args,'$.urgent')=1 THEN 0
+            WHEN kind='inventory' AND COALESCE(json_extract(args,'$.archival'),0)=0
+              AND json_extract(args,'$.until')>=? THEN 0
+            WHEN COALESCE(json_extract(args,'$.archival'),0)=0 THEN 1 ELSE 2 END,
             CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
             COALESCE(json_extract(args,'$.urgent'),0) DESC,
             CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 12`,
           clock,
+          clock - 1800,
         )
         .toArray()) {
         if (Date.now() > deadline) break;
@@ -1437,14 +1453,23 @@ export class Control {
         existing = prior ? JSON.parse(prior.data) : null;
       if (existing) return json(existing);
       const clock = now(),
+        budget = Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500),
         used = this.sql
           .exec<{
             n: number;
           }>("SELECT COUNT(*) n FROM attempts WHERE at>?", clock - 3600)
+          .one().n,
+        reserved = this.sql
+          .exec<{ n: number }>(
+            "SELECT COUNT(*) n FROM attempts WHERE at>? AND status=-1",
+            clock - 3600,
+          )
           .one().n;
       if (
-        used + 6 >
-          Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500) ||
+        used + 6 > budget ||
+        // At 500/hour, admit at most 60 six-read summaries. Leave 140 reads
+        // for inventory, stale active runs, comparisons and token exchanges.
+        reserved + 6 > Math.floor((budget * 0.72) / 6) * 6 ||
         (this.get("github_pause") || 0) > clock
       )
         return json({ granted: false, retry_after: 300 });

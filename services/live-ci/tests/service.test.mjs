@@ -195,6 +195,47 @@ test("outbox retry cannot apply the same delta twice", async (t) => {
     );
   assert.equal((await r.summary()).daily["pr-total"], 1);
 });
+test("overlapping outbox batches retain individual receipts and reversible corrections", async (t) => {
+  const r = await runtime(t),
+    ns = await r.mf.getDurableObjectNamespace("DAYS"),
+    stub = ns.get(ns.idFromName(date));
+  const delta = (id, amount) => ({
+    id,
+    day: date,
+    rows: [{ bucket: 0, metric: "pr-total", value: 0, amount }],
+  });
+  const send = async (path, body) => {
+    const response = await stub.fetch("https://internal" + path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+  };
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("a", 1), delta("b", 2)],
+  });
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("b", 2), delta("c", 3)],
+  });
+  await send("/delta", delta("a", 1));
+  assert.equal((await r.summary()).daily["pr-total"], 6);
+  await send("/delta-batch", {
+    day: date,
+    deltas: [delta("correction", -2), delta("c", 3)],
+  });
+  assert.equal((await r.summary()).daily["pr-total"], 4);
+  const oversized = await stub.fetch("https://internal/delta-batch", {
+    method: "POST",
+    body: JSON.stringify({
+      day: date,
+      deltas: Array.from({ length: 41 }, (_, i) => delta(String(i), 1)),
+    }),
+  });
+  assert.equal(oversized.status, 400);
+  assert.equal((await r.summary()).daily["pr-total"], 4);
+});
 test("manifest and immutable charts support conditional public reads without GitHub", async (t) => {
   const r = await runtime(t);
   await r.ingest({ run: run(), jobs: [job()] });
@@ -438,7 +479,21 @@ test("queued cancellations with synthetic started_at do not accrue runner minute
   assert.equal(s.daily["duration/github"], undefined);
 });
 test("publisher read leases share the rolling budget and cannot be multiplied by retry", async (t) => {
-  const r = await runtime(t);
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    async (req) =>
+      new URL(req.url).pathname.endsWith("/access_tokens")
+        ? Response.json({ token: "test", expires_at: iso(clock + 3600) })
+        : Response.json({ total_count: 0, workflow_runs: [] }),
+  );
   const first = await r.post("/lease", {
     publisher: "1/1",
     run_id: "100",
@@ -451,7 +506,7 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
     health.requests.reduce((n, x) => n + x.count, 0),
     6,
   );
-  for (let i = 2; i <= 83; i++)
+  for (let i = 2; i <= 60; i++)
     assert.equal(
       (
         await r.post("/lease", {
@@ -463,10 +518,69 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
       true,
     );
   assert.equal(
-    (await r.post("/lease", { publisher: "84/1", run_id: "100", attempt: 1 }))
+    (await r.post("/lease", { publisher: "61/1", run_id: "100", attempt: 1 }))
       .granted,
     false,
   );
+  // Publisher saturation must leave room for the current inventory and its
+  // installation-token exchange, under the same global ceiling.
+  await r.post("/tick");
+  health = await r.post("/health");
+  assert.equal(health.repair_error, null);
+  assert.equal(
+    health.requests.reduce((n, x) => n + x.count, 0),
+    362,
+  );
+  assert.equal(r.github(), 2);
+});
+test("old inventory pages cannot starve reconciliation of a stale active run", async (t) => {
+  const key = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const reads = [];
+  const r = await runtime(
+    t,
+    {
+      GITHUB_APP_ID: "1",
+      GITHUB_INSTALLATION_ID: "2",
+      GITHUB_PRIVATE_KEY: String(key),
+    },
+    async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith("/access_tokens"))
+        return Response.json({ token: "test", expires_at: iso(clock + 3600) });
+      reads.push(url);
+      return Response.json(
+        url.pathname.endsWith("/attempts/1")
+          ? run()
+          : { total_count: 0, workflow_runs: [] },
+      );
+    },
+  );
+  await r.ingest({
+    run: { ...run(), status: "in_progress", conclusion: null },
+  });
+  for (let i = 1; i <= 15; i++)
+    await r.post("/repair", {
+      repo,
+      kind: "inventory",
+      args: { since: clock - 7200 - i, until: clock - 3600 - i },
+    });
+  await r.post("/repair", {
+    repo,
+    kind: "run",
+    args: { id: "100", attempt: 1, urgent: true },
+  });
+  await r.post("/tick");
+  const refresh = reads.findIndex((url) =>
+    url.pathname.endsWith("/attempts/1"),
+  );
+  const oldInventory = reads.findIndex((url) => {
+    const since = url.searchParams.get("created")?.split("..")[0];
+    return since && Date.parse(since) / 1000 < clock - 3600;
+  });
+  assert.ok(refresh >= 0);
+  assert.ok(oldInventory > refresh);
 });
 test("cold fact archive restores prior contributions before a historical correction", async (t) => {
   const r = await runtime(t),
