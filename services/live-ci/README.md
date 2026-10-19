@@ -25,8 +25,10 @@ wait distributions and Namespace picker ticks. Matching queue departures are
 applied before arrivals. A trailing-wait window includes jobs completed before
 the chart begins.
 
-Active intervals advance in bounded alarm batches. Only dirty UTC-day summaries
-are recalculated. Publishing reads at most 90 materialized daily summaries,
+Active intervals advance in bounded alarm batches. Only dirty time bins are
+recalculated. SQLite computes queue peaks and exact daily quantiles, returning
+compact results without loading a day's interval boundaries or timing samples
+into the Worker heap. Publishing reads at most 90 materialized daily summaries,
 rather than raw jobs or all historical records. Current activity publishes each
 minute; changed chart generations publish every ten minutes. The current UTC day
 is provisional. An unavailable or unfinished input remains explicit.

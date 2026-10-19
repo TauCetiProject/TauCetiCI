@@ -4,7 +4,6 @@ import {
   normalizeJob,
   normalizeRun,
   newer,
-  summarize,
   day,
   DAY,
   iso,
@@ -514,7 +513,11 @@ export class FactPartition {
             .exec<{
               id: string;
               data: string;
-            }>("SELECT id,data FROM jobs WHERE run=? AND attempt=? AND json_extract(data,'$.estimated')=1", j.run, j.attempt)
+            }>(
+              "SELECT id,data FROM jobs WHERE run=? AND attempt=? AND json_extract(data,'$.estimated')=1",
+              j.run,
+              j.attempt,
+            )
             .toArray();
           if (
             j.estimated &&
@@ -563,6 +566,8 @@ export class DayAggregate {
       CREATE TABLE IF NOT EXISTS observations (at INTEGER PRIMARY KEY,data TEXT);
       CREATE TABLE IF NOT EXISTS landings (pr INTEGER PRIMARY KEY,at INTEGER);
       CREATE TABLE IF NOT EXISTS staging (id TEXT PRIMARY KEY,attempt INTEGER,data TEXT);
+      CREATE TABLE IF NOT EXISTS buckets (bucket INTEGER PRIMARY KEY,data TEXT);
+      CREATE TABLE IF NOT EXISTS dirty_buckets (bucket INTEGER PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT);`);
   }
   meta(key: string): any {
@@ -579,10 +584,123 @@ export class DayAggregate {
     );
   }
   summary() {
+    // SQLite performs distribution scans; JavaScript receives only quantiles
+    // and compact bins. Large days never materialize all interval boundaries
+    // or timing samples in the Worker heap.
+    if (!this.meta("projection_initialized")) {
+      this.sql.exec(
+        "INSERT OR IGNORE INTO dirty_buckets SELECT DISTINCT bucket FROM metrics",
+      );
+      this.set("projection_initialized", true);
+    }
+    for (const { bucket } of this.sql
+      .exec<{
+        bucket: number;
+      }>("SELECT bucket FROM dirty_buckets ORDER BY bucket")
+      .toArray()) {
+      const data: any = bucket === 0 ? { daily: {} } : { fleet: [] };
+      const metrics = this.sql
+        .exec<{ metric: string }>(
+          "SELECT DISTINCT metric FROM metrics WHERE bucket=?",
+          bucket,
+        )
+        .toArray()
+        .map((r) => r.metric);
+      if (bucket === 0) {
+        for (const metric of metrics) {
+          if (metric.startsWith("duration/") || metric.startsWith("wait/")) {
+            const total =
+              this.sql
+                .exec<{
+                  n: number;
+                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=? AND amount>0", metric)
+                .one().n || 0;
+            const quantile = (q: number) =>
+              this.sql
+                .exec<{ value: number }>(
+                  `SELECT value FROM
+              (SELECT value,SUM(amount) OVER (ORDER BY value ROWS UNBOUNDED PRECEDING) position FROM metrics WHERE bucket=0 AND metric=? AND amount>0)
+              WHERE position>=? ORDER BY value LIMIT 1`,
+                  metric,
+                  Math.max(1, Math.ceil(total * q)),
+                )
+                .toArray()[0]?.value ?? null;
+            data.daily[metric] = { median: quantile(0.5), p90: quantile(0.9) };
+          } else
+            data.daily[metric] =
+              this.sql
+                .exec<{
+                  n: number;
+                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=0 AND metric=?", metric)
+                .one().n || 0;
+        }
+      } else {
+        const byStep = new Map<string, any>();
+        for (const metric of metrics) {
+          const [, step, type, key = ""] = metric.split("/");
+          const b = byStep.get(step) || {
+            at: bucket,
+            step: Number(step),
+            running: {},
+            queued: {},
+            wait: {},
+            picked: [],
+          };
+          byStep.set(step, b);
+          if (type === "running")
+            b.running[key] =
+              this.sql
+                .exec<{
+                  n: number;
+                }>("SELECT SUM(amount) n FROM metrics WHERE bucket=? AND metric=?", bucket, metric)
+                .one().n || 0;
+          if (type === "queued")
+            b.queued[key] = Math.max(
+              0,
+              this.sql
+                .exec<{
+                  n: number;
+                }>(`SELECT MAX(depth) n FROM (SELECT SUM(amount) OVER (ORDER BY value ROWS UNBOUNDED PRECEDING) depth FROM metrics WHERE bucket=? AND metric=?)`, bucket, metric)
+                .one().n || 0,
+            );
+          if (type === "wait")
+            b.wait[key] =
+              this.sql
+                .exec<{
+                  n: number;
+                }>("SELECT MAX(value) n FROM metrics WHERE bucket=? AND metric=? AND amount>0", bucket, metric)
+                .one().n || 0;
+          if (type === "picked")
+            b.picked = this.sql
+              .exec<{ value: number }>(
+                "SELECT value FROM metrics WHERE bucket=? AND metric=? AND amount>0 ORDER BY value",
+                bucket,
+                metric,
+              )
+              .toArray()
+              .map((r) => r.value);
+        }
+        data.fleet = [...byStep.values()];
+      }
+      this.sql.exec(
+        "INSERT OR REPLACE INTO buckets VALUES (?,?)",
+        bucket,
+        JSON.stringify(data),
+      );
+      this.sql.exec("DELETE FROM dirty_buckets WHERE bucket=?", bucket);
+    }
+    const dailyRow = this.sql
+      .exec<{ data: string }>("SELECT data FROM buckets WHERE bucket=0")
+      .toArray()[0];
+    const fleet = this.sql
+      .exec<{ data: string }>(
+        "SELECT data FROM buckets WHERE bucket>0 ORDER BY bucket",
+      )
+      .toArray()
+      .flatMap((r) => JSON.parse(r.data).fleet);
     return {
-      ...summarize(
-        this.sql.exec<Omit<Row, "day">>("SELECT * FROM metrics").toArray(),
-      ),
+      daily: dailyRow ? JSON.parse(dailyRow.data).daily : {},
+      fleet,
       observations: this.sql
         .exec<{ data: string }>("SELECT data FROM observations ORDER BY at")
         .toArray()
@@ -648,6 +766,8 @@ export class DayAggregate {
       "observations",
       "landings",
       "staging",
+      "buckets",
+      "dirty_buckets",
     ];
     for (let i = 0; i < 2 && state.table < tables.length; i++) {
       const table = tables[state.table],
@@ -711,6 +831,10 @@ export class DayAggregate {
         )
           return;
         for (const row of b.rows) {
+          this.sql.exec(
+            "INSERT OR IGNORE INTO dirty_buckets VALUES (?)",
+            row.bucket,
+          );
           this.sql.exec(
             "INSERT INTO metrics VALUES (?,?,?,?) ON CONFLICT(bucket,metric,value) DO UPDATE SET amount=amount+excluded.amount",
             row.bucket,

@@ -512,3 +512,39 @@ test("orphaned inbox writes recover and duplicate queue messages find the archiv
   assert.equal(await bucket.get(key), null);
   assert.ok(await bucket.get(key.replace("inbox/", "deliveries/")));
 });
+test("SQL projections match archived production metrics and timeline bins", async (t) => {
+  const r = await runtime(t),
+    f = JSON.parse(readFileSync("tests/reference.json", "utf8"));
+  for (const [i, event] of f.events.entries())
+    await r.ingest({ ...event, delivery: "fixture/" + i });
+  const ns = await r.mf.getDurableObjectNamespace("DAYS"),
+    response = await ns
+      .get(ns.idFromName(f.day))
+      .fetch("https://internal/summary", {
+        method: "POST",
+        body: JSON.stringify({ day: f.day }),
+      });
+  assert.equal(response.status, 200, await response.clone().text());
+  const data = await response.json();
+  for (const [key, value] of Object.entries(f.expected)) {
+    if (typeof value === "number")
+      assert.ok(Math.abs((data.daily[key] || 0) - value) < 1e-7, key);
+    else assert.deepEqual(data.daily[key], value, key);
+  }
+  const bins = new Map(
+    data.fleet.filter((b) => b.step === 600).map((b) => [b.at, b]),
+  );
+  for (let i = 0; i < 144; i++)
+    for (const [type, expected] of [
+      ["running", f.fleet.running],
+      ["queued", f.fleet.queued],
+      ["wait", f.fleet.wait_min],
+    ])
+      for (const [key, values] of Object.entries(expected))
+        assert.ok(
+          Math.abs(
+            (bins.get(f.fleet.since + i * 600)?.[type]?.[key] || 0) - values[i],
+          ) < 1e-7,
+          `${type}/${key}/${i}`,
+        );
+});
