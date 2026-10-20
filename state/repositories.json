@@ -7,10 +7,11 @@
   "TauCetiProgress",
   "TauCetiReview",
   "TauCetiRoadmap",
+  "TauCetiRoadmapWorker",
   "TauCetiTools",
   "TauCetiWorker",
   "bors-ng",
   "tauceti-claims"
  ],
- "observed_at": "20261020T143027446429Z"
+ "observed_at": "20261020T184525481425Z"
 }
