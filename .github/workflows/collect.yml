@@ -31,6 +31,15 @@ jobs:
         with:
           ref: main
 
+      - name: Checkout pinned shared collector
+        uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCetiTools
+          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          path: .tauceti-tools
+          persist-credentials: false
+      - name: Use the shared collector
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.tauceti-tools" >> "$GITHUB_ENV"
       - name: Check for the App
         id: app
         env:

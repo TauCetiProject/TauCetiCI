@@ -407,3 +407,16 @@ execution step. Provider startup, billing rounding and invoice allocation remain
 outside this estimate. The original 18-slot budget remains exhausted and retained. The user approved
 one additional 18-slot replacement on 2026-10-15; the total scheduled cap is 36.
 Further attempts require new explicit authorization.
+
+The collector implementation now lives in [TauCetiTools](https://github.com/TauCetiProject/TauCetiTools/tree/main/tauceti_tools/collector).
+The `collector` modules are entrypoints for the existing commands; this repository owns its records,
+analysis and publication. For local collection, install the version pinned in the workflows:
+
+```sh
+python3 -m pip install 'tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6'
+```
+
+Downstream repository names and optional Bors observations come from the canonical project
+configuration. Use `tauceti-tools config environment --conf PROJECT_CONFIG` for its environment
+bindings; CI callers load that configuration before collection. With no configuration these
+commands retain their existing Tau Ceti defaults.

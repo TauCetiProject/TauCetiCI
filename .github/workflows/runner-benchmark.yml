@@ -21,6 +21,15 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Checkout pinned shared collector
+        uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCetiTools
+          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          path: .tauceti-tools
+          persist-credentials: false
+      - name: Use the shared collector
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.tauceti-tools" >> "$GITHUB_ENV"
       - name: Claim the only allowed dispatch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,6 +57,15 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Checkout pinned shared collector
+        uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCetiTools
+          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          path: .tauceti-tools
+          persist-credentials: false
+      - name: Use the shared collector
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.tauceti-tools" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           repository: TauCetiProject/TauCeti
@@ -83,6 +101,15 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Checkout pinned shared collector
+        uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCetiTools
+          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          path: .tauceti-tools
+          persist-credentials: false
+      - name: Use the shared collector
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.tauceti-tools" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           pattern: benchmark-*
