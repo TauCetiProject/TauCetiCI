@@ -413,7 +413,7 @@ The `collector` modules are entrypoints for the existing commands; this reposito
 analysis and publication. For local collection, install the version pinned in the workflows:
 
 ```sh
-python3 -m pip install 'tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@c81692e993326a127d46115052080bf5c38e8b99'
+python3 -m pip install 'tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6'
 ```
 
 Downstream repository names and optional Bors observations come from the canonical project
