@@ -29,6 +29,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Checkout pinned shared collector
+        uses: actions/checkout@v4
+        with:
+          repository: TauCetiProject/TauCetiTools
+          ref: c81692e993326a127d46115052080bf5c38e8b99
+          path: .tauceti-tools
+          persist-credentials: false
+      - name: Use the shared collector
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE/.tauceti-tools" >> "$GITHUB_ENV"
       - name: Build the database
         run: |
           python3 -m collector.build_db --out db/ci.sqlite
