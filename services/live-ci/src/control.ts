@@ -1411,6 +1411,15 @@ export class Control {
       await this.tick();
       return json({ ok: true });
     }
+    if (path === "/refresh-day") {
+      // Finish an older publication before invalidating its derived snapshot.
+      await this.publish();
+      this.sql.exec("INSERT INTO dirty VALUES (?,1) ON CONFLICT(day) DO UPDATE SET revision=revision+1", b.day);
+      this.set("charts_at", 0);
+      await this.publish();
+      const row = this.sql.exec<{ data: string }>("SELECT data FROM summaries WHERE day=?", b.day).toArray()[0];
+      return json({ day: b.day, daily: row ? JSON.parse(row.data).daily : {} });
+    }
     if (path === "/publish") {
       await this.publish();
       return json({ ok: true });

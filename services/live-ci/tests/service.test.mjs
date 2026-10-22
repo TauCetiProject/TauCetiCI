@@ -236,6 +236,22 @@ test("older archive supplies missing host identity while preserving newer termin
   assert.equal(summary.daily["pr-total"], 1);
   assert.equal(r.github(), 0);
 });
+test("authenticated day refresh publishes the latest named host totals", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({ run: run(), jobs: [{ ...job(), labels: ["self-hosted", "fleet-host-chris-server"] }] });
+  const refresh = (body, token = "admin") => r.mf.dispatchFetch("https://example.com/admin/refresh-day", {
+    method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(body),
+  });
+  assert.equal((await refresh({ day: date }, "wrong")).status, 401);
+  assert.equal((await refresh({ day: "invalid" })).status, 400);
+  const response = await refresh({ day: date });
+  assert.equal(response.status, 200, await response.clone().text());
+  const result = await response.json();
+  assert.equal(result.day, date);
+  assert.equal(result.daily["minutes/eastanglia"], 3);
+  assert.equal(result.daily["picker/eastanglia"], 1);
+  assert.equal(r.github(), 0);
+});
 test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
   const r = await runtime(t);
   for (const [i, scanning, snapshot] of [
