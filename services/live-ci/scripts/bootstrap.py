@@ -96,6 +96,10 @@ def events(db, since, interleave_days=4, sampling_cutover=None):
                     "SELECT * FROM steps WHERE job_id=? ORDER BY n", (int(j["id"]),)
                 )
             ]
+            # GitHub gives never-assigned cancellations synthetic start times.
+            # A runner name or a started step establishes actual assignment.
+            if j.get("conclusion") == "cancelled":
+                j["assigned"] = bool(j.get("runner_name") or any(s.get("started_at") for s in j["steps"]))
             total, fetched = weights.get((r["workflow"], r["created_at"][:13]), (1, 1))
             j["weight"] = total / fetched if fetched else 1
             grouped.setdefault(j["run_attempt"] or 1, []).append(j)
