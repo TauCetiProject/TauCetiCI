@@ -60,6 +60,22 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(by_id["2"]["jobs"], [])
             self.assertEqual(by_id["4"]["run"]["archive_sampling"]["weight"], 2)
 
+    def test_cancelled_imports_require_runner_assignment_evidence(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.executescript(SCHEMA)
+            for identity, runner_name in [(1, None), (2, "fleet-11e2756fc110-0123456789abcdef")]:
+                db.execute("""INSERT INTO runs(repo,run_id,run_attempt,workflow,conclusion,created_at,updated_at,jobs_fetched)
+                    VALUES ('TauCeti',?,1,'.github/workflows/pr-build.yml','cancelled',
+                            '2026-10-18T12:00:00Z','2026-10-18T12:02:12Z',1)""", (identity,))
+                db.execute("""INSERT INTO jobs(repo,run_id,job_id,run_attempt,name,conclusion,
+                    created_at,started_at,completed_at,run_s,runner_kind,labels,runner_name)
+                    VALUES ('TauCeti',?,?,1,'sandboxed-build','cancelled','2026-10-18T12:00:00Z',
+                            '2026-10-18T12:00:00Z','2026-10-18T12:02:12Z',132,'self-hosted','[]',?)""",
+                           (identity, identity, runner_name))
+            by_id = {e["run"]["id"]: e for e in bootstrap.events(db, "2026-10-18")}
+            self.assertFalse(by_id["1"]["jobs"][0]["assigned"])
+            self.assertTrue(by_id["2"]["jobs"][0]["assigned"])
+
     def test_day_interleaving_preserves_every_historical_event(self):
         with contextlib.closing(sqlite3.connect(":memory:")) as db:
             db.executescript(SCHEMA)
