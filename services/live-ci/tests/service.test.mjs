@@ -193,6 +193,21 @@ test("stored self-hosted job recomputation is bounded, authenticated and idempot
   assert.equal(summary.daily["minutes/self-hosted"], 135);
   assert.equal(r.github(), 0);
 });
+test("later host identity replaces old self-hosted totals without double counting", async (t) => {
+  const r = await runtime(t);
+  const raw = { ...job(), labels: ["self-hosted"] };
+  await r.ingest({ run: run(), jobs: [raw] });
+  assert.equal((await r.summary()).daily["picker/self-hosted"], 1);
+  const named = { ...raw, labels: ["self-hosted", "fleet-11e2756fc11042d798f759410573a935"] };
+  await r.ingest({ jobs: [named], run_id: "100", attempt: 1 });
+  await r.ingest({ jobs: [named], run_id: "100", attempt: 1 });
+  const summary = await r.summary();
+  assert.equal(summary.daily["picker/self-hosted"] || 0, 0);
+  assert.equal(summary.daily["picker/leanfro"], 1);
+  assert.equal(summary.daily["minutes/leanfro"], 3);
+  assert.equal(summary.daily["pr-total"], 1);
+  assert.equal(r.github(), 0);
+});
 test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
   const r = await runtime(t);
   for (const [i, scanning, snapshot] of [

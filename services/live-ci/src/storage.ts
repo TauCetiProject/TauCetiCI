@@ -2,6 +2,7 @@ import {
   contributions,
   difference,
   normalizeJob,
+  reportingKind,
   normalizeRun,
   newer,
   day,
@@ -257,7 +258,11 @@ export class FactPartition {
         .toArray();
       for (const row of rows) {
         const run = this.run(row.run, row.attempt);
-        if (run) this.replaceJob(run, JSON.parse(row.data), now());
+        if (run) {
+          const job = JSON.parse(row.data);
+          job.kind = reportingKind(job.kind, job.labels, job.runnerName);
+          this.replaceJob(run, job, now());
+        }
       }
       full = rows.length === 1000;
       this.set("alarm_cursor", full ? rows.at(-1)!.id : "");
@@ -460,13 +465,17 @@ export class FactPartition {
     if (path === "/recompute") {
       if (!this.meta("partition")) return json({ processed: 0, cursor: null });
       const rows = this.sql.exec<{ id: string; run: string; attempt: number; data: string }>(
-        "SELECT id,run,attempt,data FROM jobs WHERE id>? AND json_extract(data,'$.kind')='self-hosted' ORDER BY id LIMIT 40",
+        "SELECT id,run,attempt,data FROM jobs WHERE id>? AND json_extract(data,'$.kind') IN ('self-hosted','eastanglia','leanfro') ORDER BY id LIMIT 40",
         b.cursor || "",
       ).toArray();
       this.ctx.storage.transactionSync(() => {
         for (const row of rows) {
           const run = this.run(row.run, row.attempt);
-          if (run) this.replaceJob(run, JSON.parse(row.data), now());
+          if (run) {
+            const job = JSON.parse(row.data);
+            job.kind = reportingKind(job.kind, job.labels, job.runnerName);
+            this.replaceJob(run, job, now());
+          }
         }
       });
       await this.flush(true);

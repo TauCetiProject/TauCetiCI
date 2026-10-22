@@ -1,4 +1,4 @@
-import { DAY, day, iso } from "./model";
+import { DAY, day, iso, RUNNERS, runnerLabel } from "./model";
 const colors = [
   "#5eead4",
   "#ff9d4d",
@@ -149,7 +149,7 @@ export function renderCharts(
     opts: any = {},
   ) =>
     render(file, () =>
-      frame(title, note, legend(series) + panel(series, labels, opts)),
+      frame(title, note, legend(series.filter((s) => !s.dashed)) + panel(series, labels, opts)),
     );
   for (const [metric, file, title] of [
     ["duration", "ci-build-duration.svg", "How long a successful build takes"],
@@ -159,14 +159,16 @@ export function renderCharts(
     for (const [i, kind] of [
       "github",
       "namespace",
+      "eastanglia",
+      "leanfro",
       "self-hosted",
       "merge",
       ...(metric === "wait" ? ["other"] : []),
     ].entries())
       for (const q of ["median", "p90"])
         series.push({
-          name: `${kind}, ${q}`,
-          color: colors[i],
+          name: `${runnerLabel(kind)}, ${q}`,
+          color: colors[i % colors.length],
           dashed: q === "p90",
           values: days.map(
             (d) => d.data.daily[`${metric}/${kind}`]?.[q] ?? null,
@@ -233,8 +235,8 @@ export function renderCharts(
   plot(
     "ci-runner-minutes.svg",
     "Build minutes per day",
-    ["namespace", "github", "self-hosted", "cancelled"].map((k) => ({
-      name: k,
+    ["namespace", "github", "eastanglia", "leanfro", "self-hosted", "cancelled"].map((k) => ({
+      name: runnerLabel(k),
       values: daily("minutes/" + k),
     })),
   );
@@ -245,10 +247,9 @@ export function renderCharts(
       {
         name: "GitHub share",
         values: days.map((d) => {
-          const gh = d.data.daily["picker/github"] || 0,
-            ns = d.data.daily["picker/namespace"] || 0,
-            self = d.data.daily["picker/self-hosted"] || 0;
-          return gh + ns + self ? gh / (gh + ns + self) : null;
+          const gh = d.data.daily["picker/github"] || 0;
+          const total = RUNNERS.reduce((n, kind) => n + (d.data.daily[`picker/${kind}`] || 0), 0);
+          return total ? gh / total : null;
         }),
       },
     ],
@@ -297,7 +298,9 @@ export function renderCharts(
       "PR jobs on Namespace",
       "Merge validation on Namespace",
       "Other Namespace jobs",
-      "Self-hosted jobs",
+      "Jobs on eastanglia",
+      "Jobs on leanfro",
+      "Other self-hosted jobs",
     ];
     const running = [
       "gh-build-pr",
@@ -306,15 +309,17 @@ export function renderCharts(
       "ns-pr",
       "ns-mq",
       "ns-other",
+      "eastanglia",
+      "leanfro",
       "self-hosted",
     ].map((k, i) => ({
       name: names[i],
-      color: i === 6 ? "#e879f9" : colors[i],
+      color: ["#e879f9", "#facc15", "#94a3b8"][i - 6] || colors[i],
       values: data.map((b) => (b.running ? b.running[k] || 0 : null)),
     }));
-    const queued = ["github", "namespace", "self-hosted"].map((k, i) => ({
-      name: k,
-      color: i === 2 ? "#e879f9" : colors[i],
+    const queued = RUNNERS.map((k, i) => ({
+      name: runnerLabel(k),
+      color: [colors[0], colors[1], "#e879f9", "#facc15", "#94a3b8"][i],
       values: data.map((b) => (b.queued ? b.queued[k] || 0 : null)),
     }));
     const waits = ["build", "other"].map((k, i) => ({
@@ -332,7 +337,7 @@ export function renderCharts(
           ),
         ),
       ) * 1.1;
-    const capY = 280 - (140 * 20) / runningMax;
+    const capY = 280 - (125 * 20) / runningMax;
     const marks = annotations
       .filter((a) => a.at >= start && a.at < end)
       .map(
@@ -352,18 +357,18 @@ export function renderCharts(
         `CI fleet, last ${name}`,
         `Average jobs running; peak jobs queued; longest trailing wait (minutes). ${iso(clock)}. Current bin is partial.`,
         legend(running) +
-          '<text x="64" y="127">Running</text>' +
+          '<text x="64" y="140">Running</text>' +
           panel(running, labels, {
-            top: 140,
+            top: 155,
             bottom: 280,
             stack: true,
             max: runningMax,
           }) +
           `<path stroke="#facc15" stroke-dasharray="5 4" d="M64 ${capY}H928"/><text x="923" y="${capY - 4}" text-anchor="end">20 GitHub-hosted jobs</text>` +
           picks +
-          '<text x="64" y="330">Queued</text>' +
-          legend(queued, 324, 150) +
-          panel(queued, labels, { top: 345, bottom: 470 }) +
+          '<text x="64" y="317">Queued</text>' +
+          legend(queued, 311, 170) +
+          panel(queued, labels, { top: 355, bottom: 470 }) +
           '<text x="64" y="520">Longest wait (minutes)</text>' +
           legend(waits, 514, 260) +
           panel(waits, labels, { top: 535, bottom: 660 }) +
