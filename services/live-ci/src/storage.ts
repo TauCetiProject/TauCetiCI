@@ -126,6 +126,15 @@ export class FactPartition {
       if (!next.runnerName) next.runnerName = old.runnerName;
       if (!next.labels?.length) next.labels = old.labels;
       next.kind = reportingKind(next.kind, next.labels, next.runnerName);
+      // Job identity is immutable even when its archived execution snapshot is
+      // older. Learn a missing host without rolling back status or timings.
+      const archivedKind = reportingKind("self-hosted", j.labels, j.runnerName);
+      if (["unknown", "self-hosted"].includes(next.kind) &&
+          ["eastanglia", "leanfro"].includes(archivedKind)) {
+        next.kind = archivedKind;
+        next.labels = j.labels;
+        next.runnerName = j.runnerName || next.runnerName;
+      }
     }
     const after = contributions(run, next, clock),
       delta = difference(before ? JSON.parse(before.contribution) : [], after);
