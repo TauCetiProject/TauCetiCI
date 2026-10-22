@@ -91,9 +91,9 @@ export const runnerLabel = (kind: string) => ({
 export function reportingKind(kind: string, labels: string[] = [], name = ""): string {
   if (kind !== "self-hosted") return kind;
   const names = new Set(labels.flatMap((label) => {
-    const found = fleetNames[label.slice(6)] && label.startsWith("fleet-")
+    const found = Object.hasOwn(fleetNames, label.slice(6)) && label.startsWith("fleet-")
       ? fleetNames[label.slice(6)]
-      : label.startsWith("fleet-host-") ? hostNames[label.slice(11)] : undefined;
+      : label.startsWith("fleet-host-") && Object.hasOwn(hostNames, label.slice(11)) ? hostNames[label.slice(11)] : undefined;
     return found ? [found] : [];
   }));
   // Older webhook jobs may only identify the host in its runner name.
@@ -102,7 +102,7 @@ export function reportingKind(kind: string, labels: string[] = [], name = ""): s
   return names.size === 1 ? [...names][0] : kind;
 }
 export const runner = (labels: string[]) =>
-  labels.some((x) => /^(nscloud-|namespace-profile-)/.test(x))
+  labels.some((x) => x.startsWith("nscloud-"))
     ? "namespace"
     : labels.includes("self-hosted")
       ? "self-hosted"

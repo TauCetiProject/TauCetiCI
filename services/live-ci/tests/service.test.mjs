@@ -182,6 +182,8 @@ test("stored self-hosted job recomputation is bounded, authenticated and idempot
   assert.equal((await request({ repo: "other/repo", day: date })).status, 400);
   const first = await (await request({ repo, day: date })).json();
   assert.equal(first.processed, 40);
+  assert.equal(first.changed, 0);
+  assert.equal(first.unidentified, 40);
   assert.ok(first.cursor);
   const second = await (await request({ repo, day: date, cursor: first.cursor })).json();
   assert.equal(second.processed, 5);
@@ -207,6 +209,17 @@ test("later host identity replaces old self-hosted totals without double countin
   assert.equal(summary.daily["minutes/leanfro"], 3);
   assert.equal(summary.daily["pr-total"], 1);
   assert.equal(r.github(), 0);
+});
+test("old-format replay retains a host identified by runner name", async (t) => {
+  const r = await runtime(t);
+  const raw = { ...job(), labels: ["self-hosted"], runner_name: "fleet-11e2756fc110-0123456789abcdef" };
+  await r.ingest({ run: run(), jobs: [raw] });
+  assert.equal((await r.summary()).daily["picker/leanfro"], 1);
+  const old = { ...raw, runner_name: "" };
+  await r.ingest({ jobs: [old], run_id: "100", attempt: 1 });
+  const summary = await r.summary();
+  assert.equal(summary.daily["picker/leanfro"], 1);
+  assert.equal(summary.daily["picker/self-hosted"] || 0, 0);
 });
 test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
   const r = await runtime(t);

@@ -9,6 +9,9 @@ const colors = [
   "#facc15",
   "#94a3b8",
 ];
+const hostColors: Record<string, string> = {
+  eastanglia: "#fde047", leanfro: "#22d3ee", "self-hosted": "#f472b6",
+};
 const escape = (s: any) =>
   String(s).replace(
     /[&<>"']/g,
@@ -168,7 +171,7 @@ export function renderCharts(
       for (const q of ["median", "p90"])
         series.push({
           name: `${runnerLabel(kind)}, ${q}`,
-          color: colors[i % colors.length],
+          color: hostColors[kind] || colors[i % colors.length],
           dashed: q === "p90",
           values: days.map(
             (d) => d.data.daily[`${metric}/${kind}`]?.[q] ?? null,
@@ -237,6 +240,7 @@ export function renderCharts(
     "Build minutes per day",
     ["namespace", "github", "eastanglia", "leanfro", "self-hosted", "cancelled"].map((k) => ({
       name: runnerLabel(k),
+      color: hostColors[k],
       values: daily("minutes/" + k),
     })),
   );
@@ -314,12 +318,12 @@ export function renderCharts(
       "self-hosted",
     ].map((k, i) => ({
       name: names[i],
-      color: ["#e879f9", "#facc15", "#94a3b8"][i - 6] || colors[i],
+      color: hostColors[k] || colors[i],
       values: data.map((b) => (b.running ? b.running[k] || 0 : null)),
     }));
     const queued = RUNNERS.map((k, i) => ({
       name: runnerLabel(k),
-      color: [colors[0], colors[1], "#e879f9", "#facc15", "#94a3b8"][i],
+      color: hostColors[k] || colors[i],
       values: data.map((b) => (b.queued ? b.queued[k] || 0 : null)),
     }));
     const waits = ["build", "other"].map((k, i) => ({

@@ -123,6 +123,9 @@ export class FactPartition {
       next.failure = next.failure || old.failure;
       if (!next.steps.length) next.steps = old.steps;
       if (next.kind === "unknown") next.kind = old.kind;
+      if (!next.runnerName) next.runnerName = old.runnerName;
+      if (!next.labels?.length) next.labels = old.labels;
+      next.kind = reportingKind(next.kind, next.labels, next.runnerName);
     }
     const after = contributions(run, next, clock),
       delta = difference(before ? JSON.parse(before.contribution) : [], after);
@@ -463,23 +466,27 @@ export class FactPartition {
       return json({ ok: true });
     }
     if (path === "/recompute") {
-      if (!this.meta("partition")) return json({ processed: 0, cursor: null });
+      if (!this.meta("partition")) return json({ processed: 0, changed: 0, unidentified: 0, cursor: null });
       const rows = this.sql.exec<{ id: string; run: string; attempt: number; data: string }>(
         "SELECT id,run,attempt,data FROM jobs WHERE id>? AND json_extract(data,'$.kind') IN ('self-hosted','eastanglia','leanfro') ORDER BY id LIMIT 40",
         b.cursor || "",
       ).toArray();
+      let changed = 0, unidentified = 0;
       this.ctx.storage.transactionSync(() => {
         for (const row of rows) {
           const run = this.run(row.run, row.attempt);
           if (run) {
             const job = JSON.parse(row.data);
-            job.kind = reportingKind(job.kind, job.labels, job.runnerName);
+            const kind = reportingKind(job.kind, job.labels, job.runnerName);
+            if (kind !== job.kind) changed++;
+            if (kind === "self-hosted") unidentified++;
+            job.kind = kind;
             this.replaceJob(run, job, now());
           }
         }
       });
       await this.flush(true);
-      return json({ processed: rows.length, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
+      return json({ processed: rows.length, changed, unidentified, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
     }
     if (path === "/event") {
       const runID = String(

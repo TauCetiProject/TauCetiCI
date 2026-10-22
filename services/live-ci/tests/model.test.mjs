@@ -96,7 +96,8 @@ test("fleet reporting aliases retain identity and contribute separate totals", (
     assert.equal(summary.fleet[0].running[alias], 0.4);
   }
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-11e2756fc110-0123456789abcdef" }).kind, "leanfro");
-  assert.equal(m.runner(["namespace-profile-linux-amd64-16x32"]), "namespace");
+  for (const label of ["fleet-constructor", "fleet-host-__proto__", "fleet-host-toString"])
+    assert.equal(m.reportingKind("self-hosted", [label]), "self-hosted");
 });
 test("archive sampling stops at cutover without double-counting overlapping live jobs", () => {
   const cutoff = t + 600;
