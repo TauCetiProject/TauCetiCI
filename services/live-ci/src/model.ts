@@ -39,6 +39,8 @@ export type Job = {
   started: number | null;
   completed: number | null;
   kind: string;
+  labels?: string[];
+  runnerName?: string;
   assigned: boolean;
   steps: {
     name: string;
@@ -72,14 +74,41 @@ export const iso = (v: number) =>
 export const day = (v: number) => iso(v).slice(0, 10);
 export const rank = (status: string) =>
   status === "completed" ? 3 : status === "in_progress" ? 2 : 1;
+// Public report aliases only; fleet credentials, admission and dispatch keep
+// their permanent identities and operator names. Unknown hosts stay separate.
+const fleetNames: Record<string, string> = {
+  "4fab2fed9a5145f894d066c7bb28ace4": "eastanglia",
+  "11e2756fc11042d798f759410573a935": "leanfro",
+};
+const hostNames: Record<string, string> = {
+  "chris-server": "eastanglia", chris: "eastanglia", tauchonki: "leanfro",
+};
+export const RUNNERS = ["github", "namespace", "eastanglia", "leanfro", "self-hosted"];
+export const runnerLabel = (kind: string) => ({
+  github: "GitHub", namespace: "Namespace", "self-hosted": "Other self-hosted",
+  merge: "Merge validation", other: "Other GitHub jobs", cancelled: "Cancelled PR builds",
+}[kind] || kind);
+export function reportingKind(kind: string, labels: string[] = [], name = ""): string {
+  if (kind !== "self-hosted") return kind;
+  const names = new Set(labels.flatMap((label) => {
+    const found = Object.hasOwn(fleetNames, label.slice(6)) && label.startsWith("fleet-")
+      ? fleetNames[label.slice(6)]
+      : label.startsWith("fleet-host-") && Object.hasOwn(hostNames, label.slice(11)) ? hostNames[label.slice(11)] : undefined;
+    return found ? [found] : [];
+  }));
+  // Older webhook jobs may only identify the host in its runner name.
+  for (const [id, alias] of Object.entries(fleetNames))
+    if (new RegExp(`^fleet-${id.slice(0, 12)}-[a-f0-9]{16}$`).test(name)) names.add(alias);
+  return names.size === 1 ? [...names][0] : kind;
+}
 export const runner = (labels: string[]) =>
   labels.some((x) => x.startsWith("nscloud-"))
     ? "namespace"
-    : labels.some((x) => /^(ubuntu-|windows-|macos-)/.test(x))
-      ? "github"
-      : labels.length
-        ? "self-hosted"
-        : "unknown";
+    : labels.includes("self-hosted")
+      ? "self-hosted"
+      : labels.some((x) => /^(ubuntu-|windows-|macos-)/.test(x))
+        ? "github"
+        : labels.length ? "self-hosted" : "unknown";
 export function normalizeRun(repo: string, r: any): Run {
   const event = r.event || "",
     workflow = r.path || r.workflow || "";
@@ -151,7 +180,9 @@ export function normalizeJob(j: any): Job {
     created: time(j.created_at),
     started: time(j.started_at) || null,
     completed: time(j.completed_at) || null,
-    kind: j.runner_kind || runner(labels),
+    kind: reportingKind(j.runner_kind || runner(labels), labels, j.runner_name),
+    labels,
+    runnerName: j.runner_name || "",
     assigned,
     steps,
     failure:
@@ -223,8 +254,8 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     j.name,
   );
   const series =
-    j.kind === "self-hosted"
-      ? "self-hosted"
+    ["eastanglia", "leanfro", "self-hosted"].includes(j.kind)
+      ? j.kind
       : j.kind === "github"
       ? isBuild
         ? ["pr", "workflow_dispatch"].includes(run.trigger)
@@ -276,7 +307,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
       }
     }
   };
-  if (["github", "namespace", "self-hosted"].includes(j.kind))
+  if (RUNNERS.includes(j.kind))
     for (const step of [600, 7200]) {
       if (started) interval(Math.max(created, started), end, "running", step);
       if (!j.estimated)
@@ -320,7 +351,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     run.workflow === WORKFLOW &&
     j.name === BUILD &&
     ["pr", "merge_queue", "bors_staging"].includes(run.trigger);
-  if (prBuild && ["github", "namespace", "self-hosted"].includes(j.kind)) {
+  if (prBuild && RUNNERS.includes(j.kind)) {
     if (run.trigger === "pr") {
       if (j.conclusion === "success" && seconds !== null)
         daily(`duration/${j.kind}`, seconds / 60);

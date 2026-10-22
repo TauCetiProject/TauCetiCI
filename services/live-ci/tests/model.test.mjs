@@ -74,6 +74,31 @@ test("dedicated runner jobs contribute to fleet, merge outcomes and PR statistic
   assert.equal(bin.queued["self-hosted"], 2);
   assert.equal(bin.wait.build, 1);
 });
+test("fleet reporting aliases retain identity and contribute separate totals", () => {
+  const cases = [
+    ["eastanglia", ["self-hosted", "fleet-4fab2fed9a5145f894d066c7bb28ace4"]],
+    ["leanfro", ["self-hosted", "fleet-11e2756fc11042d798f759410573a935"]],
+    ["eastanglia", ["self-hosted", "fleet-host-chris-server"]],
+    ["leanfro", ["self-hosted", "fleet-host-tauchonki"]],
+    ["self-hosted", ["self-hosted", "fleet-unknown"]],
+    ["self-hosted", ["self-hosted", "fleet-host-chris-server", "fleet-host-tauchonki"]],
+  ];
+  for (const [alias, labels] of cases) {
+    const normalized = m.normalizeJob({ id: "42", run_id: "1", runner_kind: "self-hosted", labels });
+    assert.equal(normalized.kind, alias);
+    assert.deepEqual(normalized.labels, labels);
+    const summary = m.summarize(m.contributions(run, { ...job, ...normalized,
+      created: job.created, started: job.started, completed: job.completed,
+      name: job.name, assigned: true, conclusion: "success",
+    }, t + 600));
+    assert.equal(summary.daily[`picker/${alias}`], 1);
+    assert.equal(summary.daily[`minutes/${alias}`], 4);
+    assert.equal(summary.fleet[0].running[alias], 0.4);
+  }
+  assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-11e2756fc110-0123456789abcdef" }).kind, "leanfro");
+  for (const label of ["fleet-constructor", "fleet-host-__proto__", "fleet-host-toString"])
+    assert.equal(m.reportingKind("self-hosted", [label]), "self-hosted");
+});
 test("archive sampling stops at cutover without double-counting overlapping live jobs", () => {
   const cutoff = t + 600;
   const sampled = { ...run, archiveSampling: { until: cutoff, weight: 3 } };
@@ -422,7 +447,7 @@ test("charts include dedicated work and retain pending staging observations", as
   const code = buildSync({ entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false }).outputFiles[0].text;
   const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
   const assets = renderCharts([{ day: m.day(t), data: {
-    daily: { "minutes/self-hosted": 60, "picker/github": 1, "picker/self-hosted": 1 },
+    daily: { "minutes/self-hosted": 60, "picker/github": 1, "picker/self-hosted": 1, "picker/eastanglia": 1, "picker/leanfro": 1 },
     fleet: [{ at: t - 600, step: 600, running: { "self-hosted": 1 }, queued: { "self-hosted": 2 }, wait: {} }],
     staging: [
       { created: t - 300, conclusion: "success", members: [7, 8], url: "known" },
@@ -430,9 +455,14 @@ test("charts include dedicated work and retain pending staging observations", as
     ],
   } }], t);
   assert.match(assets["ci-runner-minutes.svg"], /self-hosted/);
-  assert.match(assets["ci-fleet-72h.svg"], /Self-hosted jobs/);
-  assert.match(assets["ci-build-duration.svg"], /self-hosted, median/);
-  assert.match(assets["ci-picker.svg"], /cy="260"/); // Half the PR builds use GitHub.
+  assert.match(assets["ci-fleet-72h.svg"], /Other self-hosted jobs/);
+  for (const file of ["ci-runner-minutes.svg", "ci-fleet-72h.svg", "ci-build-duration.svg", "ci-build-wait.svg"]) {
+    assert.match(assets[file], /eastanglia/);
+    assert.match(assets[file], /leanfro/);
+    assert.doesNotMatch(assets[file], /tauchonki|Chris/);
+  }
+  assert.match(assets["ci-build-duration.svg"], /Other self-hosted, median/);
+  assert.match(assets["ci-picker.svg"], /cy="320"/); // One quarter of PR builds use GitHub, counting both named hosts.
   assert.match(assets["ci-bors-staging.svg"], /data-ci-membership-pending="true"/);
   assert.match(assets["ci-bors-staging.svg"], /1 completed runs awaiting batch size/);
   assert.doesNotMatch(assets["ci-bors-staging.svg"], /NaN/);

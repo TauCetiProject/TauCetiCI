@@ -122,9 +122,22 @@ back to the normal delivery archive; duplicate messages remain idempotent.
 `POST /admin/repair-members` processes up to eight due bors membership repairs.
 `POST /admin/recompute` with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-17"}`
 recalculates at most forty stored self-hosted jobs using reversible metric deltas.
+`changed` counts reclassified jobs and `unidentified` counts jobs still lacking host evidence.
 Pass its returned `cursor` until null; retries cannot duplicate totals. These
 authenticated maintenance operations do not read GitHub. After a historical
 repair, a bootstrap completion checkpoint requests a fresh chart generation.
+
+Fleet hosts are reported as `eastanglia` (Chris) and `leanfro` (tauchonki).
+Aliases come from permanent machine labels, broker host labels, or the runner
+name; they do not change dispatch names or policy. Unidentified self-hosted jobs
+remain in `self-hosted`. Older stored jobs without retained identity evidence
+need a replay of archived job records to split their historical totals.
+Rebuild `ci.sqlite` with the updated Tools version to retain archived runner names,
+then rerun `scripts/bootstrap.py` with the original `--since` and
+`--sampling-cutover` values. The added runner names change the content hashes of
+those imports, so new deliveries replace their previous contributions. Existing
+receipts for unchanged records remain valid. The raw database `runner_kind`
+category stays `self-hosted`; only reporting derives the public alias.
 
 ## Setup and bootstrap
 
