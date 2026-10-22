@@ -1,0 +1,107 @@
+{
+  "already_recorded": 0,
+  "api_calls": 132,
+  "api_limit": 150,
+  "attempted": 20,
+  "deferred": "run limit reached",
+  "error": null,
+  "explicit_run_ids": [],
+  "gaps": [
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39696764179
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39696713571
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39696368966
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39695894259
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39695750541
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39695748967
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39694594970
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39693779758
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39693674416
+    }
+  ],
+  "list_limit_per_workflow": 100,
+  "listings": [
+    {
+      "returned": 100,
+      "total_count": 245,
+      "truncated": true,
+      "workflow": "pr-build.yml"
+    },
+    {
+      "returned": 13,
+      "total_count": 13,
+      "truncated": false,
+      "workflow": "ci.yml"
+    }
+  ],
+  "max_runs": 20,
+  "mode": "bounded-recent-resources",
+  "recorded": 11,
+  "request_attempts": 132,
+  "request_start_budget_seconds": 300,
+  "since": "2026-10-21T18:14:49Z",
+  "until": "2026-10-22T00:14:49Z",
+  "unverified_producers": 0,
+  "without_artifacts": 9
+}
