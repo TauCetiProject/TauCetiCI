@@ -221,6 +221,21 @@ test("old-format replay retains a host identified by runner name", async (t) => 
   assert.equal(summary.daily["picker/leanfro"], 1);
   assert.equal(summary.daily["picker/self-hosted"] || 0, 0);
 });
+test("older archive supplies missing host identity while preserving newer terminal facts", async (t) => {
+  const r = await runtime(t);
+  const current = { ...job(), labels: ["self-hosted"] };
+  await r.ingest({ run: run(), jobs: [current] });
+  await r.ingest({ jobs: [{ ...current, status: "in_progress", conclusion: null,
+    completed_at: null, labels: ["self-hosted", "fleet-4fab2fed9a5145f894d066c7bb28ace4"],
+  }], run_id: "100", attempt: 1, historical: true });
+  const summary = await r.summary();
+  assert.equal(summary.daily["picker/eastanglia"], 1);
+  assert.equal(summary.daily["picker/self-hosted"] || 0, 0);
+  assert.equal(summary.daily["minutes/eastanglia"], 3);
+  assert.equal(summary.daily["duration/eastanglia"].median, 3);
+  assert.equal(summary.daily["pr-total"], 1);
+  assert.equal(r.github(), 0);
+});
 test("merge observations retain completed snapshots during scans and omit startup partials", async (t) => {
   const r = await runtime(t);
   for (const [i, scanning, snapshot] of [
