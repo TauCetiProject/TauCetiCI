@@ -139,6 +139,11 @@ those imports, so new deliveries replace their previous contributions. Existing
 receipts for unchanged records remain valid. The raw database `runner_kind`
 category stays `self-hosted`; only reporting derives the public alias.
 
+After correcting historical jobs, `POST /admin/refresh-day` with
+`{"day":"2026-10-22"}` materializes that day's latest aggregate and refreshes
+published charts immediately. It returns the day's daily metrics for verification,
+requires the admin bearer token and makes no GitHub requests.
+
 ## Setup and bootstrap
 
 ```sh

@@ -431,6 +431,12 @@ async function handle(
       return json(await call(env.CONTROL, "control", "/prune-repairs", b));
     if (path === "/admin/repair-members" && request.method === "POST")
       return json(await call(env.CONTROL, "control", "/repair-members"));
+    if (path === "/admin/refresh-day" && request.method === "POST") {
+      if (typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||
+          !Number.isFinite(Date.parse(b.day)))
+        return json({ error: "Invalid report day" }, 400);
+      return json(await call(env.CONTROL, "control", "/refresh-day", { day: b.day }));
+    }
     if (path === "/admin/recompute" && request.method === "POST") {
       if (!allowed(env).includes(b.repo) ||
           typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||
