@@ -1,0 +1,83 @@
+{
+  "already_recorded": 0,
+  "api_calls": 150,
+  "api_limit": 150,
+  "attempted": 20,
+  "deferred": "resource refresh API/time budget reached",
+  "error": null,
+  "explicit_run_ids": [],
+  "gaps": [
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39955370170
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39954865352
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39949149848
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39945296575
+    },
+    {
+      "coverage": {
+        "publication": "missing",
+        "resources": "missing"
+      },
+      "run_attempt": 1,
+      "run_id": 39944854697
+    },
+    {
+      "coverage": {
+        "publication": "unavailable",
+        "resources": "unavailable"
+      },
+      "run_attempt": 1,
+      "run_id": 39940701961
+    }
+  ],
+  "list_limit_per_workflow": 100,
+  "listings": [
+    {
+      "returned": 100,
+      "total_count": 279,
+      "truncated": true,
+      "workflow": "pr-build.yml"
+    },
+    {
+      "returned": 8,
+      "total_count": 8,
+      "truncated": false,
+      "workflow": "ci.yml"
+    }
+  ],
+  "max_runs": 20,
+  "mode": "bounded-recent-resources",
+  "recorded": 14,
+  "request_attempts": 150,
+  "request_start_budget_seconds": 300,
+  "since": "2026-10-23T06:51:08Z",
+  "until": "2026-10-23T12:51:08Z",
+  "unverified_producers": 0,
+  "without_artifacts": 6
+}
