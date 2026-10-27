@@ -161,8 +161,8 @@ should be checked when aggregate charts become stale.
 alarm is scheduled. To restart a stranded outbox, `POST /admin/resume-drain`
 with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-23"}` schedules its
 normal drain alarm within one second. This requires the admin bearer token and
-an allowed repository. It preserves an earlier alarm and does nothing when the
-outbox is empty; it never rewrites facts or receipts.
+an allowed repository. It preserves an earlier future alarm, re-arms an elapsed
+alarm, and does nothing when the outbox is empty; it never rewrites facts or receipts.
 
 ## Setup and bootstrap
 
