@@ -309,7 +309,7 @@ export class FactPartition {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
-    if (path === "/discard-outbox") {
+    if (path === "/discard-outbox-batch") {
       const result = this.ctx.storage.transactionSync(() => {
         const active = this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray().length ||
           this.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1").toArray().length;

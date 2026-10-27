@@ -164,7 +164,7 @@ normal drain alarm within one second. This requires the admin bearer token and
 an allowed repository. It preserves an earlier future alarm, re-arms an elapsed
 alarm, and does nothing when the outbox is empty; it never rewrites facts or receipts.
 
-`POST /admin/discard-outbox` accepts the same repository/day and permanently
+`POST /admin/discard-outbox-batch` accepts the same repository/day and permanently
 abandons undelivered metric corrections for an inactive historical partition.
 It refuses current/future days and partitions with active jobs or runs. Raw
 facts, saved contributions, already-applied aggregates and receipt sequences

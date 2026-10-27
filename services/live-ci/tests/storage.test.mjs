@@ -247,7 +247,7 @@ test("an orphaned outbox resumes through its normal alarm without adding receipt
 
 test("discard removes only pending historical metrics and never reuses their receipt IDs", async (t) => {
   const f = fixture(t, 100);
-  const request = () => f.fact.fetch(new Request("https://internal/discard-outbox", {
+  const request = () => f.fact.fetch(new Request("https://internal/discard-outbox-batch", {
     method: "POST", body: "{}",
   }));
   assert.equal((await request()).status, 409);
@@ -284,7 +284,7 @@ test("large discards make bounded progress and retain cumulative deletion accoun
       "INSERT INTO outbox(day,data) VALUES (?,?)", "2026-10-27", "[]",
     );
   });
-  const request = async () => (await f.fact.fetch(new Request("https://internal/discard-outbox", {
+  const request = async () => (await f.fact.fetch(new Request("https://internal/discard-outbox-batch", {
     method: "POST", body: "{}",
   }))).json();
   assert.deepEqual(await request(), { deleted: 100000, through: 100003, remaining: true });
