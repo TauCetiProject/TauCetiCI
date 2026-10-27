@@ -425,6 +425,15 @@ async function handle(
       return json(await call(env.CONTROL, "control", "/backlog", {
         cursor: (url.searchParams.get("cursor") || "").slice(0, 200),
       }));
+    if (path === "/admin/discard-outbox" && request.method === "POST") {
+      if (!allowed(env).includes(b.repo) ||
+          typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||
+          !Number.isFinite(Date.parse(b.day)) || b.day >= new Date().toISOString().slice(0, 10))
+        return json({ error: "Expected an allowed historical partition" }, 400);
+      const response = await env.FACTS.get(env.FACTS.idFromName(`${b.repo}/${b.day}`))
+        .fetch("https://internal/discard-outbox", { method: "POST", body: "{}" });
+      return new Response(response.body, { status: response.status, headers: { "Content-Type": "application/json" } });
+    }
     if (path === "/admin/resume-drain" && request.method === "POST") {
       if (!allowed(env).includes(b.repo) ||
           typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||

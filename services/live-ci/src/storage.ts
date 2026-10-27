@@ -309,6 +309,34 @@ export class FactPartition {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
+    if (path === "/discard-outbox") {
+      const result = this.ctx.storage.transactionSync(() => {
+        const active = this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray().length ||
+          this.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1").toArray().length;
+        if (active) return { error: "Partition is still active" };
+        const through = this.sql.exec<{ seq: number }>(
+          "SELECT seq FROM sqlite_sequence WHERE name='outbox'",
+        ).toArray()[0]?.seq || 0;
+        // Keep AUTOINCREMENT and the saved job contributions. Receipt IDs must
+        // never be reused, and a later observation must not regenerate the
+        // deliberately abandoned historical work.
+        this.sql.exec("DELETE FROM outbox");
+        const deleted = this.sql.exec<{ n: number }>("SELECT changes() n").one().n;
+        const record = { at: now(), through, deleted };
+        if (deleted) this.set("outbox_discarded", record);
+        this.set("alarm_cursor", "");
+        this.set("alarm_refresh_due", null);
+        return { deleted, through };
+      });
+      if ("error" in result) return json(result, 409);
+      await this.ctx.storage.deleteAlarm();
+      // An event interleaved with deleteAlarm must retain its notification.
+      if (this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length ||
+          this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray().length ||
+          this.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1").toArray().length)
+        await scheduleSoon(this.ctx);
+      return json(result);
+    }
     if (path === "/resume-drain") {
       const pending = !!this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
       if (pending) {
@@ -348,6 +376,7 @@ export class FactPartition {
         last_refreshed: this.meta("alarm_last_refreshed") || null,
         refresh_due: this.meta("alarm_refresh_due") || null,
         refresh_cursor: this.meta("alarm_cursor") || null,
+        discarded: this.meta("outbox_discarded") || null,
       });
     }
     if (path === "/archive") {
