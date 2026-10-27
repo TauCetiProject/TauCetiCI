@@ -39,9 +39,8 @@ Active intervals advance in bounded alarm batches. Drain-only wakes never
 refresh intervals: existing outbox receipts drain before the next refresh page,
 and a persisted deadline starts the next sweep a minute after one finishes.
 This prevents a delivery backlog from generating more updates on every retry.
-Only dirty time bins are
-recalculated. SQLite computes queue peaks and exact daily quantiles, returning
-compact results without loading a day's interval boundaries or timing samples
+Only dirty time bins are recalculated. SQLite computes queue peaks and exact
+daily quantiles, returning compact results without loading a day's interval boundaries or timing samples
 into the Worker heap. Publishing reads at most 90 materialized daily summaries,
 rather than raw jobs or all historical records. Current activity publishes each
 minute; changed chart generations publish every ten minutes. The current UTC day
@@ -148,11 +147,16 @@ After correcting historical jobs, `POST /admin/refresh-day` with
 published charts immediately. It returns the day's daily metrics for verification,
 requires the admin bearer token and makes no GitHub requests.
 
-`GET /admin/backlog` reports at most ten fact partitions, including each exact
+`GET /admin/backlog` reports at most ten fact partitions, including each bounded
 outbox count, receipt sequence, oldest receipt, active-job count, last drain and
 refresh times, and refresh deadline/cursor. Follow the returned `cursor` with
 `?cursor=...` for the next page. This admin-only read makes no GitHub requests
-and does not flush or refresh facts.
+and does not flush or refresh facts. Counts above 10,000 are marked inexact;
+`outbox_upper_bound` uses the receipt-id span without scanning the whole queue.
+Inactive partitions remain included because they may still have pending receipts;
+an unavailable partition returns its own error without hiding the rest of the page.
+Interval refresh pauses during a delivery outage, so last-drain/refresh times
+should be checked when aggregate charts become stale.
 
 ## Setup and bootstrap
 

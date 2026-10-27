@@ -130,7 +130,7 @@ async function runtime(t, bindings = {}, upstream, borsUpstream) {
     github: () => github,
   };
 }
-test("backlog diagnostics are admin-only, paginated and do not produce metrics or GitHub reads", async (t) => {
+test("backlog diagnostics are admin-only, paginated and make no GitHub reads", async (t) => {
   const r = await runtime(t);
   const request = (cursor = "", token = "admin") => r.mf.dispatchFetch(
     "https://example.com/admin/backlog?cursor=" + encodeURIComponent(cursor),

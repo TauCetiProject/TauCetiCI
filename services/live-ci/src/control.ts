@@ -1445,11 +1445,14 @@ export class Control {
         "SELECT name FROM partitions WHERE name>? ORDER BY name LIMIT 10",
         b.cursor || "",
       ).toArray();
+      const results = await Promise.allSettled(rows.map((row) =>
+        call(this.env.FACTS, row.name, "/backlog")));
       return json({
-        partitions: await Promise.all(rows.map(async (row) => ({
-          ...await call(this.env.FACTS, row.name, "/backlog"),
-          partition: row.name,
-        }))),
+        // Inactive partitions can still have undelivered receipts. Include
+        // them, but do not let one unavailable object hide the rest of a page.
+        partitions: results.map((result, i) => result.status === "fulfilled"
+          ? { ...result.value, partition: rows[i].name }
+          : { partition: rows[i].name, error: "partition unavailable" }),
         cursor: rows.length === 10 ? rows.at(-1)!.name : null,
       });
     }

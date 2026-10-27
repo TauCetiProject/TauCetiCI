@@ -43,12 +43,18 @@ function context(t) {
 
 function fixture(t, count) {
   let clock = Date.parse("2026-10-27T12:00:00Z"), loseAcknowledgement = false;
+  let holdDelivery;
   t.mock.method(Date, "now", () => clock);
   const ctx = context(t), days = new Map();
   const env = {
     DAYS: { idFromName: (id) => id, get: (id) => ({ fetch: async (url, options) => {
       if (!days.has(id)) days.set(id, new DayAggregate(context(t), env));
       const response = await days.get(id).fetch(new Request(url, options));
+      if (holdDelivery) {
+        const hold = holdDelivery;
+        holdDelivery = undefined;
+        await hold();
+      }
       if (loseAcknowledgement) {
         loseAcknowledgement = false;
         throw new Error("lost acknowledgement after applying receipts");
@@ -80,6 +86,7 @@ function fixture(t, count) {
     fact, ctx, run, days, backlog,
     advance: (seconds) => { clock += seconds * 1000; },
     loseAcknowledgement: () => { loseAcknowledgement = true; },
+    holdDelivery: (hold) => { holdDelivery = hold; },
     async wake() {
       const alarm = await ctx.storage.getAlarm();
       assert.notEqual(alarm, null);
@@ -151,6 +158,10 @@ test("a lost acknowledgement retries original receipts without double-counting",
   assert.equal((await f.backlog()).outbox_sequence, 100);
   await f.wake();
   assert.equal((await f.backlog()).outbox, 60);
+  // Even an expired refresh deadline must not produce more work while draining.
+  f.advance(120);
+  await f.fact.alarm();
+  assert.equal((await f.backlog()).outbox, 20);
   while ((await f.backlog()).outbox) await f.wake();
   assert.equal((await f.backlog()).outbox_sequence, 100);
   const aggregate = f.days.get("2026-10-27");
@@ -169,4 +180,49 @@ test("an old deployed cursor and backlog drain without requiring a schema migrat
   await f.wake();
   assert.equal((await f.backlog()).refresh_cursor, null);
   assert.equal((await f.backlog()).outbox_sequence, 1002);
+});
+
+test("a concurrent event can replay in-flight receipts without losing its new delta", async (t) => {
+  const f = fixture(t, 100);
+  await f.catchUp();
+  let applied, release;
+  const received = new Promise((resolve) => { applied = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  f.holdDelivery(() => { applied(); return held; });
+  const alarm = f.wake();
+  await received;
+  const response = await f.fact.fetch(new Request("https://internal/event", {
+    method: "POST",
+    body: JSON.stringify({
+      partition: "TauCetiProject/TauCeti/2026-10-27", delivery: "concurrent-event",
+      jobs: [{ id: "200000", run_id: "100", run_attempt: 1, name: "sandboxed-build",
+        status: "queued", created_at: new Date(Date.now() - 10000).toISOString(),
+        labels: ["ubuntu-latest"], steps: [] }],
+    }),
+  }));
+  assert.equal(response.status, 200);
+  release();
+  await alarm;
+  while ((await f.backlog()).outbox) await f.wake();
+  assert.equal((await f.backlog()).outbox_sequence, 201);
+  const aggregate = f.days.get("2026-10-27");
+  assert.equal(aggregate.sql.exec("SELECT COUNT(*) n FROM receipts").one().n, 201);
+  const peaks = aggregate.summary().fleet.filter((b) => b.step === 600).map((b) => b.queued.github || 0);
+  assert.equal(Math.max(...peaks), 101);
+});
+
+test("backlog diagnostics cap counts while retaining a receipt-span upper bound", async (t) => {
+  const f = fixture(t, 0);
+  f.ctx.storage.transactionSync(() => {
+    for (let i = 0; i < 10020; i++) f.ctx.storage.sql.exec(
+      "INSERT INTO outbox(day,data) VALUES (?,?)", "2026-10-27", "[]",
+    );
+    f.ctx.storage.sql.exec("DELETE FROM outbox WHERE id=2");
+  });
+  const status = await f.backlog();
+  assert.equal(status.outbox, 10000);
+  assert.equal(status.outbox_count_exact, false);
+  assert.equal(status.outbox_upper_bound, 10020);
+  assert.equal(status.oldest.id, 1);
+  assert.equal(status.outbox_sequence, 10020);
 });

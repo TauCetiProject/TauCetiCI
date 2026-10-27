@@ -258,7 +258,10 @@ export class FactPartition {
       await this.ctx.storage.setAlarm(
         Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000),
       );
-    else await this.ctx.storage.deleteAlarm();
+    else {
+      this.set("alarm_refresh_due", null);
+      await this.ctx.storage.deleteAlarm();
+    }
   }
   async alarm() {
     // Persist the next retry before any network call, including during cold
@@ -306,20 +309,33 @@ export class FactPartition {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
-    if (path === "/backlog")
+    if (path === "/backlog") {
+      // Diagnostics must remain cheap even for the multi-million-row backlog
+      // they diagnose. An id span bounds the remaining queue without scanning
+      // it; the bounded count is exact for ordinary small/empty partitions.
+      const count = this.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) n FROM (SELECT id FROM outbox LIMIT 10001)",
+      ).one().n;
+      const sequence = this.sql.exec<{ seq: number }>(
+        "SELECT seq FROM sqlite_sequence WHERE name='outbox'",
+      ).toArray()[0]?.seq || 0;
+      const oldest = this.sql.exec<{ id: number; day: string }>(
+        "SELECT id,day FROM outbox ORDER BY id LIMIT 1",
+      ).toArray()[0] || null;
       return json({
         partition: this.meta("partition"),
-        outbox: this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM outbox").one().n,
-        outbox_sequence: this.sql.exec<{ seq: number }>(
-          "SELECT seq FROM sqlite_sequence WHERE name='outbox'",
-        ).toArray()[0]?.seq || 0,
-        oldest: this.sql.exec("SELECT id,day FROM outbox ORDER BY id LIMIT 1").toArray()[0] || null,
+        outbox: Math.min(count, 10000),
+        outbox_count_exact: count <= 10000,
+        outbox_upper_bound: oldest ? sequence - oldest.id + 1 : 0,
+        outbox_sequence: sequence,
+        oldest,
         active_jobs: this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM jobs WHERE active=1").one().n,
         last_drained: this.meta("outbox_last_drained") || null,
         last_refreshed: this.meta("alarm_last_refreshed") || null,
         refresh_due: this.meta("alarm_refresh_due") || null,
         refresh_cursor: this.meta("alarm_cursor") || null,
       });
+    }
     if (path === "/archive") {
       const partition = this.meta("partition");
       if (!partition) return json({ done: true });
