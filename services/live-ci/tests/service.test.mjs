@@ -168,7 +168,7 @@ test("drain recovery requires an admin and an allowed partition and leaves empty
 });
 test("outbox discard requires an admin, historical day and allowed repository", async (t) => {
   const r = await runtime(t);
-  const request = (b, token = "admin") => r.mf.dispatchFetch("https://example.com/admin/discard-outbox", {
+  const request = (b, token = "admin") => r.mf.dispatchFetch("https://example.com/admin/discard-outbox-batch", {
     method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(b),
   });
   const historical = "2026-09-01";
