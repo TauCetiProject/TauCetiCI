@@ -258,14 +258,14 @@ test("discard removes only pending historical metrics and never reuses their rec
   f.ctx.storage.sql.exec("UPDATE runs SET data=?", JSON.stringify(f.run));
   const factsBefore = f.ctx.storage.sql.exec("SELECT * FROM jobs ORDER BY id").toArray();
   await f.ctx.storage.setAlarm(Date.now() + 1000);
-  assert.deepEqual(await (await request()).json(), { deleted: 100, through: 100 });
+  assert.deepEqual(await (await request()).json(), { deleted: 100, through: 100, remaining: false });
   const status = await f.backlog();
   assert.equal(status.outbox, 0);
   assert.equal(status.next_alarm, null);
   assert.equal(status.outbox_sequence, 100);
   assert.equal(status.discarded.deleted, 100);
   assert.deepEqual(f.ctx.storage.sql.exec("SELECT * FROM jobs ORDER BY id").toArray(), factsBefore);
-  assert.deepEqual(await (await request()).json(), { deleted: 0, through: 100 });
+  assert.deepEqual(await (await request()).json(), { deleted: 0, through: 100, remaining: false });
   assert.deepEqual((await f.backlog()).discarded, status.discarded);
   // An unchanged later observation does not replay the dropped contributions.
   const raw = JSON.parse(factsBefore[0].data);
@@ -273,4 +273,24 @@ test("discard removes only pending historical metrics and never reuses their rec
   assert.equal((await f.backlog()).outbox, 0);
   f.fact.replaceJob(f.run, { ...raw, id: "900000" }, Date.now() / 1000);
   assert.ok((await f.backlog()).oldest.id > 100);
+});
+
+test("large discards make bounded progress and retain cumulative deletion accounting", async (t) => {
+  const f = fixture(t, 0);
+  f.run.status = "completed";
+  f.ctx.storage.sql.exec("UPDATE runs SET data=?", JSON.stringify(f.run));
+  f.ctx.storage.transactionSync(() => {
+    for (let i = 0; i < 100003; i++) f.ctx.storage.sql.exec(
+      "INSERT INTO outbox(day,data) VALUES (?,?)", "2026-10-27", "[]",
+    );
+  });
+  const request = async () => (await f.fact.fetch(new Request("https://internal/discard-outbox", {
+    method: "POST", body: "{}",
+  }))).json();
+  assert.deepEqual(await request(), { deleted: 100000, through: 100003, remaining: true });
+  assert.equal((await f.backlog()).outbox, 3);
+  assert.deepEqual(await request(), { deleted: 3, through: 100003, remaining: false });
+  assert.equal((await f.backlog()).discarded.deleted, 100003);
+  assert.equal((await f.backlog()).outbox_sequence, 100003);
+  assert.equal((await f.backlog()).next_alarm, null);
 });
