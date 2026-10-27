@@ -309,7 +309,13 @@ export class FactPartition {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
+    if (path === "/resume-drain") {
+      const pending = !!this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
+      if (pending) await scheduleSoon(this.ctx);
+      return json({ scheduled: pending });
+    }
     if (path === "/backlog") {
+      const alarm = await this.ctx.storage.getAlarm();
       // Diagnostics must remain cheap even for the multi-million-row backlog
       // they diagnose. An id span bounds the remaining queue without scanning
       // it; the bounded count is exact for ordinary small/empty partitions.
@@ -330,6 +336,7 @@ export class FactPartition {
         outbox_sequence: sequence,
         oldest,
         active_jobs: this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM jobs WHERE active=1").one().n,
+        next_alarm: alarm === null ? null : Math.floor(alarm / 1000),
         last_drained: this.meta("outbox_last_drained") || null,
         last_refreshed: this.meta("alarm_last_refreshed") || null,
         refresh_due: this.meta("alarm_refresh_due") || null,

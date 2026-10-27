@@ -157,6 +157,12 @@ Inactive partitions remain included because they may still have pending receipts
 an unavailable partition returns its own error without hiding the rest of the page.
 Interval refresh pauses during a delivery outage, so last-drain/refresh times
 should be checked when aggregate charts become stale.
+`next_alarm` reports the scheduled wake time in Unix seconds, or null if no
+alarm is scheduled. To restart a stranded outbox, `POST /admin/resume-drain`
+with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-23"}` schedules its
+normal drain alarm within one second. This requires the admin bearer token and
+an allowed repository. It preserves an earlier alarm and does nothing when the
+outbox is empty; it never rewrites facts or receipts.
 
 ## Setup and bootstrap
 
