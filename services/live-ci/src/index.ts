@@ -421,6 +421,10 @@ async function handle(
     }
     if (path === "/admin/health")
       return json(await call(env.CONTROL, "control", "/health"));
+    if (path === "/admin/backlog" && request.method === "GET")
+      return json(await call(env.CONTROL, "control", "/backlog", {
+        cursor: (url.searchParams.get("cursor") || "").slice(0, 200),
+      }));
     if (path === "/admin/repairs")
       return json(
         await call(env.CONTROL, "control", "/repairs", {

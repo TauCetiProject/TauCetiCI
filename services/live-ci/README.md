@@ -35,7 +35,11 @@ wait distributions and Namespace picker ticks. Matching queue departures are
 applied before arrivals. A trailing-wait window includes jobs completed before
 the chart begins.
 
-Active intervals advance in bounded alarm batches. Only dirty time bins are
+Active intervals advance in bounded alarm batches. Drain-only wakes never
+refresh intervals: existing outbox receipts drain before the next refresh page,
+and a persisted deadline starts the next sweep a minute after one finishes.
+This prevents a delivery backlog from generating more updates on every retry.
+Only dirty time bins are
 recalculated. SQLite computes queue peaks and exact daily quantiles, returning
 compact results without loading a day's interval boundaries or timing samples
 into the Worker heap. Publishing reads at most 90 materialized daily summaries,
@@ -143,6 +147,12 @@ After correcting historical jobs, `POST /admin/refresh-day` with
 `{"day":"2026-10-22"}` materializes that day's latest aggregate and refreshes
 published charts immediately. It returns the day's daily metrics for verification,
 requires the admin bearer token and makes no GitHub requests.
+
+`GET /admin/backlog` reports at most ten fact partitions, including each exact
+outbox count, receipt sequence, oldest receipt, active-job count, last drain and
+refresh times, and refresh deadline/cursor. Follow the returned `cursor` with
+`?cursor=...` for the next page. This admin-only read makes no GitHub requests
+and does not flush or refresh facts.
 
 ## Setup and bootstrap
 

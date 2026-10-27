@@ -1440,6 +1440,19 @@ export class Control {
       );
     if (path === "/prune-repairs")
       return json(await this.pruneRepairs(b.cursor || ""));
+    if (path === "/backlog") {
+      const rows = this.sql.exec<{ name: string }>(
+        "SELECT name FROM partitions WHERE name>? ORDER BY name LIMIT 10",
+        b.cursor || "",
+      ).toArray();
+      return json({
+        partitions: await Promise.all(rows.map(async (row) => ({
+          ...await call(this.env.FACTS, row.name, "/backlog"),
+          partition: row.name,
+        }))),
+        cursor: rows.length === 10 ? rows.at(-1)!.name : null,
+      });
+    }
     if (path === "/health")
       return json({
         version: this.env.CF_VERSION?.id,

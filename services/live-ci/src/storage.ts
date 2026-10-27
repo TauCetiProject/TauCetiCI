@@ -209,6 +209,7 @@ export class FactPartition {
       }
       for (const row of rows)
         this.sql.exec("DELETE FROM outbox WHERE id=?", row.id);
+      this.set("outbox_last_drained", now());
     }
     const active =
       this.sql
@@ -246,17 +247,32 @@ export class FactPartition {
         .toArray().length;
     const stillPending =
       this.meta("partition_pending") ||
-      this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
+      this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length ||
+      this.meta("alarm_cursor");
+    // Persist the refresh deadline independently of notification/drain wakes.
+    // Otherwise a steady stream of deliveries can postpone refresh forever.
+    if (stillActive && !this.meta("alarm_refresh_due"))
+      this.set("alarm_refresh_due", now() + 60);
     if (stillPending) await scheduleSoon(this.ctx);
-    else if (stillActive) await this.ctx.storage.setAlarm(Date.now() + 60000);
+    else if (stillActive)
+      await this.ctx.storage.setAlarm(
+        Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000),
+      );
     else await this.ctx.storage.deleteAlarm();
   }
   async alarm() {
     // Persist the next retry before any network call, including during cold
     // aggregate restoration or an extended downstream outage.
     await this.ctx.storage.setAlarm(Date.now() + 60000);
-    let full = false;
     this.ctx.storage.transactionSync(() => {
+      // Drain old receipts before producing another page of interval deltas.
+      // A drain wake must not regenerate up to 1000 updates while delivering
+      // only 40: that turns a temporary burst into a self-sustaining backlog.
+      if (this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length)
+        return;
+      const cursor = this.meta("alarm_cursor") || "";
+      if (!cursor && (this.meta("alarm_refresh_due") || 0) > now())
+        return;
       const rows = this.sql
         .exec<{
           id: string;
@@ -265,7 +281,7 @@ export class FactPartition {
           attempt: number;
         }>(
           "SELECT id,data,run,attempt FROM jobs WHERE active=1 AND id>? ORDER BY id LIMIT 1000",
-          this.meta("alarm_cursor") || "",
+          cursor,
         )
         .toArray();
       for (const row of rows) {
@@ -276,15 +292,34 @@ export class FactPartition {
           this.replaceJob(run, job, now());
         }
       }
-      full = rows.length === 1000;
+      const full = rows.length === 1000;
       this.set("alarm_cursor", full ? rows.at(-1)!.id : "");
+      this.set("alarm_last_refreshed", now());
+      // Continue a paginated sweep only after its existing receipts drain.
+      // Start the next sweep a minute after this one finishes, not once per
+      // drain wake. Each page uses its current clock so newer event facts
+      // cannot be rolled back to an older sweep timestamp.
+      if (!full) this.set("alarm_refresh_due", now() + 60);
     });
     await this.flush(true);
-    if (full) await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
+    if (path === "/backlog")
+      return json({
+        partition: this.meta("partition"),
+        outbox: this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM outbox").one().n,
+        outbox_sequence: this.sql.exec<{ seq: number }>(
+          "SELECT seq FROM sqlite_sequence WHERE name='outbox'",
+        ).toArray()[0]?.seq || 0,
+        oldest: this.sql.exec("SELECT id,day FROM outbox ORDER BY id LIMIT 1").toArray()[0] || null,
+        active_jobs: this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM jobs WHERE active=1").one().n,
+        last_drained: this.meta("outbox_last_drained") || null,
+        last_refreshed: this.meta("alarm_last_refreshed") || null,
+        refresh_due: this.meta("alarm_refresh_due") || null,
+        refresh_cursor: this.meta("alarm_cursor") || null,
+      });
     if (path === "/archive") {
       const partition = this.meta("partition");
       if (!partition) return json({ done: true });

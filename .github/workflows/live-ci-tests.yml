@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: TauCetiProject/TauCetiTools
-          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          ref: 0f4096297f058bff8ccd873067aab7120202aecf
           path: .tauceti-tools
           persist-credentials: false
       - name: Use the shared collector

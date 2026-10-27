@@ -130,6 +130,27 @@ async function runtime(t, bindings = {}, upstream, borsUpstream) {
     github: () => github,
   };
 }
+test("backlog diagnostics are admin-only, paginated and do not produce metrics or GitHub reads", async (t) => {
+  const r = await runtime(t);
+  const request = (cursor = "", token = "admin") => r.mf.dispatchFetch(
+    "https://example.com/admin/backlog?cursor=" + encodeURIComponent(cursor),
+    { headers: { Authorization: "Bearer " + token } },
+  );
+  assert.equal((await request("", "wrong")).status, 401);
+  for (let i = 1; i <= 11; i++) await r.post("/partition", {
+    partition: repo + "/2026-10-" + String(i).padStart(2, "0"), active: 0, revision: 1,
+  });
+  const first = await (await request()).json();
+  assert.equal(first.partitions.length, 10);
+  assert.equal(first.cursor, repo + "/2026-10-10");
+  assert.ok(first.partitions.every((p) => p.outbox === 0 && p.outbox_sequence === 0 && p.last_refreshed === null));
+  const last = await (await request(first.cursor)).json();
+  assert.equal(last.partitions.length, 1);
+  assert.equal(last.partitions[0].partition, repo + "/2026-10-11");
+  assert.equal(last.cursor, null);
+  assert.deepEqual(await (await request()).json(), first);
+  assert.equal(r.github(), 0);
+});
 test("membership repair and coverage progress while GitHub quota is exhausted", async (t) => {
   const r = await runtime(t, {
     GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2",
