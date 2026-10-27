@@ -1,16 +1,16 @@
 {
- "TauCeti": "2026-10-27T07:56:59Z",
- "TauCetiCI": "2026-10-27T08:03:06Z",
+ "TauCeti": "2026-10-27T10:01:10Z",
+ "TauCetiCI": "2026-10-27T08:03:19Z",
  "TauCetiData": "2026-10-27T14:45:15Z",
  "TauCetiFleet": "2026-10-27T08:03:19Z",
- "TauCetiProgress": "2026-10-27T08:03:19Z",
+ "TauCetiProgress": "2026-10-27T14:45:15Z",
  "TauCetiReview": "2026-10-27T14:45:15Z",
- "TauCetiRoadmap": "2026-10-27T08:01:57Z",
+ "TauCetiRoadmap": "2026-10-27T12:15:14Z",
  "TauCetiRoadmapJobs": "2026-10-27T08:03:19Z",
  "TauCetiRoadmapWorker": "2026-10-27T08:03:19Z",
  "TauCetiTools": "2026-10-27T08:03:19Z",
  "TauCetiWorker": "2026-10-27T14:45:15Z",
  "bors-ng": "2026-10-27T08:03:19Z",
- "tauceti-claims": "2026-10-27T08:03:19Z",
+ "tauceti-claims": "2026-10-27T08:33:19Z",
  "tauceti-roadmap-claims": "2026-10-27T08:03:19Z"
 }
