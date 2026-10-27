@@ -320,13 +320,16 @@ export class FactPartition {
         // Keep AUTOINCREMENT and the saved job contributions. Receipt IDs must
         // never be reused, and a later observation must not regenerate the
         // deliberately abandoned historical work.
-        this.sql.exec("DELETE FROM outbox");
+        // Whole-table deletion can exceed a production request's execution
+        // budget. Drop bounded pages without reading or replaying their data.
+        this.sql.exec("DELETE FROM outbox WHERE id IN (SELECT id FROM outbox ORDER BY id LIMIT 100000)");
         const deleted = this.sql.exec<{ n: number }>("SELECT changes() n").one().n;
-        const record = { at: now(), through, deleted };
+        const remaining = !!this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
+        const record = { at: now(), through, deleted: (this.meta("outbox_discarded")?.deleted || 0) + deleted };
         if (deleted) this.set("outbox_discarded", record);
         this.set("alarm_cursor", "");
         this.set("alarm_refresh_due", null);
-        return { deleted, through };
+        return { deleted, through, remaining };
       });
       if ("error" in result) return json(result, 409);
       await this.ctx.storage.deleteAlarm();

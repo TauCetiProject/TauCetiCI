@@ -178,7 +178,7 @@ test("outbox discard requires an admin, historical day and allowed repository", 
   assert.equal((await request({ repo, day: "../control" })).status, 400);
   const response = await request({ repo, day: historical });
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { deleted: 0, through: 0 });
+  assert.deepEqual(await response.json(), { deleted: 0, through: 0, remaining: false });
   assert.equal(r.github(), 0);
 });
 test("membership repair and coverage progress while GitHub quota is exhausted", async (t) => {

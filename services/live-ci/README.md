@@ -171,6 +171,8 @@ facts, saved contributions, already-applied aggregates and receipt sequences
 remain intact; drain alarms stop. Historical aggregates stay partial rather
 than replaying the discarded work. The discard time, highest receipt ID and
 exact deletion count appear in `/admin/backlog` for that partition.
+Each call deletes at most 100,000 entries without replaying their contents;
+repeat while `remaining` is true. Diagnostics retain the cumulative deleted count.
 
 ## Setup and bootstrap
 
