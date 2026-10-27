@@ -226,3 +226,19 @@ test("backlog diagnostics cap counts while retaining a receipt-span upper bound"
   assert.equal(status.oldest.id, 1);
   assert.equal(status.outbox_sequence, 10020);
 });
+
+test("an orphaned outbox resumes through its normal alarm without adding receipts", async (t) => {
+  const f = fixture(t, 100);
+  assert.equal((await f.backlog()).next_alarm, null);
+  const resume = async () => (await f.fact.fetch(new Request("https://internal/resume-drain", {
+    method: "POST", body: "{}",
+  }))).json();
+  assert.deepEqual(await resume(), { scheduled: true });
+  const scheduled = (await f.backlog()).next_alarm;
+  assert.equal(scheduled, Date.now() / 1000 + 1);
+  assert.deepEqual(await resume(), { scheduled: true });
+  assert.equal((await f.backlog()).next_alarm, scheduled);
+  while ((await f.backlog()).outbox) await f.wake();
+  assert.equal((await f.backlog()).outbox_sequence, 100);
+  assert.deepEqual(await resume(), { scheduled: false });
+});

@@ -151,6 +151,21 @@ test("backlog diagnostics are admin-only, paginated and make no GitHub reads", a
   assert.deepEqual(await (await request()).json(), first);
   assert.equal(r.github(), 0);
 });
+test("drain recovery requires an admin and an allowed partition and leaves empty outboxes alone", async (t) => {
+  const r = await runtime(t);
+  const request = (body, token = "admin") => r.mf.dispatchFetch(
+    "https://example.com/admin/resume-drain", {
+      method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(body),
+    },
+  );
+  assert.equal((await request({ repo, day: date }, "wrong")).status, 401);
+  assert.equal((await request({ repo: "other/repo", day: date })).status, 400);
+  assert.equal((await request({ repo, day: "../control" })).status, 400);
+  const result = await request({ repo, day: date });
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), { scheduled: false });
+  assert.equal(r.github(), 0);
+});
 test("membership repair and coverage progress while GitHub quota is exhausted", async (t) => {
   const r = await runtime(t, {
     GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2",

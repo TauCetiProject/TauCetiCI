@@ -425,6 +425,13 @@ async function handle(
       return json(await call(env.CONTROL, "control", "/backlog", {
         cursor: (url.searchParams.get("cursor") || "").slice(0, 200),
       }));
+    if (path === "/admin/resume-drain" && request.method === "POST") {
+      if (!allowed(env).includes(b.repo) ||
+          typeof b.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(b.day) ||
+          !Number.isFinite(Date.parse(b.day)))
+        return json({ error: "Invalid drain partition" }, 400);
+      return json(await call(env.FACTS, `${b.repo}/${b.day}`, "/resume-drain"));
+    }
     if (path === "/admin/repairs")
       return json(
         await call(env.CONTROL, "control", "/repairs", {
