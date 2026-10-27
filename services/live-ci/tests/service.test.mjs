@@ -166,6 +166,21 @@ test("drain recovery requires an admin and an allowed partition and leaves empty
   assert.deepEqual(await result.json(), { scheduled: false });
   assert.equal(r.github(), 0);
 });
+test("outbox discard requires an admin, historical day and allowed repository", async (t) => {
+  const r = await runtime(t);
+  const request = (b, token = "admin") => r.mf.dispatchFetch("https://example.com/admin/discard-outbox", {
+    method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(b),
+  });
+  const historical = "2026-09-01";
+  assert.equal((await request({ repo, day: historical }, "wrong")).status, 401);
+  assert.equal((await request({ repo: "other/repo", day: historical })).status, 400);
+  assert.equal((await request({ repo, day: new Date().toISOString().slice(0, 10) })).status, 400);
+  assert.equal((await request({ repo, day: "../control" })).status, 400);
+  const response = await request({ repo, day: historical });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { deleted: 0, through: 0 });
+  assert.equal(r.github(), 0);
+});
 test("membership repair and coverage progress while GitHub quota is exhausted", async (t) => {
   const r = await runtime(t, {
     GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2",

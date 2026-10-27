@@ -244,3 +244,33 @@ test("an orphaned outbox resumes through its normal alarm without adding receipt
   assert.equal((await f.backlog()).outbox_sequence, 100);
   assert.deepEqual(await resume(), { scheduled: false });
 });
+
+test("discard removes only pending historical metrics and never reuses their receipt IDs", async (t) => {
+  const f = fixture(t, 100);
+  const request = () => f.fact.fetch(new Request("https://internal/discard-outbox", {
+    method: "POST", body: "{}",
+  }));
+  assert.equal((await request()).status, 409);
+  assert.equal((await f.backlog()).outbox, 100);
+  f.ctx.storage.sql.exec("UPDATE jobs SET active=0");
+  assert.equal((await request()).status, 409); // Active parent alone also blocks deletion.
+  f.run.status = "completed";
+  f.ctx.storage.sql.exec("UPDATE runs SET data=?", JSON.stringify(f.run));
+  const factsBefore = f.ctx.storage.sql.exec("SELECT * FROM jobs ORDER BY id").toArray();
+  await f.ctx.storage.setAlarm(Date.now() + 1000);
+  assert.deepEqual(await (await request()).json(), { deleted: 100, through: 100 });
+  const status = await f.backlog();
+  assert.equal(status.outbox, 0);
+  assert.equal(status.next_alarm, null);
+  assert.equal(status.outbox_sequence, 100);
+  assert.equal(status.discarded.deleted, 100);
+  assert.deepEqual(f.ctx.storage.sql.exec("SELECT * FROM jobs ORDER BY id").toArray(), factsBefore);
+  assert.deepEqual(await (await request()).json(), { deleted: 0, through: 100 });
+  assert.deepEqual((await f.backlog()).discarded, status.discarded);
+  // An unchanged later observation does not replay the dropped contributions.
+  const raw = JSON.parse(factsBefore[0].data);
+  f.fact.replaceJob(f.run, raw, Date.now() / 1000);
+  assert.equal((await f.backlog()).outbox, 0);
+  f.fact.replaceJob(f.run, { ...raw, id: "900000" }, Date.now() / 1000);
+  assert.ok((await f.backlog()).oldest.id > 100);
+});
