@@ -311,7 +311,14 @@ export class FactPartition {
       b: any = await request.json();
     if (path === "/resume-drain") {
       const pending = !!this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length;
-      if (pending) await scheduleSoon(this.ctx);
+      if (pending) {
+        const scheduled = await this.ctx.storage.getAlarm();
+        // A failed/exhausted old alarm can retain an elapsed timestamp.
+        // Unlike ordinary ingestion, explicit recovery must re-arm that case.
+        if (scheduled !== null && scheduled <= Date.now())
+          await this.ctx.storage.setAlarm(Date.now() + 1000);
+        else await scheduleSoon(this.ctx);
+      }
       return json({ scheduled: pending });
     }
     if (path === "/backlog") {

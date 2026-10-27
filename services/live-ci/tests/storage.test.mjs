@@ -230,6 +230,8 @@ test("backlog diagnostics cap counts while retaining a receipt-span upper bound"
 test("an orphaned outbox resumes through its normal alarm without adding receipts", async (t) => {
   const f = fixture(t, 100);
   assert.equal((await f.backlog()).next_alarm, null);
+  // Production retained a failed alarm timestamp more than three days old.
+  await f.ctx.storage.setAlarm(Date.now() - 3 * 86400000);
   const resume = async () => (await f.fact.fetch(new Request("https://internal/resume-drain", {
     method: "POST", body: "{}",
   }))).json();
