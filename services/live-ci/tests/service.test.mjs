@@ -605,7 +605,7 @@ test("repair recovery prunes settled work without reading GitHub or dropping unr
   ])
     await r.post("/repair", { repo, kind, args: { id: "100", attempt } });
   const result = await r.post("/prune-repairs");
-  assert.deepEqual(result, { scanned: 5, removed: 3, cursor: null });
+  assert.deepEqual(result, { scanned: 5, removed: 3, retired: 0, cursor: null });
   const remaining = await r.post("/repairs");
   assert.equal(remaining.length, 2);
   assert.ok(remaining.every((row) => row.args.attempt === 2));
@@ -664,7 +664,7 @@ test("webhooks verify HMAC and persist the delivery before queueing", async (t) 
   const r = await runtime(t),
     body = JSON.stringify({
       repository: { full_name: repo },
-      workflow_run: run(),
+      workflow_run: { ...run(), actor: { login: "unused" }, referenced_workflows: [{ path: "unused" }] },
     });
   const headers = {
     "x-github-event": "workflow_run",
@@ -697,6 +697,12 @@ test("webhooks verify HMAC and persist the delivery before queueing", async (t) 
       .objects.length,
     1,
   );
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  const item = (await bucket.list({ prefix: "inbox/" })).objects[0];
+  const saved = await (await bucket.get(item.key)).json();
+  assert.equal(saved.run.id, "100");
+  assert.equal(saved.run.actor, undefined);
+  assert.equal(saved.run.referenced_workflows, undefined);
 });
 test("queued cancellations with synthetic started_at do not accrue runner minutes", async (t) => {
   const r = await runtime(t);
@@ -846,52 +852,22 @@ test("old inventory pages cannot starve reconciliation of a stale active run", a
   assert.ok(refresh >= 0);
   assert.ok(oldInventory > refresh);
 });
-test("cold fact archive restores prior contributions before a historical correction", async (t) => {
-  const r = await runtime(t),
-    then = clock - 60 * 86400,
-    oldDate = iso(then).slice(0, 10),
-    partition = repo + "/" + oldDate;
-  const raw = {
-    ...run(),
-    path: ".github/workflows/label.yml",
-    created_at: iso(then),
-    updated_at: iso(then + 300),
-  };
-  const j = {
-    ...job(),
-    name: "label",
-    created_at: iso(then),
-    started_at: iso(then + 60),
-    completed_at: iso(then + 120),
-  };
+test("expired auxiliary facts and their late corrections are not collected", async (t) => {
+  const r = await runtime(t), then = clock - 60 * 86400;
+  const raw = { ...run(), path: ".github/workflows/label.yml",
+    created_at: iso(then), updated_at: iso(then + 300) };
+  const j = { ...job(), name: "label", created_at: iso(then),
+    started_at: iso(then + 60), completed_at: iso(then + 120) };
   await r.ingest({ run: raw, jobs: [j], historical: true });
-  const ns = await r.mf.getDurableObjectNamespace("FACTS"),
-    fact = ns.get(ns.idFromName(partition));
-  let response = await fact.fetch("https://internal/archive", {
-    method: "POST",
-    body: JSON.stringify({ builds: false }),
-  });
-  assert.equal(response.status, 200, await response.clone().text());
-  response = await fact.fetch("https://internal/status", {
-    method: "POST",
-    body: JSON.stringify({ id: "100", attempt: 1 }),
-  });
-  assert.equal((await response.json()).jobs, 0);
-  const bucket = await r.mf.getR2Bucket("ARCHIVE");
-  assert.equal((await bucket.list({ prefix: "facts/" })).objects.length, 1);
-  await r.ingest({
-    jobs: [
-      { ...j, started_at: iso(then + 120), completed_at: iso(then + 180) },
-    ],
-  });
-  const days = await r.mf.getDurableObjectNamespace("DAYS");
-  response = await days
-    .get(days.idFromName(oldDate))
-    .fetch("https://internal/summary", { method: "POST", body: "{}" });
-  assert.deepEqual((await response.json()).daily["wait/other"], {
-    median: 2,
-    p90: 2,
-  });
+  await r.ingest({ run: raw, jobs: [{ ...j, completed_at: iso(then + 180) }] });
+  const ns = await r.mf.getDurableObjectNamespace("FACTS");
+  const response = await ns.get(ns.idFromName(repo + "/" + iso(then).slice(0, 10))).fetch(
+    "https://internal/status", { method: "POST", body: JSON.stringify({ id: "100", attempt: 1 }) });
+  const status = await response.json();
+  assert.equal(status.jobs, 0);
+  assert.equal(status.run, undefined);
+  assert.equal((await r.post("/repairs")).length, 0);
+  assert.equal(r.github(), 0);
 });
 test("secondary rate limits pause all repair reads and preserve pending work", async (t) => {
   const key = generateKeyPairSync("rsa", {
@@ -1019,7 +995,7 @@ test("parallel historical import preserves duplicate receipts and exact totals",
   assert.equal(summary.daily["duration/github"].median, 3);
   assert.equal(r.github(), 0);
 });
-test("cold aggregate pages restore exact distributions and idempotency receipts", async (t) => {
+test("closed aggregate days retain summaries and acknowledge late corrections", async (t) => {
   const r = await runtime(t),
     date = iso(clock - 120 * 86400).slice(0, 10),
     ns = await r.mf.getDurableObjectNamespace("DAYS"),
@@ -1063,7 +1039,7 @@ test("cold aggregate pages restore exact distributions and idempotency receipts"
   await send("/delta", delta);
   assert.deepEqual(
     (await send("/summary", { day: date })).daily["duration/github"],
-    { median: 4, p90: 6 },
+    { median: 2, p90: 4 },
   );
 });
 test("concurrent landing corrections leave a PR only on its earliest observed day", async (t) => {
@@ -1266,4 +1242,58 @@ test("SQL projections match archived production metrics and timeline bins", asyn
           ) < 1e-7,
           `${type}/${key}/${i}`,
         );
+});
+
+test("repeated inventory does not recreate satisfied or unnecessary repairs", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({ run: run(), jobs: [job()], verified_jobs: true,
+    telemetry: { coverage: "complete" } });
+  await r.ingest({ run: run() });
+  await r.ingest({ run: { ...run("101"), path: ".github/workflows/label.yml" } });
+  await r.ingest({ run: run("102"), jobs: [job("202", "102")] });
+  assert.deepEqual(await r.post("/repairs"), []);
+  assert.equal(r.github(), 0);
+});
+test("pruning retires expired and auxiliary recovery but retains a recent missing build", async (t) => {
+  const r = await runtime(t);
+  const old = { ...run("120"), created_at: iso(clock - 3 * 86400), updated_at: iso(clock - 2 * 86400) };
+  await r.ingest({ run: old, historical: true });
+  await r.ingest({ run: { ...run("121"), path: ".github/workflows/label.yml" } });
+  await r.ingest({ run: run("122"), historical: true });
+  for (const [id, kind] of [["120", "jobs"], ["120", "details"], ["121", "jobs"], ["122", "jobs"]])
+    await r.post("/repair", { repo, kind, args: { id, attempt: 1 } });
+  const result = await r.post("/prune-repairs");
+  assert.equal(result.retired, 3);
+  const pending = await r.post("/repairs");
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].args.id, "122");
+  assert.equal(r.github(), 0);
+});
+test("optional enrichment cannot consume more than sixty requests while core repairs still run", async (t) => {
+  const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" });
+  const paths = [];
+  const r = await runtime(t, { GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2", GITHUB_PRIVATE_KEY: key }, (req) => {
+    const path = new URL(req.url).pathname;
+    paths.push(path);
+    if (path.endsWith('/access_tokens')) return Response.json({ token: 'test', expires_at: iso(clock + 3600) });
+    if (path.endsWith('/artifacts')) return Response.json({ artifacts: [] });
+    if (path.endsWith('/attempts/1')) return Response.json(run('90000'));
+    return Response.json({ workflow_runs: [], total_count: 0, jobs: [] });
+  });
+  for (let i = 1; i <= 61; i++) {
+    const id = String(i * 20);
+    await r.ingest({ run: run(id), jobs: [job(String(10000 + i), id)], verified_jobs: true, historical: true });
+    await r.post('/repair', { repo, kind: 'details', args: { id, attempt: 1 } });
+  }
+  for (let i = 0; i < 7; i++) await r.post('/tick');
+  assert.equal(paths.filter((path) => path.endsWith('/artifacts')).length, 60);
+  assert.equal((await r.post('/health')).detail_requests_last_hour, 60);
+  await r.post('/repair', { repo, kind: 'run', args: { id: '90000', attempt: 1, urgent: true } });
+  await r.post('/tick');
+  assert.ok(paths.some((path) => path.endsWith('/runs/90000/attempts/1')));
+  await r.ingest({ run: run('90001'), historical: true });
+  await r.post('/repair', { repo, kind: 'jobs', args: { id: '90001', attempt: 1, archival: true } });
+  await r.post('/tick');
+  assert.ok(paths.some((path) => path.endsWith('/runs/90001/attempts/1/jobs')));
+
 });

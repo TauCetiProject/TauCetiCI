@@ -55,33 +55,41 @@ Bors membership repairs run in a separate bounded lane, independent of GitHub
 quota. Staging coverage counts missing membership and pending repairs; completed
 runs with unknown batch sizes remain visible as diamonds below the scatter plot.
 
-General facts move to compressed R2 archives after 30 days; build facts retain
-90 days. Archival operates in bounded run batches, retaining the old contribution
-with each archived fact. A correction restores those facts before calculating
-its delta. After 90 days, exact aggregate distributions and receipts also move
-to compressed, resumable archive pages; compact daily summaries remain in R2.
-Historical corrections restore just their affected days. Raw deliveries and
-retired rendered assets expire after 14 days. Fact archives and summary history
-are retained. SQLite objects support Cloudflare point-in-time recovery.
+Raw general facts are retained for 30 days and `pr-build` facts for 90 days, then
+retired while their applied metrics remain. Compact daily summaries are retained
+long term. Existing fact and aggregate archives expire after seven days. Closed days keep
+only their compact summary and acknowledge late corrections without reopening
+expired raw evidence. Raw deliveries and failed deliveries expire after 14 days; validation
+copies after 30 days. Retired rendered assets expire after 14 days. Run-directory
+mappings are pruned after the longest supported raw-fact window. Late events
+outside these windows do not reopen historical collection.
 
-The request scheduler and publisher use a short persisted lease. Normal read
-work, completed-attempt verification and missing-artifact/log recovery share a
-rolling ceiling of 500 request attempts per hour, including retries and token
-exchange. Completed resources retire; 404/410 responses become explicit gaps.
-Secondary limits pause reads and publisher admissions. Historical import never
-spends GitHub quota. Bootstrap is deliberately separate from the freshness path.
+Job webhooks supply the normal freshness path. Inventory discovers missing runs;
+only missing/nonterminal build jobs require enumeration. Auxiliary job history
+is observed through webhooks, with gaps left explicit. Job and optional-detail
+recovery expires 24 hours after the run's last update. Successful PR builds have
+phase artifacts sampled one in twenty, with means divided by the sampled count; recent failed PR builds can receive log
+classification. Optional enrichment has its own 60-request rolling hourly cap
+within the existing 500-request total. Current state repairs take precedence.
+Satisfied and retired repair entries are pruned automatically in bounded pages,
+and inventory cannot re-admit ineligible work. Protected health exposes retired
+counts by reason and the optional request count.
 
-The trusted `ci-live-summary.yml` workflow in TauCeti reserves six requests before
-reading run metadata, jobs, artifacts or failed-job logs. Its OIDC token must
-identify that exact main-branch workflow and repository. Reservations count the
-full allowance conservatively even when fewer requests are used.
-At the default budget, publisher reservations use at most 360 of the 500 slots
-per rolling hour, leaving 140 for reconciliation and token exchanges. Deferred
-summaries remain repairable from webhooks and the attempt-specific repair queue.
-The publisher reports
-quota rejections to the shared scheduler. A fresh runner parses bounded JSON
-artifacts; it neither checks out nor executes candidate code. Candidate phase
-measurements remain statistics and cannot establish producer or merge identity.
+The trusted `ci-live-summary.yml` workflow is manual diagnosis only. It retains
+OIDC authentication and a six-request reservation; its artifact search records a
+completed result even when no artifact exists. Normal build completion no longer
+starts a reporting runner. The legacy collector, resource refresh and SQLite
+publication workflows are likewise manual analysis/export tools. Optional logs,
+artifacts and commit comparisons require `collector.incremental --analysis`.
+Host resource sampling runs only when the repository variable
+`CI_RESOURCE_EXPERIMENT` is `1`; the normal sandbox command runs directly.
+
+The site caches the eleven already-published SVG assets, with digest checks and
+previous-chart preservation, instead of downloading the historical SQLite
+release and recalculating those charts. The SQLite release remains available for
+explicit analyses. Full per-module telemetry lists and ruleset snapshots are no
+longer collected, and chart publication does not write an unused full-series
+JSON export on each generation.
 
 ## Public contract
 
@@ -89,12 +97,10 @@ measurements remain statistics and cannot establish producer or merge identity.
 
 - `mode`: `shadow` or `live`.
 - `generated_at`, `observed_at`: publication and event-receipt times.
-- `current`: observed running/queued counts by runner, active builds, staging
-  batches, inventory confirmation time, computation time and truncation state.
+- `current`: observed running/queued counts by runner, inventory confirmation time, computation time and truncation state.
 - `groups`: independent fleet, daily, detail, queue and staging publication times,
   source cutoffs, coverage description, pending work and known gaps.
 - `assets`: SVG filenames mapped to immutable revisioned URLs.
-- `series_url`: the bounded materialized JSON series behind those assets.
 - `coverage`: enumerated inventory intervals per repository.
 - `github`: rolling request/reservation accounting, budget and cooldown.
 
@@ -116,7 +122,7 @@ carry no GitHub credentials. `/healthz` exposes service identity/version only.
 Protected `/admin/health` exposes scheduler and processing diagnostics.
 `GET /admin/repairs?kind=run` returns at most 20 pending repair records.
 `POST /admin/prune-repairs` checks up to 100 repairs against stored facts and
-removes only satisfied work; follow its returned cursor to scan the backlog.
+removes satisfied or policy-retired work; follow its returned cursor to scan the backlog.
 `POST /admin/replay-failed` requeues up to 100 retained failed deliveries;
 follow its returned cursor for additional pages. These operations require the
 admin bearer token and make no GitHub requests. Successful replay moves the body

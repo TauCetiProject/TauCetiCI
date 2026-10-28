@@ -365,6 +365,12 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
         );
       if (j.conclusion === "success") {
         daily("phase-count");
+        const sampled = !!run.telemetry?.phases?.some((p) => p.seconds !== null && p.seconds > 0 && phases[p.phase]);
+        if (sampled) daily("phase-sample-count");
+        const phaseDaily = (name: string, seconds: number) => {
+          daily(`phase/${name}`, 0, seconds / 60);
+          if (sampled) daily(`sample-phase/${name}`, 0, seconds / 60);
+        };
         for (const s of j.steps) {
           if (!s.started || !s.completed) continue;
           const seconds = Math.max(0, s.completed - s.started),
@@ -376,13 +382,9 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
           if (phase === "build, audits, lints" && total > 0) {
             const factor = Math.min(1, seconds / total);
             for (const p of split)
-              daily(`phase/${phases[p.phase]}`, 0, (p.seconds! * factor) / 60);
-            daily(
-              "phase/sandbox, unattributed",
-              0,
-              Math.max(0, seconds - total) / 60,
-            );
-          } else daily(`phase/${phase}`, 0, seconds / 60);
+              phaseDaily(phases[p.phase], p.seconds! * factor);
+            phaseDaily("sandbox, unattributed", Math.max(0, seconds - total));
+          } else phaseDaily(phase, seconds);
         }
       }
     } else {

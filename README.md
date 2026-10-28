@@ -33,8 +33,9 @@ snapshot to erase enriched data. Active runs have no terminal result until a lat
 
 All TauCeti build workflows (`pr-build`, `ci`, `nightly-verify`, `pr-profile`, `lint-full`,
 `pages`) have their jobs collected. The high-volume label, notification and merge-bot
-workflows have their jobs sampled one run in four, chosen by run id. Optional build details
-include steps, tested commits, failure excerpts and trusted resource artifacts. Pending job
+workflows in explicit historical exports have their jobs sampled one run in four, chosen by run id. Basic build jobs include steps. Optional analysis (`--analysis`) adds tested-commit
+comparisons, failure excerpts and trusted resource artifacts. Scheduled enrichment
+is disabled; host resources require an explicit experiment. Pending job
 work is explicit; missing optional artifacts do not pin job coverage.
 
 ## Querying
@@ -45,7 +46,7 @@ charts and current activity on Cloudflare. Its public manifest is served from
 GitHub quota. It begins in shadow mode while the existing collector and SQLite
 release continue serving as the historical reference.
 
-A SQLite database is rebuilt after collection, with a three-hour fallback schedule, and published as `ci.sqlite.gz` on the
+A SQLite database can be rebuilt explicitly and published as `ci.sqlite.gz` on the
 [`db` release](https://github.com/TauCetiProject/TauCetiCI/releases/tag/db):
 
 ```bash
@@ -60,7 +61,7 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 
 ## Collection
 
-[`collect.yml`](.github/workflows/collect.yml) is scheduled every twenty minutes. GitHub may
+[`collect.yml`](.github/workflows/collect.yml) is manual-only; the live dashboard uses job webhooks and bounded repairs. GitHub may
 delay scheduled runs. Each invocation starts no requests after thirty minutes, checkpoints
 completed records to git about every two minutes, and performs a final push before the
 55-minute runner timeout. API exhaustion ends a phase without waiting for a quota reset.
@@ -124,7 +125,7 @@ Run and job metadata do not expire.
 
 [`analysis/report.py`](analysis/report.py) models failure rates, rebase and merge-queue risk,
 GitHub-hosted runner capacity, merge-queue settings (by simulation) and the economics of batching
-PR builds, from the database. The publish workflow regenerates it with the database, as the `db`
+PR builds, from the database. The manual publish workflow regenerates it with the database, as the `db`
 release's `REPORT.md`.
 
 ## Merge backend experiments
@@ -191,7 +192,7 @@ without independently verified source provenance produce visible
 also remain unverified. Database rebuilds apply the same
 rule to historical records, and unverified dependency flags cannot set cohorts.
 
-The hourly `collect resources` workflow independently samples recent completed
+The manual `collect resources` workflow independently samples recent completed
 `pr-build`/`ci` runs, so a slow full-history collection cannot stall new resource
 data. It lists at most 100 runs per workflow within six hours, attempts at most
 20 new trusted runs, caps API requests at 150 and starts no requests after five

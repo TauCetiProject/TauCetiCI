@@ -467,3 +467,14 @@ test("charts include dedicated work and retain pending staging observations", as
   assert.match(assets["ci-bors-staging.svg"], /1 completed runs awaiting batch size/);
   assert.doesNotMatch(assets["ci-bors-staging.svg"], /NaN/);
 });
+
+test("phase samples use their own denominator rather than all successful builds", async () => {
+  const code = buildSync({ entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false }).outputFiles[0].text;
+  const { phaseSeries } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+  const data = [{ data: { daily: { "phase-count": 20, "phase/build": 6,
+    "phase/build, audits, lints": 114, "phase-sample-count": 1, "sample-phase/build": 6 } } },
+    { data: { daily: { "phase-count": 20, "phase/build, audits, lints": 120 } } }];
+  const values = Object.fromEntries(phaseSeries(data).map((s) => [s.name, s.values]));
+  assert.deepEqual(values.build, [6, 0]);
+  assert.deepEqual(values["build, audits, lints"], [0, 6]);
+});

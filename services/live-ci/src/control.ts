@@ -10,6 +10,7 @@ import {
 } from "./types";
 import { DAY, day, iso, normalizeRun, normalizeJob, WORKFLOW } from "./model";
 import { renderCharts } from "./charts";
+import { BUILD_WORKFLOWS, DETAIL_REQUESTS_PER_HOUR, needsJobs, repairReason, retained } from "./policy";
 import { headers, installationToken, boundedBytes } from "./github";
 import { unzipSync } from "fflate";
 import { classify } from "./failure";
@@ -83,14 +84,23 @@ export class Control {
       due,
     );
   }
-  async pruneRepairs(cursor = "") {
+  retire(row: { key: string; kind: string }, reason: string) {
+    this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+    const counts = this.get("retired_repairs") || {};
+    const key = `${row.kind}: ${reason}`;
+    counts[key] = (counts[key] || 0) + 1;
+    this.set("retired_repairs", counts);
+  }
+  async pruneRepairs(cursor = "", limit = 100) {
+    limit = Math.max(1, Math.min(200, Number(limit) || 100));
     const rows = this.sql
-      .exec<{ key: string; repo: string; kind: string; args: string }>(
-        "SELECT key,repo,kind,args FROM repairs WHERE key>? AND kind IN ('run','jobs','details') ORDER BY key LIMIT 100",
+      .exec<{ key: string; repo: string; kind: string; args: string; due: number }>(
+        "SELECT key,repo,kind,args,due FROM repairs WHERE key>? AND kind IN ('run','jobs','details','members') ORDER BY key LIMIT ?",
         cursor,
+        limit,
       )
       .toArray();
-    let removed = 0;
+    let removed = 0, retired = 0;
     for (let i = 0; i < rows.length; i += 4)
       await Promise.all(
         rows.slice(i, i + 4).map(async (row) => {
@@ -101,19 +111,24 @@ export class Control {
             "/get",
             { id: args.id },
           );
-          if (!location.partition) return;
+          if (!location.partition) {
+            if (row.due < now() - DAY) { this.retire(row, "unresolved parent expired"); retired++; }
+            return;
+          }
           const status = await call(
             this.env.FACTS,
             location.partition,
             "/status",
             { id: String(args.id), attempt: args.attempt || 1 },
           );
+          const reason = repairReason(row.kind, status.run, now());
+          if (reason) { this.retire(row, reason); retired++; return; }
           const satisfied =
             row.kind === "run"
               ? status.run?.status === "completed"
               : row.kind === "jobs"
-                ? status.verified
-                : status.run?.telemetry?.coverage === "complete" ||
+                ? status.verified || ((!args.page || args.page === 1) && !needsJobs(status))
+                : row.kind === 'members' ? status.run?.members?.length : status.run?.telemetry?.coverage === "complete" ||
                   status.run?.telemetry?.phases?.length;
           if (satisfied) {
             this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
@@ -124,7 +139,8 @@ export class Control {
     return {
       scanned: rows.length,
       removed,
-      cursor: rows.length === 100 ? rows.at(-1)!.key : null,
+      retired,
+      cursor: rows.length === limit ? rows.at(-1)!.key : null,
     };
   }
   async ingest(b: any) {
@@ -140,8 +156,9 @@ export class Control {
     )
       throw new Error("Repository is not allowed");
     if (b.run) {
-      const run = normalizeRun(repo, b.run),
-        partition = `${repo}/${day(run.created)}`;
+      const run = normalizeRun(repo, b.run);
+      if (!retained(run, now())) return;
+      const partition = `${repo}/${day(run.created)}`;
       let needsMembers = !run.members?.length;
       await call(this.env.DIRECTORIES, directory(repo, run.id), "/put", {
         id: run.id,
@@ -174,7 +191,7 @@ export class Control {
           run.id,
           run.attempt,
         );
-      if (run.trigger === "bors_staging") {
+      if (run.trigger === "bors_staging" && run.created >= now() - 30 * DAY) {
         const stored = await call(this.env.FACTS, partition, "/status", {
           id: run.id,
           attempt: run.attempt,
@@ -190,46 +207,16 @@ export class Control {
             repo, run.id, run.attempt,
           );
       }
-      if (
-        !b.historical &&
-        run.workflow === WORKFLOW &&
-        run.status === "completed" &&
-        !b.verified_jobs
-      )
-        this.enqueue(
-          repo,
-          "jobs",
-          {
-            id: run.id,
-            attempt: run.attempt,
-            archival: run.updated < now() - 3600,
-          },
-          now() + 180,
-        );
-      if (
-        !b.historical &&
-        run.workflow === WORKFLOW &&
-        run.status === "completed" &&
-        !b.telemetry
-      )
-        this.enqueue(
-          repo,
-          "details",
-          {
-            id: run.id,
-            attempt: run.attempt,
-            archival: run.updated < now() - 3600,
-          },
-          now() + 600,
-        );
-      if (!b.historical && run.attempt > 1)
-        this.enqueue(
-          repo,
-          "jobs",
-          { id: run.id, attempt: run.attempt - 1 },
-          now() + 180,
-        );
-      if (run.trigger === "bors_staging" && run.batch && needsMembers)
+      if (!b.historical && run.status === "completed" && BUILD_WORKFLOWS.has(run.workflow)) {
+        const status = await call(this.env.FACTS, partition, "/status", { id: run.id, attempt: run.attempt });
+        const args = { id: run.id, attempt: run.attempt, created: run.created, updated: run.updated };
+        if (!repairReason("jobs", status.run, now()) && needsJobs(status))
+          this.enqueue(repo, "jobs", args, now() + 180);
+        if (!repairReason("details", status.run, now()) &&
+            !status.run?.telemetry?.coverage && !status.run?.telemetry?.phases?.length)
+          this.enqueue(repo, "details", args, now() + 600);
+      }
+      if (run.trigger === "bors_staging" && run.batch && needsMembers && run.created >= now() - 30 * DAY)
         this.enqueue(repo, "members", {
           id: run.id,
           attempt: run.attempt,
@@ -247,6 +234,7 @@ export class Control {
           run.updated,
         );
     } else if (b.jobs?.length || b.telemetry) {
+      if (b.jobs?.length && b.jobs.every((j: any) => Date.parse(j.created_at) / 1000 < now() - 90 * DAY)) return;
       const id = String(b.run_id ?? b.jobs[0].run_id);
       const location = await call(
         this.env.DIRECTORIES,
@@ -255,12 +243,16 @@ export class Control {
         { id },
       );
       if (!location.partition) {
+        if (b.jobs?.length && b.jobs.every((j: any) => Date.parse(j.created_at) / 1000 < now() - DAY)) return;
         this.enqueue(repo, "run", {
           id,
           attempt: b.attempt || b.jobs?.[0]?.run_attempt || 1,
         });
         throw new Error("Run metadata not available yet; retry delivery");
       }
+      const stored = await call(this.env.FACTS, location.partition, "/status", { id, attempt: b.attempt || b.jobs?.[0]?.run_attempt || 1 });
+      if (stored.run && !retained(stored.run, now())) return;
+      if (!stored.run && location.partition.slice(-10) < day(now() - 30 * DAY)) return;
       try {
         await call(this.env.FACTS, location.partition, "/event", {
           ...b,
@@ -295,6 +287,7 @@ export class Control {
           b.coverage.until,
         );
     } else if (b.staging) {
+      if (b.staging.created < now() - 30 * DAY) return;
       await call(this.env.DAYS, day(b.staging.created), "/staging", {
         ...b.staging,
         day: day(b.staging.created),
@@ -302,6 +295,7 @@ export class Control {
     } else if (b.observation) {
       const o = b.observation,
         at = Math.floor(Date.parse(o.observed_at) / 1000);
+      if (at < now() - 30 * DAY) return;
       if (!Number.isFinite(at))
         throw new Error("Invalid observation timestamp");
       const eligible = o.eligible || o.eligible_prs || [];
@@ -334,6 +328,7 @@ export class Control {
       }
     } else if (b.landing) {
       const { pr, at } = b.landing;
+      if (at < now() - 90 * DAY) return;
       this.ctx.storage.transactionSync(() => {
         const prior = this.sql
           .exec<{
@@ -389,6 +384,7 @@ export class Control {
   async github(
     path: string,
     binary = false,
+    optional = false,
   ): Promise<{ response: Response; data: any }> {
     if (
       !this.env.GITHUB_APP_ID ||
@@ -426,6 +422,11 @@ export class Control {
         .one().n >= Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500)
     )
       throw new Error("Rolling GitHub request budget exhausted");
+    if (optional) {
+      const recent = (this.get("detail_requests") || []).filter((at: number) => at > now() - 3600);
+      if (recent.length >= DETAIL_REQUESTS_PER_HOUR) throw new Error("Optional detail budget exhausted");
+      this.set("detail_requests", [...recent, now()]);
+    }
     const reserved = this.sql
       .exec<{
         id: number;
@@ -491,6 +492,14 @@ export class Control {
   async repair(row: any) {
     const args = JSON.parse(row.args),
       base = `repos/${row.repo}/actions`;
+    if (["jobs", "details", "members"].includes(row.kind)) {
+      const location = await call(this.env.DIRECTORIES, directory(row.repo, args.id), "/get", { id: args.id });
+      if (location.partition) {
+        const status = await call(this.env.FACTS, location.partition, "/status", { id: String(args.id), attempt: args.attempt || 1 });
+        const reason = repairReason(row.kind, status.run, now());
+        if (reason) { this.retire(row, reason); return; }
+      }
+    }
     if (row.kind === "details") {
       const location = await call(
         this.env.DIRECTORIES,
@@ -511,40 +520,42 @@ export class Control {
         return;
       }
       const telemetry: any = { job_failures: {}, coverage: "complete" };
-      const { data } = await this.github(
-        `${base}/runs/${args.id}/artifacts?name=ci-telemetry&per_page=100`,
-      );
-      const artifact = data.artifacts?.find(
-        (a: any) =>
-          !a.expired &&
-          a.size_in_bytes < 24 * 1024 * 1024 &&
-          Date.parse(a.created_at) / 1000 >= status.run.started &&
-          Date.parse(a.created_at) / 1000 <= status.run.updated,
-      );
-      if (artifact) {
-        const { data: zip } = await this.github(
-          `${base}/artifacts/${artifact.id}/zip`,
-          true,
+      if (status.run.conclusion === "success") {
+        const { data } = await this.github(
+          `${base}/runs/${args.id}/artifacts?name=ci-telemetry&per_page=100`, false, true,
         );
-        const files = unzipSync(zip, {
-          filter: (entry) =>
-            entry.name === "telemetry.json" &&
-            entry.originalSize <= 1024 * 1024,
-        });
-        if (files["telemetry.json"]) {
-          const value = JSON.parse(
-            new TextDecoder().decode(files["telemetry.json"]),
+        const artifact = data.artifacts?.find(
+          (a: any) =>
+            !a.expired &&
+            a.size_in_bytes < 24 * 1024 * 1024 &&
+            Date.parse(a.created_at) / 1000 >= status.run.started &&
+            Date.parse(a.created_at) / 1000 <= status.run.updated,
+        );
+        if (artifact) {
+          const { data: zip } = await this.github(
+            `${base}/artifacts/${artifact.id}/zip`,
+            true, true,
           );
-          if (value.schema === "tauceti-ci.telemetry/v1")
-            telemetry.phases = value.phases;
+          const files = unzipSync(zip, {
+            filter: (entry) =>
+              entry.name === "telemetry.json" &&
+              entry.originalSize <= 1024 * 1024,
+          });
+          if (files["telemetry.json"]) {
+            const value = JSON.parse(
+              new TextDecoder().decode(files["telemetry.json"]),
+            );
+            if (value.schema === "tauceti-ci.telemetry/v1")
+              telemetry.phases = value.phases;
+          }
         }
       }
       for (const j of status.job_rows
-        .filter((j: any) => j.conclusion === "failure")
+        .filter((j: any) => j.name === "sandboxed-build" && j.conclusion === "failure")
         .slice(0, 2)) {
         const { data: bytes } = await this.github(
           `${base}/jobs/${j.id}/logs`,
-          true,
+          true, true,
         );
         const failed = j.steps.find((s: any) => s.conclusion === "failure");
         const lines = new TextDecoder()
@@ -658,9 +669,7 @@ export class Control {
               { id: String(run.id), attempt: run.run_attempt || 1 },
             );
             if (
-              !status.jobs ||
-              status.job_rows.some((j: any) => j.status !== "completed") ||
-              BigInt(run.id) % 50n === 0n
+              !repairReason("jobs", status.run, now()) && needsJobs(status)
             )
               this.enqueue(
                 row.repo,
@@ -717,11 +726,7 @@ export class Control {
         delivery: `repair/run/${data.id}/${data.run_attempt}/${data.updated_at}`,
         run: data,
       });
-      if (data.status === "completed")
-        this.enqueue(row.repo, "jobs", {
-          id: String(data.id),
-          attempt: data.run_attempt || 1,
-        });
+
     } else if (row.kind === "jobs") {
       const location = await call(
         this.env.DIRECTORIES,
@@ -740,7 +745,7 @@ export class Control {
           this.enqueue(row.repo, "run", { id: args.id, attempt: args.attempt });
           throw new Error("Missing attempt metadata; repair requested");
         }
-        if (status.verified) {
+        if (status.verified || ((!args.page || args.page === 1) && !needsJobs(status))) {
           this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
           return;
         }
@@ -869,8 +874,6 @@ export class Control {
     const current: any = {
       running: {},
       queued: {},
-      builds: [],
-      staging: [],
       truncated: active.length === 200,
     };
     for (const p of active) {
@@ -878,22 +881,6 @@ export class Control {
       current.truncated = current.truncated || snapshot.truncated;
       for (const c of snapshot.counts)
         current[c.state][c.kind] = (current[c.state][c.kind] || 0) + c.count;
-      for (const job of snapshot.jobs) {
-        if (job.name === "sandboxed-build") {
-          if (current.builds.length < 100)
-            current.builds.push({
-              ...job,
-              repo: p.name.split("/").slice(0, 2).join("/"),
-            });
-          else current.truncated = true;
-        }
-      }
-      const batches = snapshot.runs.filter(
-        (r: any) => r.trigger === "bors_staging",
-      );
-      if (current.staging.length + batches.length > 100)
-        current.truncated = true;
-      current.staging.push(...batches.slice(0, 100 - current.staging.length));
       const repo = p.name.split("/").slice(0, 2).join("/");
       for (const r of [
         ...snapshot.runs.map((r: any) => ({
@@ -982,6 +969,14 @@ export class Control {
       pending_repairs: this.sql
         .exec<{ n: number }>("SELECT COUNT(*) n FROM repairs")
         .one().n,
+      collection_policy: {
+        auxiliary_jobs: "webhook observations",
+        recovery_hours: 24,
+        successful_phase_sample: "one in twenty",
+        optional_requests_per_hour: DETAIL_REQUESTS_PER_HOUR,
+        raw_general_days: 30, raw_pr_build_days: 90,
+        historical_recovery_retired: Object.values(this.get("retired_repairs") || {}).reduce((n: number, value: any) => n + Number(value), 0),
+      },
       history: {
         status:
           this.get("history_since") <= clock - 89 * DAY ? "ready" : "importing",
@@ -1018,9 +1013,7 @@ export class Control {
         } catch (error) {
           errors.all = String(error);
         }
-        const pending = days
-          .filter((d) => d.day >= day(clock - DAY))
-          .reduce((n, d) => n + (d.data.daily["failure/pending"] || 0), 0);
+        const pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM repairs WHERE kind='details'").one().n;
         const missingMembers = days.flatMap((d) => d.data.staging || [])
           .filter((r) => r.created >= clock - 30 * DAY && !r.members?.length).length;
         const membershipRepairs = this.sql.exec<{ n: number }>(
@@ -1054,7 +1047,7 @@ export class Control {
                 : mainSource;
           const metadata = {
             source_through: through ? iso(through) : null,
-            coverage: "observed_with_reconciliation",
+            coverage: "webhook_observed_with_bounded_recovery",
             complete: false,
             pending: group === "details" ? pending :
               group === "staging" ? Math.max(missingMembers, membershipRepairs) : 0,
@@ -1113,16 +1106,7 @@ export class Control {
             };
           }
         }
-        try {
-          await this.env.ARCHIVE.put(
-            `public/v1/ci/assets/${clock}/series.json`,
-            JSON.stringify(days),
-            { httpMetadata: { contentType: "application/json" } },
-          );
-          manifest.series_url = `/v1/ci/assets/${clock}/series.json`;
-        } catch (error) {
-          this.set("series_error", String(error));
-        }
+        delete manifest.series_url;
         this.set("charts_at", clock);
       }
     }
@@ -1241,6 +1225,11 @@ export class Control {
     try {
       const clock = now();
       await this.flushLandings();
+      const pruning = await this.pruneRepairs(this.get("repair_prune_cursor") || "");
+      this.set("repair_prune_cursor", pruning.cursor || "");
+      const repositories = allowed(this.env), shard = Math.floor(clock / 60) % Math.max(1, repositories.length * 64);
+      if (repositories.length)
+        await call(this.env.DIRECTORIES, `${repositories[Math.floor(shard / 64)]}/${shard % 64}`, "/prune");
       if (clock - (this.get("inventory_scheduled") || 0) >= 900) {
         const previous = this.get("inventory_scheduled"),
           since = previous || clock - 900;
@@ -1276,16 +1265,18 @@ export class Control {
       const deadline = Date.now() + 20000;
       for (const row of this.sql
         .exec(
-          `SELECT * FROM repairs WHERE due<=? AND kind!='members'
+          `SELECT * FROM repairs WHERE due<=? AND kind!='members' AND (kind!='details' OR ?=1)
           ORDER BY CASE
             WHEN kind='run' AND json_extract(args,'$.urgent')=1 THEN 0
             WHEN kind='inventory' AND COALESCE(json_extract(args,'$.archival'),0)=0
               AND json_extract(args,'$.until')>=? THEN 0
+            WHEN kind='details' THEN 3
             WHEN COALESCE(json_extract(args,'$.archival'),0)=0 THEN 1 ELSE 2 END,
             CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
             COALESCE(json_extract(args,'$.urgent'),0) DESC,
             CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 12`,
           clock,
+          (this.get("detail_requests") || []).filter((at: number) => at > clock - 3600).length < DETAIL_REQUESTS_PER_HOUR ? 1 : 0,
           clock - 1800,
         )
         .toArray()) {
@@ -1324,6 +1315,7 @@ export class Control {
                 : Math.min(3600, 60 * 2 ** Math.min(6, Number(row.failures)))),
             row.key,
           );
+          if (/Optional detail budget/.test(String(error))) continue;
           if (/budget|quota|configured|authentication/.test(String(error)))
             break;
         }
@@ -1360,10 +1352,15 @@ export class Control {
           clock,
           candidate.name,
         );
-        if (builds)
-          await call(this.env.DAYS, candidate.name.slice(-10), "/compact", {
+        if (builds) {
+          const compacted = await call(this.env.DAYS, candidate.name.slice(-10), "/compact", {
             day: candidate.name.slice(-10),
           });
+          if (result.done && compacted.done) {
+            this.sql.exec("DELETE FROM partitions WHERE name=?", candidate.name);
+            this.sql.exec("DELETE FROM meta WHERE key IN (?,?)", key, `partition_revision/${candidate.name}`);
+          }
+        }
       }
       this.sql.exec("DELETE FROM attempts WHERE at<?", clock - 2 * DAY);
       this.sql.exec("DELETE FROM deliveries WHERE at<?", clock - 14 * DAY);
@@ -1371,6 +1368,11 @@ export class Control {
       this.sql.exec("DELETE FROM leases WHERE expires<?", clock - DAY);
       this.sql.exec("DELETE FROM witnesses WHERE updated<?", clock - 2 * DAY);
       this.sql.exec("DELETE FROM comparisons WHERE at<?", clock - 30 * DAY);
+      this.sql.exec("DELETE FROM gaps WHERE at<?", clock - 90 * DAY);
+      this.sql.exec("DELETE FROM coverage WHERE until<?", clock - 30 * DAY);
+      this.sql.exec("DELETE FROM annotations WHERE at<?", clock - 90 * DAY);
+      this.sql.exec("DELETE FROM landings WHERE at<?", clock - 90 * DAY);
+      this.sql.exec("DELETE FROM meta WHERE key LIKE 'active_checked/%' AND CAST(value AS INTEGER)<?", clock - 90 * DAY);
     } finally {
       this.set("lease", 0);
     }
@@ -1439,7 +1441,7 @@ export class Control {
           .map((row) => ({ ...row, args: JSON.parse(String(row.args)) })),
       );
     if (path === "/prune-repairs")
-      return json(await this.pruneRepairs(b.cursor || ""));
+      return json(await this.pruneRepairs(b.cursor || "", b.limit));
     if (path === "/backlog") {
       const rows = this.sql.exec<{ name: string }>(
         "SELECT name FROM partitions WHERE name>? ORDER BY name LIMIT 10",
@@ -1476,6 +1478,8 @@ export class Control {
             n: number;
           }>("SELECT COUNT(*) n FROM partitions WHERE active>0")
           .one().n,
+        retired_repairs: this.get("retired_repairs") || {},
+        detail_requests_last_hour: (this.get("detail_requests") || []).filter((at: number) => at > now() - 3600).length,
         pending: this.sql
           .exec(
             "SELECT kind,COUNT(*) count,MIN(due) oldest FROM repairs GROUP BY kind",

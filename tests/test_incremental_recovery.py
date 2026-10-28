@@ -91,7 +91,7 @@ class RecoveryTests(unittest.TestCase):
         ranges=[]
         for end in (self.since+collect.dt.timedelta(minutes=15),self.until):
             api=fixtures.CollectionAPI([],budget=80)
-            with patch.object(inc,'observations') as observations,patch.object(collect,'collect_main'),                     patch.object(collect,'snapshot_settings'),contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(inc,'observations') as observations,patch.object(collect,'collect_main'),                     contextlib.redirect_stdout(io.StringIO()):
                 inc.run(api,self.index,['TauCeti'],end,'growing',self.checkpoint,
                         since=self.since,requested_until=requested)
             observations.assert_not_called()
@@ -162,7 +162,7 @@ class RecoveryTests(unittest.TestCase):
         for _ in range(2):
             api=fixtures.CollectionAPI([],budget=80)
             with patch.object(inc,'observations'),patch.object(collect,'collect_main'), \
-                    patch.object(collect,'snapshot_settings'),contextlib.redirect_stdout(io.StringIO()):
+                    contextlib.redirect_stdout(io.StringIO()):
                 inc.run(api,self.index,['TauCeti'],self.until,'backfill',self.checkpoint,since=since)
             requests.extend(api.requests)
         self.assertEqual(len(requests),49)  # 24.5 hours at 30-minute windows, exactly once.
@@ -174,7 +174,7 @@ class RecoveryTests(unittest.TestCase):
         inc.save_state('main-cursor.json',{'TauCeti':'2026-10-14T18:00:00Z'})
         api=fixtures.CollectionAPI([],budget=80)
         with patch.object(inc,'observations'),patch.object(collect,'collect_main') as main, \
-                patch.object(collect,'snapshot_settings'),contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()):
             inc.run(api,self.index,['TauCeti'],self.until,'main',self.checkpoint)
         self.assertEqual(collect.iso(main.call_args.args[2]),'2026-10-14T12:00:00Z')
         self.assertEqual(inc.read_state('main-cursor.json')['TauCeti'],collect.iso(self.until))

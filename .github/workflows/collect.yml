@@ -4,15 +4,12 @@ name: collect
 # publish completed batches during the run; the 30-minute soft deadline leaves
 # room for final publication before the 55-minute runner timeout.
 
+# Explicit analysis/export only; the dashboard uses the live reporting service.
 on:
-  push:
-    branches: [main]
-    paths: ['collector/**', '.github/workflows/collect.yml']
-  schedule:
-    - cron: "3,23,43 * * * *"
   workflow_dispatch:
     inputs:
-      since: { description: "Backfill from (e.g. 72h, or an ISO time); empty resumes from the cursor", required: false, default: "" }
+      analysis: { description: "Collect optional artifacts, logs and commit comparisons", type: boolean, default: false }
+      since: { description: "Backfill from (e.g. 72h, or an ISO time); empty resumes from the cursor", required: false, default: "24h" }
       until: { description: "Until (ISO time; default now)", required: false, default: "" }
 
 permissions:
@@ -35,7 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: TauCetiProject/TauCetiTools
-          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          ref: a8b16c3dd0c0730a1963052cb520808e161222ef
           path: .tauceti-tools
           persist-credentials: false
       - name: Use the shared collector
@@ -65,11 +62,13 @@ jobs:
       - name: Collect
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          COLLECT_ANALYSIS: ${{ inputs.analysis }}
           BACKFILL_SINCE: ${{ inputs.since }}
           BACKFILL_UNTIL: ${{ inputs.until }}
         run: |
           set -o pipefail
           args=()
+          [ "$COLLECT_ANALYSIS" = "true" ] && args+=(--analysis)
           [ -n "$BACKFILL_SINCE" ] && args+=(--since "$BACKFILL_SINCE")
           [ -n "$BACKFILL_UNTIL" ] && args+=(--until "$BACKFILL_UNTIL")
           python3 -m collector.incremental --push --max-calls 4500 --max-seconds 1800 \
