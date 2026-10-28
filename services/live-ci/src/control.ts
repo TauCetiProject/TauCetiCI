@@ -143,6 +143,23 @@ export class Control {
       cursor: rows.length === limit ? rows.at(-1)!.key : null,
     };
   }
+  async canCloseDay(date: string): Promise<boolean> {
+    // Older run partitions can contribute across midnight. Never close over
+    // undelivered corrections, including those from another repository.
+    const writers = this.sql.exec<{ name: string }>(
+      "SELECT name FROM partitions WHERE substr(name,-10)<=? ORDER BY name LIMIT 101", date,
+    ).toArray();
+    // Oldest days close first; pruning them makes later days eligible. Keep
+    // cross-object reads below the per-invocation request limit.
+    if (writers.length > 100) return false;
+    for (let i = 0; i < writers.length; i += 4) {
+      const statuses = await Promise.allSettled(writers.slice(i, i + 4).map((writer) =>
+        call(this.env.FACTS, writer.name, "/backlog")));
+      if (statuses.some((status) => status.status !== "fulfilled" || status.value.outbox || status.value.active_jobs))
+        return false;
+    }
+    return true;
+  }
   async ingest(b: any) {
     if (
       this.sql.exec("SELECT 1 FROM deliveries WHERE id=?", b.delivery).toArray()
@@ -1334,8 +1351,9 @@ export class Control {
         .exec<{
           name: string;
         }>(
-          "SELECT name FROM partitions WHERE active=0 AND substr(name,-10)<? ORDER BY seen LIMIT 4",
+          "SELECT name FROM partitions WHERE substr(name,-10)<? AND (active=0 OR substr(name,-10)<?) ORDER BY seen LIMIT 4",
           day(clock - 30 * DAY),
+          day(clock - 90 * DAY),
         )
         .toArray();
       for (const candidate of candidates) {
@@ -1346,13 +1364,13 @@ export class Control {
           cursor: this.get(key),
           limit: 100,
         });
-        this.set(key, result.done ? null : result.cursor);
+        this.set(key, result.done ? null : (result.cursor ?? null));
         this.sql.exec(
           "UPDATE partitions SET seen=? WHERE name=?",
           clock,
           candidate.name,
         );
-        if (builds) {
+        if (builds && result.done && await this.canCloseDay(candidate.name.slice(-10))) {
           const compacted = await call(this.env.DAYS, candidate.name.slice(-10), "/compact", {
             day: candidate.name.slice(-10),
           });

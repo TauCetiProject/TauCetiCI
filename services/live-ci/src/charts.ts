@@ -278,7 +278,7 @@ export function renderCharts(
   const landed: Series = {
     name: "PR arrivals on main",
     dashed: true,
-    values: days.map((d) => d.data.landings?.length || 0),
+    values: days.map((d) => d.data.daily["landed-prs"] ?? d.data.landings?.length ?? 0),
   };
   render("ci-merge-queue.svg", () =>
     frame(

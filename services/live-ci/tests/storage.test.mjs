@@ -150,6 +150,36 @@ test("legacy cold days acknowledge late writes after their detail archives expir
   assert.deepEqual(saved.landings, []);
 });
 
+test("a correction during summary upload delays closure and remains in the saved total", async (t) => {
+  let release, entered;
+  const paused = new Promise((resolve) => { entered = resolve; });
+  const resume = new Promise((resolve) => { release = resolve; });
+  let first = true, saved;
+  const env = {
+    ARCHIVE: { put: async (_key, data) => {
+      if (first) { first = false; entered(); await resume; }
+      saved = JSON.parse(data);
+    } },
+    CONTROL: { idFromName: (id) => id, get: () => ({ fetch: async () => Response.json({}) }) },
+  };
+  const aggregate = new DayAggregate(context(t), env), date = '2026-01-01';
+  const delta = async (id, amount) => aggregate.fetch(new Request('https://internal/delta', {
+    method: 'POST', body: JSON.stringify({ id, day: date,
+      rows: [{ bucket: 0, metric: 'pr-total', value: 0, amount }] }),
+  }));
+  await delta('initial', 10);
+  await aggregate.alarm();
+  const closing = aggregate.compact(date);
+  await paused;
+  await delta('racing', 1);
+  release();
+  assert.equal((await closing).reason, 'concurrent correction');
+  assert.ok(!aggregate.meta('closed'));
+  await aggregate.alarm();
+  for (let i = 0; i < 5; i++) if ((await aggregate.compact(date)).done) break;
+  assert.equal(saved.daily['pr-total'], 11);
+});
+
 test("a burst over drain capacity settles without regenerating interval updates", async (t) => {
   const f = fixture(t, 100);
   await f.catchUp();

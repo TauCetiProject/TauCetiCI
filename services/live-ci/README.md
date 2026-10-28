@@ -279,7 +279,7 @@ and SQLite export must remain available.
 
 Tests cover transactional replay, reordered deliveries, attempts, exact
 percentiles, phase corrections, synthetic queued cancellations, quota pauses,
-HMAC authentication, cold restore and public-read isolation. A production
+HMAC authentication, closed-day migration and public-read isolation. A production
 archive cohort is checked against the existing Python daily/fleet calculations.
 The 1x/10x fixture checks contribution growth and independence from retained
 history. Its local timings are not evidence of Cloudflare network capacity;

@@ -15,19 +15,12 @@ import {
   type Job,
 } from "./model";
 import { call, json, now, type Env } from "./types";
+import { retained } from "./policy";
 async function scheduleSoon(ctx: DurableObjectState) {
   const next = Date.now() + 1000;
   const scheduled = await ctx.storage.getAlarm();
   // A busy partition must not keep postponing its notification indefinitely.
   if (scheduled === null || scheduled > next) await ctx.storage.setAlarm(next);
-}
-async function archiveRead(env: Env, key: string): Promise<any> {
-  const object = await env.ARCHIVE.get(key + ".gz");
-  return object
-    ? new Response(
-        object.body.pipeThrough(new DecompressionStream("gzip")),
-      ).json()
-    : null;
 }
 /** Sharded locator: workflow_job does not carry its parent run creation date. */
 export class RunDirectory {
@@ -285,7 +278,7 @@ export class FactPartition {
         .toArray();
       for (const row of rows) {
         const run = this.run(row.run, row.attempt);
-        if (run) {
+        if (run && retained(run, now())) {
           const job = JSON.parse(row.data);
           job.kind = reportingKind(job.kind, job.labels, job.runnerName);
           this.replaceJob(run, job, now());
@@ -390,7 +383,7 @@ export class FactPartition {
         .exec<{ id: string; attempt: number; data: string }>(
           `SELECT * FROM runs WHERE (id>? OR (id=? AND attempt>?)) AND json_extract(data,'$.created')<?
         AND (?=1 OR json_extract(data,'$.workflow')!=?)
-        AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.run=runs.id AND jobs.attempt=runs.attempt AND jobs.active=1)
+        AND (?=1 OR NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.run=runs.id AND jobs.attempt=runs.attempt AND jobs.active=1))
         ORDER BY id,attempt LIMIT ?`,
           b.cursor?.id || "",
           b.cursor?.id || "",
@@ -398,6 +391,7 @@ export class FactPartition {
           cutoff,
           b.builds ? 1 : 0,
           WORKFLOW,
+          b.builds ? 1 : 0,
           Math.min(100, b.limit || 20),
         )
         .toArray();
@@ -449,35 +443,6 @@ export class FactPartition {
           ? { id: last.id, attempt: last.attempt }
           : b.cursor || null,
       });
-    }
-    if (path === "/restore") {
-      if (this.run(b.id, b.attempt)) return json({ restored: false });
-      const archive = await archiveRead(
-        this.env,
-        `facts/${b.partition}/${b.id}/${b.attempt}.json`,
-      );
-      if (!archive) return json({ restored: false });
-      this.ctx.storage.transactionSync(() => {
-        if (this.run(b.id, b.attempt)) return;
-        this.set("partition", b.partition);
-        this.sql.exec(
-          "INSERT INTO runs VALUES (?,?,?)",
-          archive.run.id,
-          archive.run.attempt,
-          archive.run.data,
-        );
-        for (const j of archive.jobs)
-          this.sql.exec(
-            "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?)",
-            j.id,
-            j.run,
-            j.attempt,
-            j.active,
-            j.data,
-            j.contribution,
-          );
-      });
-      return json({ restored: true });
     }
     if (path === "/current") {
       const jobs = this.sql
@@ -589,38 +554,6 @@ export class FactPartition {
       return json({ processed: rows.length, changed, unidentified, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
     }
     if (path === "/event") {
-      const runID = String(
-          b.run?.id ?? b.run?.run_id ?? b.run_id ?? b.jobs?.[0]?.run_id,
-        ),
-        attempt =
-          b.run?.run_attempt ?? b.attempt ?? b.jobs?.[0]?.run_attempt ?? 1;
-      if (!this.run(runID, attempt)) {
-        const archived = await archiveRead(
-          this.env,
-          `facts/${b.partition}/${runID}/${attempt}.json`,
-        );
-        if (archived) {
-          this.ctx.storage.transactionSync(() => {
-            if (this.run(runID, attempt)) return;
-            this.sql.exec(
-              "INSERT INTO runs VALUES (?,?,?)",
-              archived.run.id,
-              archived.run.attempt,
-              archived.run.data,
-            );
-            for (const j of archived.jobs)
-              this.sql.exec(
-                "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?)",
-                j.id,
-                j.run,
-                j.attempt,
-                j.active,
-                j.data,
-                j.contribution,
-              );
-          });
-        }
-      }
       this.ctx.storage.transactionSync(() => {
         this.set("partition", b.partition);
         if (
@@ -925,6 +858,7 @@ export class DayAggregate {
     if (!this.meta("closed")) {
       const revision = this.meta("revision") || 0;
       const archived = this.meta("cold") && await this.env.ARCHIVE.get(`summaries/${date}.json`);
+      if (this.meta("cold") && !archived) return { done: false, reason: "cold summary missing" };
       const summary = archived ? await archived.json() : this.summary();
       await this.env.ARCHIVE.put(`summaries/${date}.json`, JSON.stringify({
         daily: { ...summary.daily, "landed-prs": summary.landings?.length || summary.daily?.["landed-prs"] || 0 },

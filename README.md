@@ -62,7 +62,7 @@ the records directly: `SELECT * FROM read_ndjson('records/runs/TauCeti/**/*.ndjs
 ## Collection
 
 [`collect.yml`](.github/workflows/collect.yml) is manual-only; the live dashboard uses job webhooks and bounded repairs. GitHub may
-delay scheduled runs. Each invocation starts no requests after thirty minutes, checkpoints
+delay dispatched runs. Each invocation starts no requests after thirty minutes, checkpoints
 completed records to git about every two minutes, and performs a final push before the
 55-minute runner timeout. API exhaustion ends a phase without waiting for a quota reset.
 Before each checkpoint, uncommitted page/job files are packed by kind, repository and day;
