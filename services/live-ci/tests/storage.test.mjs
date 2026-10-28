@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { buildSync } from "esbuild";
+import { build, buildSync } from "esbuild";
 
 const code = buildSync({
   entryPoints: ["src/storage.ts"], bundle: true, platform: "node", format: "esm", write: false,
@@ -40,6 +40,40 @@ function context(t) {
     deleteAlarm: async () => { alarm = null; },
   } };
 }
+
+test("legacy and retried orphan repairs expire without discarding fresh metadata work", async (t) => {
+  let clock = Date.parse('2026-10-28T12:00:00Z');
+  t.mock.method(Date, 'now', () => clock);
+  const namespace = (value) => ({ idFromName: (id) => id,
+    get: () => ({ fetch: async () => Response.json(value) }) });
+  globalThis.__orphanTestEnv = {
+    DIRECTORIES: namespace({ partition: 'TauCetiProject/TauCeti/2026-10-26' }),
+    FACTS: namespace({ jobs: 0, job_rows: [], verified: false }),
+  };
+  t.after(() => { delete globalThis.__orphanTestEnv; });
+  const bundled = await build({ entryPoints: ['src/control.ts'], bundle: true,
+    platform: 'node', format: 'esm', write: false, plugins: [{ name: 'test-bindings', setup(builder) {
+      builder.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: 'bindings', namespace: 'test' }));
+      builder.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: 'export const env = globalThis.__orphanTestEnv;' }));
+    } }] });
+  const { Control } = await import('data:text/javascript;base64,' + Buffer.from(bundled.outputFiles[0].text).toString('base64'));
+  const ctx = context(t), repo = 'TauCetiProject/TauCeti';
+  ctx.storage.sql.exec('CREATE TABLE repairs(key TEXT PRIMARY KEY,repo TEXT,kind TEXT,args TEXT,due INTEGER,failures INTEGER DEFAULT 0)');
+  ctx.storage.sql.exec('INSERT INTO repairs VALUES (?,?,?,?,?,0)', 'legacy', repo,
+    'details', JSON.stringify({ id: '100', attempt: 1 }), clock / 1000 - 2 * 86400);
+  const control = new Control(ctx);
+  assert.equal((await control.pruneRepairs()).retired, 1);
+  control.enqueue(repo, 'jobs', { id: '200', attempt: 1 });
+  const original = ctx.storage.sql.exec('SELECT enqueued FROM repairs').one().enqueued;
+  clock += 2 * 86400 * 1000;
+  ctx.storage.sql.exec('UPDATE repairs SET due=?', clock / 1000 + 60);
+  control.enqueue(repo, 'jobs', { id: '200', attempt: 1, urgent: true });
+  assert.equal(ctx.storage.sql.exec('SELECT enqueued FROM repairs').one().enqueued, original);
+  control.enqueue(repo, 'run', { id: '300', attempt: 1 });
+  const result = await control.pruneRepairs();
+  assert.equal(result.retired, 1);
+  assert.equal(ctx.storage.sql.exec('SELECT kind FROM repairs').one().kind, 'run');
+});
 
 function fixture(t, count) {
   let clock = Date.parse("2026-10-27T12:00:00Z"), loseAcknowledgement = false;
