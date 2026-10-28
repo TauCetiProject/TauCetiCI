@@ -103,6 +103,83 @@ function fixture(t, count) {
   };
 }
 
+test("raw fact retirement preserves applied metrics without creating another archive", async (t) => {
+  const f = fixture(t, 1);
+  f.run.status = 'completed';
+  f.run.conclusion = 'success';
+  f.run.updated = f.run.created + 240;
+  f.ctx.storage.sql.exec('UPDATE runs SET data=?', JSON.stringify(f.run));
+  const old = JSON.parse(f.ctx.storage.sql.exec('SELECT data FROM jobs').one().data);
+  f.fact.replaceJob(f.run, { ...old, status: 'completed', conclusion: 'success',
+    started: f.run.created + 60, completed: f.run.created + 240, assigned: true }, Date.now() / 1000);
+  await f.catchUp();
+  const before = [...f.days.values()].map((day) => day.summary().daily);
+  assert.ok(before.some((daily) => daily['minutes/github'] === 3));
+  f.advance(91 * 86400);
+  const result = await (await f.fact.fetch(new Request('https://internal/archive', {
+    method: 'POST', body: JSON.stringify({ builds: true }),
+  }))).json();
+  assert.equal(result.done, true);
+  assert.equal(f.ctx.storage.sql.exec('SELECT COUNT(*) n FROM jobs').one().n, 0);
+  assert.equal(f.ctx.storage.sql.exec('SELECT COUNT(*) n FROM runs').one().n, 0);
+  assert.deepEqual([...f.days.values()].map((day) => day.summary().daily), before);
+});
+
+test("legacy cold days acknowledge late writes after their detail archives expire", async (t) => {
+  const reads = [], writes = new Map(), date = '2026-01-01';
+  const summary = { daily: { 'pr-total': 10 }, landings: [{ pr: 1 }], fleet: [], observations: [], staging: [] };
+  const env = { ARCHIVE: {
+    get: async (key) => {
+      reads.push(key);
+      return { body: new Response(writes.get(key) || JSON.stringify(summary)).body,
+        json: async () => JSON.parse(writes.get(key) || JSON.stringify(summary)) };
+    },
+    put: async (key, data) => writes.set(key, data),
+  } };
+  const day = new DayAggregate(context(t), env);
+  day.set('cold', { pages: ['expired-detail-page'] });
+  const response = await day.fetch(new Request('https://internal/delta', {
+    method: 'POST', body: JSON.stringify({ day: date, id: 'late', rows: [] }),
+  }));
+  assert.equal((await response.json()).closed, true);
+  for (let i = 0; i < 5; i++) if ((await day.compact(date)).done) break;
+  assert.ok(reads.every((key) => key.startsWith('summaries/')));
+  const saved = JSON.parse(writes.get(`summaries/${date}.json`));
+  assert.equal(saved.daily['pr-total'], 10);
+  assert.equal(saved.daily['landed-prs'], 1);
+  assert.deepEqual(saved.landings, []);
+});
+
+test("a correction during summary upload delays closure and remains in the saved total", async (t) => {
+  let release, entered;
+  const paused = new Promise((resolve) => { entered = resolve; });
+  const resume = new Promise((resolve) => { release = resolve; });
+  let first = true, saved;
+  const env = {
+    ARCHIVE: { put: async (_key, data) => {
+      if (first) { first = false; entered(); await resume; }
+      saved = JSON.parse(data);
+    } },
+    CONTROL: { idFromName: (id) => id, get: () => ({ fetch: async () => Response.json({}) }) },
+  };
+  const aggregate = new DayAggregate(context(t), env), date = '2026-01-01';
+  const delta = async (id, amount) => aggregate.fetch(new Request('https://internal/delta', {
+    method: 'POST', body: JSON.stringify({ id, day: date,
+      rows: [{ bucket: 0, metric: 'pr-total', value: 0, amount }] }),
+  }));
+  await delta('initial', 10);
+  await aggregate.alarm();
+  const closing = aggregate.compact(date);
+  await paused;
+  await delta('racing', 1);
+  release();
+  assert.equal((await closing).reason, 'concurrent correction');
+  assert.ok(!aggregate.meta('closed'));
+  await aggregate.alarm();
+  for (let i = 0; i < 5; i++) if ((await aggregate.compact(date)).done) break;
+  assert.equal(saved.daily['pr-total'], 11);
+});
+
 test("a burst over drain capacity settles without regenerating interval updates", async (t) => {
   const f = fixture(t, 100);
   await f.catchUp();

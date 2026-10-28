@@ -119,6 +119,22 @@ function legend(series: Series[], top = 77, left = 64): string {
     )
     .join("");
 }
+export function phaseSeries(days: { data: any }[]): Series[] {
+  const names = new Set<string>();
+  for (const d of days) for (const key of Object.keys(d.data.daily)) {
+    if (key.startsWith("phase/")) names.add(key.slice(6));
+    if (key.startsWith("sample-phase/")) names.add(key.slice(13));
+  }
+  return [...names].sort().map((name) => ({
+    name,
+    values: days.map((d) => {
+      const count = d.data.daily["phase-sample-count"] || 0;
+      return count ? (d.data.daily[`sample-phase/${name}`] || 0) / count :
+        (d.data.daily[`phase/${name}`] || 0) / (d.data.daily["phase-count"] || 1);
+    }),
+  }));
+}
+
 export function renderCharts(
   days: { day: string; data: any }[],
   clock: number,
@@ -189,19 +205,14 @@ export function renderCharts(
     ].sort();
   plot(
     "ci-build-phases.svg",
-    "Mean minutes per successful PR build",
-    keys("phase/").map((k) => ({
-      name: k.slice(6),
-      values: daily(k).map(
-        (v, i) => v / (days[i].data.daily["phase-count"] || 1),
-      ),
-    })),
+    "Mean PR build phases (sampled splits; coarse timings otherwise)",
+    phaseSeries(days),
     { stack: true },
   );
   plot(
     "ci-failures.svg",
     "Failed PR builds by cause",
-    keys("failure/").map((k) => ({ name: k.slice(8), values: daily(k) })),
+    keys("failure/").map((k) => ({ name: k === "failure/pending" ? "unclassified" : k.slice(8), values: daily(k) })),
     { stack: true },
   );
   // Separate rate plot avoids mixing counts and shares on one axis.
@@ -219,9 +230,9 @@ export function renderCharts(
     frame(
       "Failed PR builds and failure rate",
       note,
-      legend(keys("failure/").map((k) => ({ name: k.slice(8), values: [] }))) +
+      legend(keys("failure/").map((k) => ({ name: k === "failure/pending" ? "unclassified" : k.slice(8), values: [] }))) +
         panel(
-          keys("failure/").map((k) => ({ name: k.slice(8), values: daily(k) })),
+          keys("failure/").map((k) => ({ name: k === "failure/pending" ? "unclassified" : k.slice(8), values: daily(k) })),
           labels,
           { top: 150, bottom: 330, stack: true },
         ) +
@@ -267,7 +278,7 @@ export function renderCharts(
   const landed: Series = {
     name: "PR arrivals on main",
     dashed: true,
-    values: days.map((d) => d.data.landings?.length || 0),
+    values: days.map((d) => d.data.daily["landed-prs"] ?? d.data.landings?.length ?? 0),
   };
   render("ci-merge-queue.svg", () =>
     frame(

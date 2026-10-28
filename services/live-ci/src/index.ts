@@ -9,6 +9,7 @@ import {
   type Env,
 } from "./types";
 import { validTelemetry } from "./model";
+import { compactEvent } from "./policy";
 import { verifyPublisher } from "./oidc";
 export { RunDirectory, FactPartition, DayAggregate } from "./storage";
 export { Control } from "./control";
@@ -96,6 +97,7 @@ function validateEvent(b: any, env: Env) {
 }
 async function archiveEvent(env: Env, event: any) {
   validateEvent(event, env);
+  event = compactEvent(event);
   const key = `inbox/${new Date().toISOString().slice(0, 10)}/${await digest(event.delivery)}.json`;
   // Retain the body before enqueueing. A failed enqueue is safely retryable.
   await env.ARCHIVE.put(key, JSON.stringify(event), {

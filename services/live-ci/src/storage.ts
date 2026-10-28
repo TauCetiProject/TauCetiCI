@@ -15,31 +15,13 @@ import {
   type Job,
 } from "./model";
 import { call, json, now, type Env } from "./types";
+import { retained } from "./policy";
 async function scheduleSoon(ctx: DurableObjectState) {
   const next = Date.now() + 1000;
   const scheduled = await ctx.storage.getAlarm();
   // A busy partition must not keep postponing its notification indefinitely.
   if (scheduled === null || scheduled > next) await ctx.storage.setAlarm(next);
 }
-async function archiveRead(env: Env, key: string): Promise<any> {
-  const object = await env.ARCHIVE.get(key + ".gz");
-  return object
-    ? new Response(
-        object.body.pipeThrough(new DecompressionStream("gzip")),
-      ).json()
-    : null;
-}
-async function archiveWrite(env: Env, key: string, value: any) {
-  const compressed = await new Response(
-    new Blob([JSON.stringify(value)])
-      .stream()
-      .pipeThrough(new CompressionStream("gzip")),
-  ).arrayBuffer();
-  await env.ARCHIVE.put(key + ".gz", compressed, {
-    httpMetadata: { contentType: "application/json", contentEncoding: "gzip" },
-  });
-}
-
 /** Sharded locator: workflow_job does not carry its parent run creation date. */
 export class RunDirectory {
   constructor(
@@ -52,6 +34,13 @@ export class RunDirectory {
   }
   async fetch(request: Request) {
     const b: any = await request.json();
+    if (new URL(request.url).pathname === "/prune") {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE substr(partition,-10)<? LIMIT 1000)",
+        day(now() - 90 * DAY),
+      );
+      return json({ ok: true });
+    }
     if (new URL(request.url).pathname === "/put")
       this.ctx.storage.sql.exec(
         "INSERT INTO runs VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET partition=excluded.partition,seen=excluded.seen",
@@ -289,7 +278,7 @@ export class FactPartition {
         .toArray();
       for (const row of rows) {
         const run = this.run(row.run, row.attempt);
-        if (run) {
+        if (run && retained(run, now())) {
           const job = JSON.parse(row.data);
           job.kind = reportingKind(job.kind, job.labels, job.runnerName);
           this.replaceJob(run, job, now());
@@ -388,13 +377,13 @@ export class FactPartition {
       if (this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length)
         return json({ done: false, reason: "outbox pending" });
       const cutoff = now() - (b.builds ? 90 : 30) * DAY;
-      // Archive by complete run, in bounded pages. The previous contribution is
-      // retained in the archive, so restoring it does not re-add any metrics.
+      // Retire raw facts after the correction window, preserving applied metrics.
+      // Compact daily summaries remain available after raw evidence expires.
       const eligible = this.sql
         .exec<{ id: string; attempt: number; data: string }>(
           `SELECT * FROM runs WHERE (id>? OR (id=? AND attempt>?)) AND json_extract(data,'$.created')<?
         AND (?=1 OR json_extract(data,'$.workflow')!=?)
-        AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.run=runs.id AND jobs.attempt=runs.attempt AND jobs.active=1)
+        AND (?=1 OR NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.run=runs.id AND jobs.attempt=runs.attempt AND jobs.active=1))
         ORDER BY id,attempt LIMIT ?`,
           b.cursor?.id || "",
           b.cursor?.id || "",
@@ -402,6 +391,7 @@ export class FactPartition {
           cutoff,
           b.builds ? 1 : 0,
           WORKFLOW,
+          b.builds ? 1 : 0,
           Math.min(100, b.limit || 20),
         )
         .toArray();
@@ -409,9 +399,6 @@ export class FactPartition {
         const jobs = this.sql
           .exec("SELECT * FROM jobs WHERE run=? AND attempt=?", r.id, r.attempt)
           .toArray();
-        const archived = { partition, run: r, jobs };
-        const key = `facts/${partition}/${r.id}/${r.attempt}.json`;
-        await archiveWrite(this.env, key, archived);
         this.ctx.storage.transactionSync(() => {
           // A concurrent correction must not be erased by an older archive.
           const current = this.sql
@@ -446,6 +433,7 @@ export class FactPartition {
             r.id,
             r.attempt,
           );
+          this.sql.exec("DELETE FROM meta WHERE key=?", `verified/${r.id}/${r.attempt}`);
         });
       }
       const last = eligible.at(-1);
@@ -455,35 +443,6 @@ export class FactPartition {
           ? { id: last.id, attempt: last.attempt }
           : b.cursor || null,
       });
-    }
-    if (path === "/restore") {
-      if (this.run(b.id, b.attempt)) return json({ restored: false });
-      const archive = await archiveRead(
-        this.env,
-        `facts/${b.partition}/${b.id}/${b.attempt}.json`,
-      );
-      if (!archive) return json({ restored: false });
-      this.ctx.storage.transactionSync(() => {
-        if (this.run(b.id, b.attempt)) return;
-        this.set("partition", b.partition);
-        this.sql.exec(
-          "INSERT INTO runs VALUES (?,?,?)",
-          archive.run.id,
-          archive.run.attempt,
-          archive.run.data,
-        );
-        for (const j of archive.jobs)
-          this.sql.exec(
-            "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?)",
-            j.id,
-            j.run,
-            j.attempt,
-            j.active,
-            j.data,
-            j.contribution,
-          );
-      });
-      return json({ restored: true });
     }
     if (path === "/current") {
       const jobs = this.sql
@@ -595,38 +554,6 @@ export class FactPartition {
       return json({ processed: rows.length, changed, unidentified, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
     }
     if (path === "/event") {
-      const runID = String(
-          b.run?.id ?? b.run?.run_id ?? b.run_id ?? b.jobs?.[0]?.run_id,
-        ),
-        attempt =
-          b.run?.run_attempt ?? b.attempt ?? b.jobs?.[0]?.run_attempt ?? 1;
-      if (!this.run(runID, attempt)) {
-        const archived = await archiveRead(
-          this.env,
-          `facts/${b.partition}/${runID}/${attempt}.json`,
-        );
-        if (archived) {
-          this.ctx.storage.transactionSync(() => {
-            if (this.run(runID, attempt)) return;
-            this.sql.exec(
-              "INSERT INTO runs VALUES (?,?,?)",
-              archived.run.id,
-              archived.run.attempt,
-              archived.run.data,
-            );
-            for (const j of archived.jobs)
-              this.sql.exec(
-                "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?)",
-                j.id,
-                j.run,
-                j.attempt,
-                j.active,
-                j.data,
-                j.contribution,
-              );
-          });
-        }
-      }
       this.ctx.storage.transactionSync(() => {
         this.set("partition", b.partition);
         if (
@@ -740,7 +667,6 @@ export class FactPartition {
 /** Global UTC day: delta receipts make cross-object outbox replay exactly once. */
 export class DayAggregate {
   private sql: SqlStorage;
-  private restoration?: Promise<boolean>;
   constructor(
     private ctx: DurableObjectState,
     private env: Env,
@@ -916,113 +842,44 @@ export class DayAggregate {
       landings: this.sql.exec("SELECT * FROM landings").toArray(),
     };
   }
-  async restore(): Promise<boolean> {
-    if (this.restoration) return this.restoration;
-    this.restoration = this.restorePage();
-    try {
-      return await this.restoration;
-    } finally {
-      this.restoration = undefined;
-    }
-  }
-  private async restorePage(): Promise<boolean> {
-    const cold = this.meta("cold");
-    if (!cold) return true;
-    let position = this.meta("restore") || 0;
-    for (let i = 0; i < 20 && position < cold.pages.length; i++, position++) {
-      const page = await archiveRead(this.env, cold.pages[position]);
-      if (!page) throw new Error("Cold aggregate page missing");
-      this.ctx.storage.transactionSync(() => {
-        for (const row of page.rows) {
-          const { archive_rowid, ...values } = row,
-            columns = Object.keys(values);
-          this.sql.exec(
-            `INSERT OR REPLACE INTO ${page.table}(${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
-            ...(Object.values(values) as any[]),
-          );
-        }
-        this.set("restore", position + 1);
-      });
-    }
-    if (position >= cold.pages.length) {
-      this.set("cold", null);
-      this.set("restore", 0);
-      return true;
-    }
-    await this.ctx.storage.setAlarm(Date.now() + 1000);
-    return false;
-  }
   async alarm() {
-    await this.ctx.storage.setAlarm(Date.now() + 60000);
-    const restored = await this.restore();
     const pending = this.meta("notification");
     if (pending) {
       await call(this.env.CONTROL, "control", "/dirty", { day: pending.day });
       if (this.meta("notification")?.revision === pending.revision)
         this.set("notification", null);
     }
-    if (restored && !this.meta("notification"))
-      await this.ctx.storage.deleteAlarm();
+    if (!this.meta("notification")) await this.ctx.storage.deleteAlarm();
     else await this.ctx.storage.setAlarm(Date.now() + 1000);
   }
   async compact(date: string) {
-    if (date >= day(now() - 90 * DAY))
-      return { done: false, reason: "inside detail retention" };
-    if (this.meta("notification"))
-      return { done: false, reason: "notification pending" };
-    if (this.meta("cold")) return { done: true };
-    const revision = this.meta("revision") || 0;
-    let state = this.meta("compaction");
-    if (!state || state.revision !== revision)
-      state = { revision, table: 0, cursor: 0, pages: [] };
-    const tables = [
-      "metrics",
-      "receipts",
-      "observations",
-      "landings",
-      "staging",
-      "buckets",
-      "dirty_buckets",
-    ];
+    if (date >= day(now() - 90 * DAY)) return { done: false, reason: "inside detail retention" };
+    if (this.meta("notification")) return { done: false, reason: "notification pending" };
+    if (!this.meta("closed")) {
+      const revision = this.meta("revision") || 0;
+      const archived = this.meta("cold") && await this.env.ARCHIVE.get(`summaries/${date}.json`);
+      if (this.meta("cold") && !archived) return { done: false, reason: "cold summary missing" };
+      const summary = archived ? await archived.json() : this.summary();
+      await this.env.ARCHIVE.put(`summaries/${date}.json`, JSON.stringify({
+        daily: { ...summary.daily, "landed-prs": summary.landings?.length || summary.daily?.["landed-prs"] || 0 },
+        fleet: [], observations: [], staging: [], landings: [],
+      }));
+      if ((this.meta("revision") || 0) !== revision)
+        return { done: false, reason: "concurrent correction" };
+      this.set("closed", true);
+      this.set("compaction", { table: 0 });
+      this.set("cold", null);
+      this.set("restore", null);
+    }
+    const tables = ["metrics", "receipts", "observations", "landings", "staging", "buckets", "dirty_buckets"];
+    const state = this.meta("compaction") || { table: tables.length };
     for (let i = 0; i < 2 && state.table < tables.length; i++) {
-      const table = tables[state.table],
-        rows = this.sql
-          .exec<any>(
-            `SELECT rowid archive_rowid,* FROM ${table} WHERE rowid>? ORDER BY rowid LIMIT 500`,
-            state.cursor,
-          )
-          .toArray();
-      if (rows.length) {
-        const key = `aggregates/${date}/${revision}/${table}/${state.cursor}.json`;
-        await archiveWrite(this.env, key, { table, rows });
-        state.pages.push(key);
-        state.cursor = rows.at(-1).archive_rowid;
-      }
-      if (rows.length < 500) {
-        state.table++;
-        state.cursor = 0;
-      }
+      const table = tables[state.table];
+      this.sql.exec(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} LIMIT 5000)`);
+      if (!this.sql.exec(`SELECT 1 FROM ${table} LIMIT 1`).toArray().length) state.table++;
     }
-    if ((this.meta("revision") || 0) !== revision) {
-      this.set("compaction", null);
-      return { done: false };
-    }
-    if (state.table === tables.length) {
-      await this.env.ARCHIVE.put(
-        `summaries/${date}.json`,
-        JSON.stringify(this.summary()),
-      );
-      await archiveWrite(this.env, `aggregates/${date}/manifest.json`, state);
-      this.ctx.storage.transactionSync(() => {
-        if ((this.meta("revision") || 0) !== revision) return;
-        for (const table of tables) this.sql.exec(`DELETE FROM ${table}`);
-        this.set("cold", state);
-        this.set("compaction", null);
-      });
-      return { done: !!this.meta("cold") };
-    }
-    this.set("compaction", state);
-    return { done: false };
+    this.set("compaction", state.table === tables.length ? null : state);
+    return { done: state.table === tables.length };
   }
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
@@ -1032,7 +889,7 @@ export class DayAggregate {
       return json({ ok: true });
     }
     if (path === "/compact") return json(await this.compact(b.day));
-    if (path === "/summary" && this.meta("cold")) {
+    if (path === "/summary" && (this.meta("cold") || this.meta("closed"))) {
       const object = await this.env.ARCHIVE.get(`summaries/${b.day}.json`);
       if (object)
         return new Response(object.body, {
@@ -1040,8 +897,8 @@ export class DayAggregate {
         });
       throw new Error("Cold summary missing");
     }
-    if (path !== "/summary" && !(await this.restore()))
-      throw new Error("Aggregate restoration in progress");
+    if (path !== "/summary" && (this.meta("cold") || this.meta("closed")))
+      return json({ ok: true, closed: true });
     if (path === "/delta" || path === "/delta-batch") {
       const deltas = path === "/delta" ? [b] : b.deltas;
       if (

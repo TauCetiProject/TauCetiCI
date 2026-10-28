@@ -326,7 +326,7 @@ class IncrementalTests(unittest.TestCase):
         enricher.tested.return_value = {}; enricher.telemetry.return_value = None
         enricher.failure.return_value = None
         with patch.object(inc, 'observations'), patch.object(collect, 'collect_main'), \
-                patch.object(collect, 'snapshot_settings'), patch.object(collect, 'Enricher', return_value=enricher), \
+                patch.object(collect, 'Enricher', return_value=enricher), \
                 patch.object(collect.resources, 'observations', return_value={}), \
                 contextlib.redirect_stdout(io.StringIO()):
             inc.run(api, self.index, ['TauCeti', 'Other'], self.until, 'bounded', self.checkpoint)

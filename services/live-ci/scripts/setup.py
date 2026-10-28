@@ -217,27 +217,19 @@ def deploy():
             )
             if result.returncode:
                 raise SystemExit("Deployment failed: " + result.stderr)
-        # Expire deliveries, retired report assets and cursors, never fact archives.
-        rule = {
-            "rules": [
-                {
-                    "id": "delivery-retention",
-                    "enabled": True,
-                    "conditions": {"prefix": "deliveries/"},
-                    "deleteObjectsTransition": {
-                        "condition": {"type": "Age", "maxAge": 14 * 86400}
-                    },
-                },
-                {
-                    "id": "report-retention",
-                    "enabled": True,
-                    "conditions": {"prefix": "public/v1/ci/assets/"},
-                    "deleteObjectsTransition": {
-                        "condition": {"type": "Age", "maxAge": 14 * 86400}
-                    },
-                },
+        # Bound replay/debug evidence and retired detail archives; keep compact summaries.
+        rule = {"rules": [
+            {"id": name, "enabled": True, "conditions": {"prefix": prefix},
+             "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": days * 86400}}}
+            for name, prefix, days in [
+                ("delivery-retention", "deliveries/", 14),
+                ("failed-retention", "failed/", 14),
+                ("report-retention", "public/v1/ci/assets/", 14),
+                ("validation-retention", "validation/", 30),
+                ("retired-facts", "facts/", 7),
+                ("retired-aggregates", "aggregates/", 7),
             ]
-        }
+        ]}
         # Wrangler's lifecycle command reads structured JSON from a file.
         lifecycle = Path(path).with_suffix(".lifecycle.json")
         private(lifecycle, json.dumps(rule))
