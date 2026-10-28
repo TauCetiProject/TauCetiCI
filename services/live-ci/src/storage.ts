@@ -923,12 +923,15 @@ export class DayAggregate {
     if (date >= day(now() - 90 * DAY)) return { done: false, reason: "inside detail retention" };
     if (this.meta("notification")) return { done: false, reason: "notification pending" };
     if (!this.meta("closed")) {
+      const revision = this.meta("revision") || 0;
       const archived = this.meta("cold") && await this.env.ARCHIVE.get(`summaries/${date}.json`);
       const summary = archived ? await archived.json() : this.summary();
       await this.env.ARCHIVE.put(`summaries/${date}.json`, JSON.stringify({
         daily: { ...summary.daily, "landed-prs": summary.landings?.length || summary.daily?.["landed-prs"] || 0 },
         fleet: [], observations: [], staging: [], landings: [],
       }));
+      if ((this.meta("revision") || 0) !== revision)
+        return { done: false, reason: "concurrent correction" };
       this.set("closed", true);
       this.set("compaction", { table: 0 });
       this.set("cold", null);
