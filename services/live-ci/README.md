@@ -71,7 +71,10 @@ recovery expires 24 hours after the run's last update. Successful PR builds have
 phase artifacts sampled one in twenty, with means divided by the sampled count; recent failed PR builds can receive log
 classification. Optional enrichment has its own 60-request rolling hourly cap
 within the existing 500-request total. Current state repairs take precedence.
-Satisfied and retired repair entries are pruned automatically in bounded pages,
+Unresolved parent attempts expire after 24 hours from admission; retries and
+re-enqueueing cannot renew that lifetime. Protected health reports this admission
+time separately from retry deadlines. Satisfied and retired repair entries are
+pruned automatically in bounded pages,
 and inventory cannot re-admit ineligible work. Protected health exposes retired
 counts by reason and the optional request count.
 

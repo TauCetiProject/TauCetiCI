@@ -49,6 +49,12 @@ export class Control {
       CREATE TABLE IF NOT EXISTS witnesses(repo TEXT,id TEXT,attempt INTEGER,partition TEXT,updated INTEGER,checked INTEGER DEFAULT 0,PRIMARY KEY(repo,id,attempt));
       CREATE INDEX IF NOT EXISTS witnesses_checked ON witnesses(checked,updated);
       CREATE TABLE IF NOT EXISTS landings(repo TEXT,pr INTEGER,at INTEGER,PRIMARY KEY(repo,pr));`);
+    if (!this.sql.exec<{ name: string }>("PRAGMA table_info(repairs)").toArray().some((column) => column.name === "enqueued")) {
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("ALTER TABLE repairs ADD COLUMN enqueued INTEGER");
+        this.sql.exec("UPDATE repairs SET enqueued=due WHERE enqueued IS NULL");
+      });
+    }
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS landing_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,day TEXT,path TEXT,data TEXT)",
     );
@@ -75,27 +81,29 @@ export class Control {
     if (this.sql.exec("SELECT 1 FROM gaps WHERE key=?", key).toArray().length)
       return;
     this.sql.exec(
-      `INSERT INTO repairs(key,repo,kind,args,due) VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
+      `INSERT INTO repairs(key,repo,kind,args,due,enqueued) VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
       due=MIN(due,excluded.due),args=CASE WHEN json_extract(excluded.args,'$.archival') IS NOT 1 THEN excluded.args ELSE repairs.args END`,
       key,
       repo,
       kind,
       JSON.stringify(args),
       due,
+      now(),
     );
   }
   retire(row: { key: string; kind: string }, reason: string) {
-    this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
+    if (!this.sql.exec("DELETE FROM repairs WHERE key=? RETURNING key", row.key).toArray().length) return false;
     const counts = this.get("retired_repairs") || {};
     const key = `${row.kind}: ${reason}`;
     counts[key] = (counts[key] || 0) + 1;
     this.set("retired_repairs", counts);
+    return true;
   }
   async pruneRepairs(cursor = "", limit = 100) {
     limit = Math.max(1, Math.min(200, Number(limit) || 100));
     const rows = this.sql
-      .exec<{ key: string; repo: string; kind: string; args: string; due: number }>(
-        "SELECT key,repo,kind,args,due FROM repairs WHERE key>? AND kind IN ('run','jobs','details','members') ORDER BY key LIMIT ?",
+      .exec<{ key: string; repo: string; kind: string; args: string; due: number; enqueued: number }>(
+        "SELECT key,repo,kind,args,due,enqueued FROM repairs WHERE key>? AND kind IN ('run','jobs','details','members') ORDER BY key LIMIT ?",
         cursor,
         limit,
       )
@@ -112,7 +120,7 @@ export class Control {
             { id: args.id },
           );
           if (!location.partition) {
-            if (row.due < now() - DAY) { this.retire(row, "unresolved parent expired"); retired++; }
+            if ((row.enqueued ?? row.due) < now() - DAY && this.retire(row, "unresolved parent expired")) retired++;
             return;
           }
           const status = await call(
@@ -121,8 +129,12 @@ export class Control {
             "/status",
             { id: String(args.id), attempt: args.attempt || 1 },
           );
+          if (!status.run && (row.enqueued ?? row.due) < now() - DAY) {
+            if (this.retire(row, "missing parent attempt expired")) retired++;
+            return;
+          }
           const reason = repairReason(row.kind, status.run, now());
-          if (reason) { this.retire(row, reason); retired++; return; }
+          if (reason) { if (this.retire(row, reason)) retired++; return; }
           const satisfied =
             row.kind === "run"
               ? status.run?.status === "completed"
@@ -131,8 +143,7 @@ export class Control {
                 : row.kind === 'members' ? status.run?.members?.length : status.run?.telemetry?.coverage === "complete" ||
                   status.run?.telemetry?.phases?.length;
           if (satisfied) {
-            this.sql.exec("DELETE FROM repairs WHERE key=?", row.key);
-            removed++;
+            removed += this.sql.exec("DELETE FROM repairs WHERE key=? RETURNING key", row.key).toArray().length;
           }
         }),
       );
@@ -513,6 +524,9 @@ export class Control {
       const location = await call(this.env.DIRECTORIES, directory(row.repo, args.id), "/get", { id: args.id });
       if (location.partition) {
         const status = await call(this.env.FACTS, location.partition, "/status", { id: String(args.id), attempt: args.attempt || 1 });
+        if (!status.run && (row.enqueued ?? row.due) < now() - DAY) {
+          this.retire(row, "missing parent attempt expired"); return;
+        }
         const reason = repairReason(row.kind, status.run, now());
         if (reason) { this.retire(row, reason); return; }
       }
@@ -1500,7 +1514,7 @@ export class Control {
         detail_requests_last_hour: (this.get("detail_requests") || []).filter((at: number) => at > now() - 3600).length,
         pending: this.sql
           .exec(
-            "SELECT kind,COUNT(*) count,MIN(due) oldest FROM repairs GROUP BY kind",
+            "SELECT kind,COUNT(*) count,MIN(due) oldest,MIN(enqueued) oldest_enqueued FROM repairs GROUP BY kind",
           )
           .toArray(),
         dirty: this.sql.exec("SELECT COUNT(*) count FROM dirty").one(),
