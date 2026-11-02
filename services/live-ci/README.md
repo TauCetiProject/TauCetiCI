@@ -37,8 +37,16 @@ the chart begins.
 
 Active intervals advance in bounded alarm batches. Drain-only wakes never
 refresh intervals: existing outbox receipts drain before the next refresh page,
-and a persisted deadline starts the next sweep a minute after one finishes.
+and a persisted deadline starts the next sweep five minutes after one finishes.
 This prevents a delivery backlog from generating more updates on every retry.
+Webhook changes and completions still apply immediately. Clock-only refreshes
+update the saved contribution without replacing the indexed job row. Unchanged
+metadata, run records and directory mappings do not generate replacement writes.
+Partition notifications track inactive/active transitions, with a daily heartbeat
+while active; live counts still read the latest observed job state. Day-change
+notifications coalesce for up to a minute without postponing earlier alarms.
+Pending notifications and their existing revision counters survive retries and
+object eviction. Delivery failures retain their independent one-minute retry.
 Only dirty time bins are recalculated. SQLite computes queue peaks and exact
 daily quantiles, returning compact results without loading a day's interval boundaries or timing samples
 into the Worker heap. Publishing reads at most 90 materialized daily summaries,

@@ -16,8 +16,10 @@ import {
 } from "./model";
 import { call, json, now, type Env } from "./types";
 import { retained } from "./policy";
-async function scheduleSoon(ctx: DurableObjectState) {
-  const next = Date.now() + 1000;
+const REFRESH_SECONDS = 300;
+const DAY_NOTIFY_MS = 60_000;
+async function scheduleSoon(ctx: DurableObjectState, delayMs = 1000) {
+  const next = Date.now() + delayMs;
   const scheduled = await ctx.storage.getAlarm();
   // A busy partition must not keep postponing its notification indefinitely.
   if (scheduled === null || scheduled > next) await ctx.storage.setAlarm(next);
@@ -43,7 +45,7 @@ export class RunDirectory {
     }
     if (new URL(request.url).pathname === "/put")
       this.ctx.storage.sql.exec(
-        "INSERT INTO runs VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET partition=excluded.partition,seen=excluded.seen",
+        "INSERT INTO runs VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET partition=excluded.partition,seen=excluded.seen WHERE runs.partition IS NOT excluded.partition",
         b.id,
         b.partition,
         now(),
@@ -85,7 +87,7 @@ export class FactPartition {
   }
   set(k: string, v: any) {
     this.sql.exec(
-      "INSERT OR REPLACE INTO meta VALUES (?,?)",
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value",
       k,
       JSON.stringify(v),
     );
@@ -104,7 +106,9 @@ export class FactPartition {
         data: string;
         contribution: string;
         active: number;
-      }>("SELECT data,contribution,active FROM jobs WHERE id=?", j.id)
+        run: string;
+        attempt: number;
+      }>("SELECT data,contribution,active,run,attempt FROM jobs WHERE id=?", j.id)
       .toArray()[0];
     const old: Job | undefined = before ? JSON.parse(before.data) : undefined;
     const next = before ? newer<Job>(old, j) : j;
@@ -129,20 +133,19 @@ export class FactPartition {
       delta = difference(before ? JSON.parse(before.contribution) : [], after);
     const active =
       next.status !== "completed" && run.status !== "completed" ? 1 : 0;
-    if (
-      !delta.length &&
-      before &&
-      before.data === JSON.stringify(next) &&
-      before.active === active
-    )
-      return;
-    this.sql.exec(
+    const data = JSON.stringify(next);
+    if (before && before.data === data && before.active === active &&
+        before.run === run.id && before.attempt === run.attempt) {
+      if (!delta.length) return;
+      // Periodic clock advancement does not change the indexed job facts.
+      this.sql.exec("UPDATE jobs SET contribution=? WHERE id=?", JSON.stringify(after), next.id);
+    } else this.sql.exec(
       "INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?)",
       next.id,
       run.id,
       run.attempt,
       active,
-      JSON.stringify(next),
+      data,
       JSON.stringify(after),
     );
     const groups = new Map<string, Row[]>();
@@ -211,13 +214,22 @@ export class FactPartition {
           "SELECT COUNT(*) n FROM runs WHERE json_extract(data,'$.status')!='completed'",
         )
         .one().n;
-    const revision = (this.meta("partition_revision") || 0) + 1;
-    this.set("partition_revision", revision);
-    this.set("partition_pending", revision);
+    const state = active > 0 ? 1 : 0;
+    const reported = this.meta("partition_reported");
+    // Control needs partition eligibility, not a new revision for every drain.
+    // Check even when no metric changed (e.g. a terminal run with no jobs).
+    // The heartbeat preserves Control's seen-based stale-run recovery window.
+    if (!reported || reported.active !== state || (state && reported.at < now() - DAY)) {
+      const revision = (this.meta("partition_revision") || 0) + 1;
+      this.set("partition_revision", revision);
+      this.set("partition_pending", revision);
+      this.set("partition_reported", { active: state, at: now() });
+    }
     // Notify from an alarm, whose request context starts a fresh call chain.
     // Calling Control here during Control -> Facts -> Days ingestion creates
     // reentrant chains that exhaust the production Workers depth budget.
-    if (notify) {
+    const revision = this.meta("partition_pending");
+    if (notify && revision) {
       await call(this.env.CONTROL, "control", "/partition", {
         partition,
         active,
@@ -226,14 +238,11 @@ export class FactPartition {
       if (this.meta("partition_pending") === revision)
         this.set("partition_pending", null);
     }
-    const stillActive =
-      this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray()
-        .length ||
-      this.sql
-        .exec(
-          "SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1",
-        )
-        .toArray().length;
+    // Finish asynchronous reads before deciding whether to replace/delete an
+    // alarm. An event may have queued work during the send or alarm lookup.
+    const scheduled = await this.ctx.storage.getAlarm();
+    const stillActive = this.sql.exec("SELECT 1 FROM jobs WHERE active=1 LIMIT 1").toArray().length ||
+      this.sql.exec("SELECT 1 FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 1").toArray().length;
     const stillPending =
       this.meta("partition_pending") ||
       this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length ||
@@ -241,15 +250,15 @@ export class FactPartition {
     // Persist the refresh deadline independently of notification/drain wakes.
     // Otherwise a steady stream of deliveries can postpone refresh forever.
     if (stillActive && !this.meta("alarm_refresh_due"))
-      this.set("alarm_refresh_due", now() + 60);
+      this.set("alarm_refresh_due", now() + REFRESH_SECONDS);
     if (stillPending) await scheduleSoon(this.ctx);
-    else if (stillActive)
-      await this.ctx.storage.setAlarm(
-        Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000),
-      );
+    else if (stillActive) {
+      const next = Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000);
+      if (scheduled !== next) await this.ctx.storage.setAlarm(next);
+    }
     else {
       this.set("alarm_refresh_due", null);
-      await this.ctx.storage.deleteAlarm();
+      if (scheduled !== null) await this.ctx.storage.deleteAlarm();
     }
   }
   async alarm() {
@@ -288,10 +297,10 @@ export class FactPartition {
       this.set("alarm_cursor", full ? rows.at(-1)!.id : "");
       this.set("alarm_last_refreshed", now());
       // Continue a paginated sweep only after its existing receipts drain.
-      // Start the next sweep a minute after this one finishes, not once per
+      // Start the next sweep five minutes after this one finishes, not once per
       // drain wake. Each page uses its current clock so newer event facts
       // cannot be rolled back to an older sweep timestamp.
-      if (!full) this.set("alarm_refresh_due", now() + 60);
+      if (!full) this.set("alarm_refresh_due", now() + REFRESH_SECONDS);
     });
     await this.flush(true);
   }
@@ -554,6 +563,7 @@ export class FactPartition {
       return json({ processed: rows.length, changed, unidentified, cursor: rows.length === 40 ? rows.at(-1)!.id : null });
     }
     if (path === "/event") {
+      let accepted = false;
       this.ctx.storage.transactionSync(() => {
         this.set("partition", b.partition);
         if (
@@ -562,9 +572,11 @@ export class FactPartition {
             .toArray().length
         )
           return;
+        accepted = true;
         if (b.run) {
           const next = normalizeRun(b.repo, b.run),
             old = this.run(next.id, next.attempt);
+          const previous = old && JSON.stringify(old);
           const run = newer(old, next);
           if (next.archiveSampling || old?.archiveSampling)
             run.archiveSampling = next.archiveSampling || old!.archiveSampling;
@@ -580,43 +592,38 @@ export class FactPartition {
             run.telemetry = b.telemetry;
           if (b.verified_jobs)
             this.set(`verified/${run.id}/${run.attempt}`, true);
-          this.sql.exec(
-            "INSERT OR REPLACE INTO runs VALUES (?,?,?)",
-            run.id,
-            run.attempt,
-            JSON.stringify(run),
-          );
-          for (const row of this.sql
-            .exec<{
-              data: string;
-            }>(
-              "SELECT data FROM jobs WHERE run=? AND attempt=?",
+          if (JSON.stringify(run) !== previous) {
+            this.sql.exec(
+              "INSERT OR REPLACE INTO runs VALUES (?,?,?)",
               run.id,
               run.attempt,
-            )
-            .toArray())
-            this.replaceJob(run, JSON.parse(row.data), now());
+              JSON.stringify(run),
+            );
+            for (const row of this.sql
+              .exec<{ data: string }>(
+                "SELECT data FROM jobs WHERE run=? AND attempt=?", run.id, run.attempt,
+              ).toArray())
+              this.replaceJob(run, JSON.parse(row.data), now());
+          }
         }
         if (b.telemetry && !b.run) {
           const run = this.run(String(b.run_id), b.attempt);
           if (!run) throw new Error("Run metadata not present");
+          const previous = JSON.stringify(run);
           run.telemetry = { ...run.telemetry, ...b.telemetry };
-          this.sql.exec(
-            "UPDATE runs SET data=? WHERE id=? AND attempt=?",
-            JSON.stringify(run),
-            run.id,
-            run.attempt,
-          );
-          for (const row of this.sql
-            .exec<{
-              data: string;
-            }>(
-              "SELECT data FROM jobs WHERE run=? AND attempt=?",
+          if (JSON.stringify(run) !== previous) {
+            this.sql.exec(
+              "UPDATE runs SET data=? WHERE id=? AND attempt=?",
+              JSON.stringify(run),
               run.id,
               run.attempt,
-            )
-            .toArray())
-            this.replaceJob(run, JSON.parse(row.data), now());
+            );
+            for (const row of this.sql
+              .exec<{ data: string }>(
+                "SELECT data FROM jobs WHERE run=? AND attempt=?", run.id, run.attempt,
+              ).toArray())
+              this.replaceJob(run, JSON.parse(row.data), now());
+          }
         }
         for (const raw of b.jobs || []) {
           const j = normalizeJob(raw),
@@ -656,7 +663,11 @@ export class FactPartition {
         this.sql.exec("INSERT INTO deliveries VALUES (?,?)", b.delivery, now());
         this.sql.exec("DELETE FROM deliveries WHERE at<?", now() - 14 * DAY);
       });
-      await scheduleSoon(this.ctx);
+      // Arm recovery before cross-object delivery, including a retry of a
+      // previously accepted event. A settled duplicate needs no new alarm.
+      if (accepted || this.meta("partition_pending") ||
+          this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length)
+        await scheduleSoon(this.ctx);
       await this.flush();
       return json({ ok: true });
     }
@@ -690,7 +701,7 @@ export class DayAggregate {
   }
   set(key: string, value: any) {
     this.sql.exec(
-      "INSERT OR REPLACE INTO meta VALUES (?,?)",
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value",
       key,
       JSON.stringify(value),
     );
@@ -845,12 +856,15 @@ export class DayAggregate {
   async alarm() {
     const pending = this.meta("notification");
     if (pending) {
+      // Keep autonomous recovery armed if the cross-object send fails, even
+      // after the runtime has exhausted its automatic retries for this alarm.
+      await this.ctx.storage.setAlarm(Date.now() + DAY_NOTIFY_MS);
       await call(this.env.CONTROL, "control", "/dirty", { day: pending.day });
       if (this.meta("notification")?.revision === pending.revision)
         this.set("notification", null);
     }
     if (!this.meta("notification")) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Date.now() + 1000);
+    else await scheduleSoon(this.ctx, DAY_NOTIFY_MS);
   }
   async compact(date: string) {
     if (date >= day(now() - 90 * DAY)) return { done: false, reason: "inside detail retention" };
@@ -899,6 +913,7 @@ export class DayAggregate {
     }
     if (path !== "/summary" && (this.meta("cold") || this.meta("closed")))
       return json({ ok: true, closed: true });
+    let changed = false;
     if (path === "/delta" || path === "/delta-batch") {
       const deltas = path === "/delta" ? [b] : b.deltas;
       if (
@@ -935,25 +950,26 @@ export class DayAggregate {
             );
           }
           this.sql.exec("INSERT INTO receipts VALUES (?)", delta.id);
+          if (delta.rows.length) changed = true;
         }
       });
     } else if (path === "/observation")
-      this.sql.exec(
-        "INSERT OR REPLACE INTO observations VALUES (?,?)",
+      changed = this.sql.exec(
+        "INSERT INTO observations VALUES (?,?) ON CONFLICT(at) DO UPDATE SET data=excluded.data WHERE observations.data IS NOT excluded.data RETURNING at",
         b.at,
         JSON.stringify(b),
-      );
+      ).toArray().length > 0;
     else if (path === "/landing" || path === "/unlanding") {
       const key = `landing/${b.pr}`,
         revision = Number(b.revision) || 0;
       if (revision >= (this.meta(key) || 0)) {
         if (path === "/landing")
-          this.sql.exec(
-            "INSERT INTO landings VALUES (?,?) ON CONFLICT(pr) DO UPDATE SET at=MIN(at,excluded.at)",
+          changed = this.sql.exec(
+            "INSERT INTO landings VALUES (?,?) ON CONFLICT(pr) DO UPDATE SET at=excluded.at WHERE excluded.at<landings.at RETURNING pr",
             b.pr,
             b.at,
-          );
-        else this.sql.exec("DELETE FROM landings WHERE pr=?", b.pr);
+          ).toArray().length > 0;
+        else changed = this.sql.exec("DELETE FROM landings WHERE pr=? RETURNING pr", b.pr).toArray().length > 0;
         this.set(key, revision);
       }
     } else if (path === "/staging") {
@@ -974,23 +990,22 @@ export class DayAggregate {
           old?.testedHead === b.testedHead
         )
           b.members = old.members;
-        this.sql.exec(
-          "INSERT OR REPLACE INTO staging VALUES (?,?,?)",
+        changed = this.sql.exec(
+          "INSERT INTO staging VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET attempt=excluded.attempt,data=excluded.data WHERE staging.data IS NOT excluded.data RETURNING id",
           b.id,
           b.attempt,
           JSON.stringify(b),
-        );
+        ).toArray().length > 0;
       }
     } else if (path === "/summary") {
       return json(this.summary());
     } else return json({ error: "unknown operation" }, 404);
-    const revision = (this.meta("revision") || 0) + 1;
-    this.set("revision", revision);
-    this.set("notification", {
-      day: b.day || day(b.at),
-      revision,
-    });
-    await scheduleSoon(this.ctx);
+    if (changed) {
+      const revision = (this.meta("revision") || 0) + 1;
+      this.set("revision", revision);
+      this.set("notification", { day: b.day || day(b.at), revision });
+    }
+    if (this.meta("notification")) await scheduleSoon(this.ctx, DAY_NOTIFY_MS);
     return json({ ok: true });
   }
 }

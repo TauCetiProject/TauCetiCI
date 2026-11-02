@@ -68,7 +68,7 @@ export class Control {
   }
   set(k: string, v: any) {
     this.sql.exec(
-      "INSERT OR REPLACE INTO meta VALUES (?,?)",
+      "INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE meta.value IS NOT excluded.value",
       k,
       JSON.stringify(v),
     );
