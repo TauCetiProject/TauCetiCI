@@ -323,10 +323,12 @@ test("merge observations retain completed snapshots during scans and omit startu
     const bucket = await r.mf.getR2Bucket("ARCHIVE");
     const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
     assert.equal(manifest.current.ready_to_merge.complete, i !== 3);
+    assert.equal(manifest.current.ready_to_merge.snapshot_at, i === 3 ? null : iso(clock - 300).replace(".000Z", "Z"));
   }
   const rows = (await r.summary()).observations;
   assert.deepEqual(rows.map((o) => o.complete), [true, true, true, false]);
   assert.deepEqual(rows.map((o) => o.count), [7, 7, 7, 7]);
+  assert.deepEqual(rows.map((o) => o.snapshot_at), [clock - 300, clock - 300, clock - 300, null]);
   await r.ingest({
     observation: {
       observed_at: iso(clock - 296),
@@ -339,6 +341,55 @@ test("merge observations retain completed snapshots during scans and omit startu
   const manifest = await (await r.mf.dispatchFetch("https://example.com/v1/ci/manifest.json")).json();
   assert.equal(manifest.current.ready_to_merge.complete, true);
   assert.equal(manifest.current.ready_to_merge.count, 2);
+  assert.equal(r.github(), 0);
+});
+test("queue chart metadata keeps snapshot age through reused and partial scans", async (t) => {
+  const r = await runtime(t);
+  const snapshot = iso(clock - 600);
+  await r.ingest({ observation: {
+    observed_at: iso(clock - 300), eligible_count: 931,
+    candidate_scan_complete: false, candidate_snapshot_at: snapshot,
+  } });
+  await r.ingest({ observation: {
+    observed_at: iso(clock - 299), eligible_count: 475,
+    candidate_scan_complete: false, candidate_snapshot_at: null,
+  } });
+  await r.post("/refresh-day", { day: date });
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.deepEqual(manifest.groups.queue.latest_complete, {
+    at: iso(clock - 300).replace(".000Z", "Z"), snapshot_at: snapshot.replace(".000Z", "Z"), count: 931,
+  });
+  assert.equal(manifest.groups.queue.latest_scan_incomplete, true);
+  const asset = manifest.assets["ci-queue-size.svg"].url;
+  // Live counts can advance without replacing the chart's count or timestamp.
+  await r.ingest({ observation: {
+    observed_at: iso(clock - 298), eligible_count: 957,
+    candidate_scan_complete: true,
+  } });
+  await r.post("/publish");
+  const next = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(next.current.ready_to_merge.count, 957);
+  assert.equal(next.current.ready_to_merge.snapshot_at, iso(clock - 298).replace(".000Z", "Z"));
+  assert.deepEqual(next.groups.queue, manifest.groups.queue);
+  assert.equal(next.assets["ci-queue-size.svg"].url, asset);
+  await r.post("/refresh-day", { day: date });
+  const refreshed = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(refreshed.groups.queue.latest_complete.count, 957);
+  assert.equal(refreshed.groups.queue.latest_scan_incomplete, false);
+  assert.equal(r.github(), 0);
+});
+test("a queue chart with only partial scans has no complete count", async (t) => {
+  const r = await runtime(t);
+  await r.ingest({ observation: {
+    observed_at: iso(clock - 300), eligible_count: 475,
+    candidate_scan_complete: false, candidate_snapshot_at: null,
+  } });
+  await r.post("/refresh-day", { day: date });
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.groups.queue.latest_complete, null);
+  assert.equal(manifest.groups.queue.latest_scan_incomplete, true);
   assert.equal(r.github(), 0);
 });
 test("archive sampling survives newer live metadata and retracts prior overlap contributions", async (t) => {

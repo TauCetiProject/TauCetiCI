@@ -336,14 +336,17 @@ export class Control {
           ).size;
       // An in-progress scan reuses the last completed candidate snapshot.
       // Only the first scan after a restart has no trustworthy baseline.
-      const complete =
-        (o.candidate_scan_complete !== false &&
-          o.candidate_scan_complete !== 0) ||
-        !!o.candidate_snapshot_at;
+      const scanComplete = o.candidate_scan_complete !== false &&
+        o.candidate_scan_complete !== 0;
+      const snapshot = Math.floor(Date.parse(o.candidate_snapshot_at) / 1000);
+      const snapshotAt = Number.isFinite(snapshot) && snapshot <= at
+        ? snapshot : scanComplete ? at : null;
+      const complete = snapshotAt !== null;
       await call(this.env.DAYS, day(at), "/observation", {
         at,
         count,
         complete,
+        snapshot_at: snapshotAt,
         day: day(at),
       });
       if (at >= (this.get("bors_observed") || 0)) {
@@ -352,6 +355,7 @@ export class Control {
           at: iso(at),
           count,
           complete,
+          snapshot_at: snapshotAt === null ? null : iso(snapshotAt),
         });
       }
     } else if (b.landing) {
@@ -1050,6 +1054,19 @@ export class Control {
         const membershipRepairs = this.sql.exec<{ n: number }>(
           "SELECT COUNT(*) n FROM repairs WHERE kind='members'",
         ).one().n;
+        // Match the observations used by the queue chart. Publication and the
+        // latest partial scan must not stand in for the last complete snapshot.
+        const queueObservations = days.flatMap((d) => d.data.observations || [])
+          .filter((o) => o.at >= clock - 30 * DAY && o.at <= clock)
+          .sort((a, b) => a.at - b.at);
+        const latestQueue = queueObservations.at(-1);
+        const latestComplete = queueObservations.filter((o) => o.complete !== false).at(-1);
+        const queueSnapshot = latestComplete ? {
+          at: iso(latestComplete.at),
+          snapshot_at: Number.isFinite(latestComplete.snapshot_at)
+            ? iso(latestComplete.snapshot_at) : null,
+          count: latestComplete.count,
+        } : null;
         const gaps = this.sql
           .exec<{
             kind: string;
@@ -1080,6 +1097,10 @@ export class Control {
             source_through: through ? iso(through) : null,
             coverage: "webhook_observed_with_bounded_recovery",
             complete: false,
+            ...(group === "queue" ? {
+              latest_complete: queueSnapshot,
+              latest_scan_incomplete: latestQueue?.complete === false,
+            } : {}),
             pending: group === "details" ? pending :
               group === "staging" ? Math.max(missingMembers, membershipRepairs) : 0,
             gaps: gaps
