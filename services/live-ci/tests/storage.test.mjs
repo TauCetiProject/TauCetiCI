@@ -239,6 +239,21 @@ test("partition notification failure survives eviction and legacy revisions keep
   assert.equal(restarted.meta("alarm_refresh_due"), Date.now() / 1000 + 300);
 });
 
+test("a rollback advancing the legacy counter invalidates a stale activity marker", async (t) => {
+  const f = fixture(t, 0);
+  await f.fact.flush(true);
+  const reported = f.fact.meta("partition_reported");
+  // Older code maintains the legacy counter/pending keys, but knows nothing
+  // about the new marker. Its latest acknowledgement may describe other state.
+  f.fact.set("partition_revision", reported.revision + 100);
+  f.fact.set("partition_pending", null);
+  const restarted = new FactPartition(f.ctx, f.env);
+  await restarted.flush(true);
+  assert.equal(f.notifications.at(-1).revision, reported.revision + 101);
+  assert.equal(f.notifications.at(-1).active, 1);
+  assert.equal(restarted.meta("partition_pending"), null);
+});
+
 test("a terminal event during a partition notification retains its newer generation", async (t) => {
   const f = fixture(t, 0);
   let entered, release;
@@ -297,6 +312,20 @@ test("same-timestamp telemetry changes still correct failure metrics", async (t)
   const daily = f.days.values().next().value.summary().daily;
   assert.equal(daily["failure/lint"], 1);
   assert.equal(daily["failure/pending"], undefined);
+});
+
+test("changed run metadata recalculates active sibling contributions at the same timestamp", async (t) => {
+  const f = fixture(t, 1);
+  const job = JSON.parse(f.ctx.storage.sql.exec("SELECT data FROM jobs").one().data);
+  f.fact.replaceJob(f.run, { ...job, kind: "namespace" }, Date.now() / 1000);
+  await f.catchUp();
+  const aggregate = f.days.values().next().value;
+  assert.equal(aggregate.summary().daily["picker/namespace"], 1);
+  await post(f.fact, "/event", { partition: f.fact.meta("partition"), repo: f.run.repo,
+    delivery: "corrected-trigger", run: rawRun(f.run, { trigger: "bors_staging" }) });
+  assert.equal(f.fact.run(f.run.id, 1).trigger, "bors_staging");
+  assert.equal(aggregate.summary().daily["picker/namespace"], undefined);
+  assert.equal((await f.backlog()).active_jobs, 1);
 });
 
 test("unchanged run-directory locations do not rewrite their indexed row", async (t) => {
@@ -363,6 +392,21 @@ test("day notifications survive send failure, eviction and a concurrent correcti
   await restarted.alarm();
   assert.equal(restarted.meta("notification"), null);
   assert.equal(f.notifications.length, 3);
+});
+
+for (const expired of [false, true]) test(`retention re-arms a legacy pending day notification (${expired ? "elapsed" : "missing"} alarm)`, async (t) => {
+  const f = dayFixture(t);
+  await f.delta("old-pending");
+  if (expired) await f.ctx.storage.setAlarm(Date.now() - 86400000);
+  else await f.ctx.storage.deleteAlarm();
+  const restarted = new DayAggregate(f.ctx, f.env);
+  const result = await restarted.compact("2026-01-01");
+  assert.equal(result.reason, "notification pending");
+  assert.equal(await f.ctx.storage.getAlarm(), Date.now() + 60000);
+  assert.equal(restarted.meta("notification").revision, 1);
+  await restarted.alarm();
+  assert.equal(f.notifications.length, 1);
+  assert.equal(restarted.meta("notification"), null);
 });
 
 test("unchanged and stale day observations preserve revisions and earlier legacy alarms", async (t) => {

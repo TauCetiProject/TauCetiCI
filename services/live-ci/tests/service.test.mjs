@@ -343,19 +343,29 @@ test("merge observations retain completed snapshots during scans and omit startu
 });
 test("archive sampling survives newer live metadata and retracts prior overlap contributions", async (t) => {
   const r = await runtime(t);
-  await r.ingest({ run: run(), jobs: [job()] });
+  // Use a settled interval that always straddles a previous UTC midnight.
+  const sampleClock = Math.floor(clock / 86400) * 86400 - 86400 + 120;
+  const sampledRun = { ...run(), created_at: iso(sampleClock - 300), updated_at: iso(sampleClock) };
+  const sampledJob = { ...job(), created_at: iso(sampleClock - 300),
+    started_at: iso(sampleClock - 240), completed_at: iso(sampleClock - 60), steps: [] };
+  await r.ingest({ run: sampledRun, jobs: [sampledJob] });
   await r.ingest({
     historical: true,
-    run: { ...run(), updated_at: iso(clock - 10),
-      archive_sampling: { until: clock - 120, weight: 2 } },
-    jobs: [job()],
+    run: { ...sampledRun, updated_at: iso(sampleClock - 10),
+      archive_sampling: { until: sampleClock - 120, weight: 2 } },
+    jobs: [sampledJob],
   });
-  await r.ingest({ run: run(), jobs: [job()] });
-  const summary = await r.summary();
-  const amount = summary.fleet.filter((row) => row.step === 600)
+  await r.ingest({ run: sampledRun, jobs: [sampledJob] });
+  // Each time bin belongs to its own UTC day, not necessarily the run's day.
+  const days = await r.mf.getDurableObjectNamespace("DAYS");
+  const summaries = await Promise.all([sampledRun.created_at, sampledJob.completed_at].map(async (at) =>
+    (await days.get(days.idFromName(at.slice(0, 10))).fetch("https://internal/summary", {
+      method: "POST", body: "{}",
+    })).json()));
+  const amount = summaries.flatMap((s) => s.fleet).filter((row) => row.step === 600)
     .reduce((n, row) => n + (row.running["gh-build-pr"] || 0), 0);
   assert.ok(Math.abs(amount - 0.5) < 1e-9);
-  assert.equal(summary.daily["pr-total"], 1);
+  assert.equal(summaries[0].daily["pr-total"], 1);
 });
 test("duplicate delivery, late queued job and telemetry corrections preserve totals", async (t) => {
   const r = await runtime(t),

@@ -22,7 +22,8 @@ async function scheduleSoon(ctx: DurableObjectState, delayMs = 1000) {
   const next = Date.now() + delayMs;
   const scheduled = await ctx.storage.getAlarm();
   // A busy partition must not keep postponing its notification indefinitely.
-  if (scheduled === null || scheduled > next) await ctx.storage.setAlarm(next);
+  if (scheduled === null || scheduled <= Date.now() || scheduled > next)
+    await ctx.storage.setAlarm(next);
 }
 /** Sharded locator: workflow_job does not carry its parent run creation date. */
 export class RunDirectory {
@@ -216,14 +217,17 @@ export class FactPartition {
         .one().n;
     const state = active > 0 ? 1 : 0;
     const reported = this.meta("partition_reported");
+    const currentRevision = this.meta("partition_revision") || 0;
     // Control needs partition eligibility, not a new revision for every drain.
     // Check even when no metric changed (e.g. a terminal run with no jobs).
     // The heartbeat preserves Control's seen-based stale-run recovery window.
-    if (!reported || reported.active !== state || (state && reported.at < now() - DAY)) {
-      const revision = (this.meta("partition_revision") || 0) + 1;
+    // A rollback may advance the legacy counter without updating reported.
+    if (!reported || reported.revision !== currentRevision || reported.active !== state ||
+        (state && reported.at < now() - DAY)) {
+      const revision = currentRevision + 1;
       this.set("partition_revision", revision);
       this.set("partition_pending", revision);
-      this.set("partition_reported", { active: state, at: now() });
+      this.set("partition_reported", { active: state, at: now(), revision });
     }
     // Notify from an alarm, whose request context starts a fresh call chain.
     // Calling Control here during Control -> Facts -> Days ingestion creates
@@ -868,7 +872,12 @@ export class DayAggregate {
   }
   async compact(date: string) {
     if (date >= day(now() - 90 * DAY)) return { done: false, reason: "inside detail retention" };
-    if (this.meta("notification")) return { done: false, reason: "notification pending" };
+    if (this.meta("notification")) {
+      // Older deployments can leave a pending send with no usable alarm.
+      // The existing retention tick also repairs that state autonomously.
+      await scheduleSoon(this.ctx, DAY_NOTIFY_MS);
+      return { done: false, reason: "notification pending" };
+    }
     if (!this.meta("closed")) {
       const revision = this.meta("revision") || 0;
       const archived = this.meta("cold") && await this.env.ARCHIVE.get(`summaries/${date}.json`);
