@@ -111,6 +111,11 @@ JSON export on each generation.
 - `current`: observed running/queued counts by runner, inventory confirmation time, computation time and truncation state.
 - `groups`: independent fleet, daily, detail, queue and staging publication times,
   source cutoffs, coverage description, pending work and known gaps.
+  The queue group also reports `latest_complete` (count, observation `at`, and
+  `snapshot_at`) for the last complete count included in that chart, plus
+  `latest_scan_incomplete`. These describe the published asset, even when newer
+  live observations have arrived. A reused candidate snapshot keeps its original
+  timestamp; older stored observations without that timestamp report null.
 - `assets`: SVG filenames mapped to immutable revisioned URLs.
 - `coverage`: enumerated inventory intervals per repository.
 - `github`: rolling request/reservation accounting, budget and cooldown.
