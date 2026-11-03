@@ -370,7 +370,7 @@ export function renderCharts(
     render(`ci-fleet-${name}.svg`, () =>
       frame(
         `CI fleet, last ${name}`,
-        `Average jobs running; peak jobs queued; longest trailing wait (minutes). ${iso(clock)}. Current bin is partial.`,
+        `Average running; peak queued; longest wait (min). ${iso(clock)}. Recent bins are provisional.`,
         legend(running) +
           '<text x="64" y="140">Running</text>' +
           panel(running, labels, {
