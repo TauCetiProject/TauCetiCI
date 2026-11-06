@@ -1777,6 +1777,14 @@ export class Operations {
       this.get("domain_cache/" + kind);
     return value?.scope === this.get("public_scope") ? value : undefined;
   }
+  private queuePreparations(): QueuePreparation[] {
+    const saved = this.get("queue_preparation"),
+      scope = this.get("public_scope");
+    // Accept the previous single-summary representation during a live update.
+    return (Array.isArray(saved) ? saved : saved ? [saved] : [])
+      .filter((row: QueuePreparation) => row.scope === scope)
+      .slice(-8);
+  }
   private changedReady(): boolean {
     return DOMAINS.some((kind) => {
       const ready = this.state(kind),
@@ -2014,7 +2022,10 @@ export class Operations {
         this.set("domain_error/" + kind, null);
         if (projection.timing) {
           projection.timing.ready_recorded_at = Date.now();
-          this.set("queue_preparation", projection.timing);
+          this.set(
+            "queue_preparation",
+            [...this.queuePreparations(), projection.timing].slice(-8),
+          );
         }
       });
     } catch {
@@ -2507,7 +2518,8 @@ export class Operations {
       await this.alarm();
       return json({ ok: true });
     }
-    if (path === "/health")
+    if (path === "/health") {
+      const queuePreparations = this.queuePreparations();
       return json({
         publisher_version: this.env.CF_VERSION?.id || null,
         alarm_at: await this.ctx.storage.getAlarm(),
@@ -2525,10 +2537,8 @@ export class Operations {
             },
           ]),
         ),
-        queue_preparation:
-          this.get("queue_preparation")?.scope === this.get("public_scope")
-            ? this.get("queue_preparation")
-            : null,
+        queue_preparation: queuePreparations.at(-1) || null,
+        queue_preparations: queuePreparations,
         publication_started_at: this.publicationStarted || null,
         publication_pending: [...this.publicationPending],
         publication_elapsed_ms: this.get("publication_elapsed_ms") ?? null,
@@ -2545,6 +2555,7 @@ export class Operations {
           .exec<{ count: number }>("SELECT COUNT(*) count FROM ops_frames")
           .one().count,
       });
+    }
     return json({ error: "Not found" }, 404);
   }
 }
