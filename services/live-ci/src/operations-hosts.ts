@@ -1,6 +1,17 @@
 /** Scoped host observations: explicit fields, aliases and permanent identities. */
 import { object, integer, source, string } from "./operations-model";
 export type PublicHost = { machine_id: string; alias: string };
+/** A restarted observer has no new host facts until its prepared stream arrives. */
+export function retainHostFacts(host: any, previous: any) {
+  return !host.observed_at && previous?.observed_at
+    ? {
+        ...previous,
+        alias: host.alias,
+        connected: host.connected,
+        transport_at: host.transport_at || previous.transport_at,
+      }
+    : host;
+}
 export function publicHosts(raw: string | undefined): PublicHost[] {
   const rows = JSON.parse(raw || "[]");
   if (!Array.isArray(rows) || rows.length > 100)
