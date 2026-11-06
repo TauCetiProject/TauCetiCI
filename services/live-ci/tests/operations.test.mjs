@@ -3274,3 +3274,24 @@ test("pool activity is independent of list cohorts, advances cached windows and 
   await r.request('/tick'); await r.flush();
   assert.deepEqual(r.object(r.manifest().domains.jobs).pool_activity.pools,[]);
 });
+
+test("upgrade schedules quiet legacy Facts partitions without another GitHub event", async t => {
+  const r=runtime(t);await r.send(seed);await r.flush();
+  const clock=Date.now()/1000;
+  for(let day=1;day<=3;day++) r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-0'+day,1,clock-86400*day,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date((clock-86400*day)*1000).toISOString()}));
+  const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
+  let calls=0;
+  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
+  const oldRevision=r.operations.get('jobs_revision')||0;
+  new Operations(r.ctx);
+  assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,3);
+  assert.equal(r.operations.get('jobs_revision'),oldRevision+1);
+  new Operations(r.ctx);
+  assert.equal(r.operations.get('jobs_revision'),oldRevision+1,'restart does not requeue already pending work');
+  await r.request('/tick');await r.flush();
+  assert.equal(calls,3);
+  assert.equal(r.object(r.manifest().domains.jobs).pool_activity.coverage,'retained_observations');
+  assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,0);
+  new Operations(r.ctx);
+  assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,0,'upgraded cached facts stay quiet');
+});
