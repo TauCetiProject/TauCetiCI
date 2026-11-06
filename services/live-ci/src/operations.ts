@@ -45,6 +45,8 @@ type SourceRow = {
 export class Operations {
   private sql: SqlStorage;
   private publishing?: Promise<void>;
+  private publicationRequested = false;
+  private bootstrapRequested = false;
   private publicationStarted?: number;
   private preparing = new Map<string, Preparation>();
   private pointer?: Promise<void>;
@@ -117,8 +119,19 @@ export class Operations {
     this.alarmUpdates = next.catch(() => {});
     return next;
   }
-  private schedule() {
-    return this.alarmUpdate(() => this.scheduleObservation());
+  private async schedule() {
+    // Recovery is durable before best-effort background work starts.
+    await this.alarmUpdate(() => this.scheduleObservation());
+    this.nudge();
+  }
+  private nudge(): void {
+    // Completion callbacks must not await/return this pump: the jobs lane may
+    // itself be waiting for the completing Facts worker's promise.
+    this.ctx.waitUntil(
+      this.publish().catch(() =>
+        console.warn("operations: event publication unavailable"),
+      ),
+    );
   }
   private async scheduleObservation() {
     // Coalesce at the next allowed publication slot, rather than adding a
@@ -1798,6 +1811,7 @@ export class Operations {
           this.publicationPending.delete(kind);
         }
         await this.rearm();
+        this.nudge();
       });
     this.ctx.waitUntil(entry.promise);
   }
@@ -2015,6 +2029,7 @@ export class Operations {
         this.pointer = undefined;
         this.publicationPending.delete("manifest");
         await this.rearm();
+        this.nudge();
       }
     })();
     this.ctx.waitUntil(this.pointer);
@@ -2095,7 +2110,7 @@ export class Operations {
       });
     this.ctx.waitUntil(this.maintenance);
   }
-  private async performPublish() {
+  private async performPublish(allowBootstrap: boolean) {
     await this.syncScope();
     const targets = this.targets(),
       clock = Date.now();
@@ -2145,20 +2160,36 @@ export class Operations {
         await this.prepare(kind, projection);
       });
     }
-    this.startPointer();
+    // An event can arrive before a cadence-deferred cold queue has even
+    // started preparing. Empty in-memory workers do not establish readiness.
+    const warm = DOMAINS.some((kind) => !!this.state(kind, false));
+    const queueReady = this.state("queue")?.version === this.targets().queue;
+    if (allowBootstrap || warm || queueReady) this.startPointer();
     await this.rearm();
   }
-  async publish() {
+  async publish(allowBootstrap = false) {
+    this.publicationRequested = true;
+    this.bootstrapRequested ||= allowBootstrap;
     if (this.publishing) return this.publishing;
-    this.publishing = this.performPublish();
+    this.publishing = (async () => {
+      do {
+        const bootstrap = this.bootstrapRequested;
+        this.publicationRequested = false;
+        this.bootstrapRequested = false;
+        await this.performPublish(bootstrap);
+      } while (this.publicationRequested);
+    })();
     try {
       await this.publishing;
     } finally {
       this.publishing = undefined;
+      // Preserve a kick delivered after the loop's last check but before this
+      // continuation. There is only one pending bit, never a work queue.
+      if (this.publicationRequested) this.nudge();
     }
   }
   async alarm() {
-    await this.publish();
+    await this.publish(true);
   }
 
   async fetch(request: Request) {
