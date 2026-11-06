@@ -1059,6 +1059,20 @@ test("a facts response over two megabytes is stored as individually bounded job 
       .n < 10000,
   );
   assert.equal(r.object(r.manifest().domains.jobs).counts.running, 1000);
+  const before = r.database.prepare("SELECT total_changes() n").get().n;
+  r.advance(15000);
+  value.revision = 2;
+  value.received_at = new Date(Date.now()).toISOString();
+  value.jobs[0] = {...value.jobs[0], active:false, status:"completed", conclusion:"success"};
+  value.jobs.splice(1,1);
+  await r.request("/partition",{partition,revision:2});
+  await r.operations.alarm();
+  assert.equal(r.database.prepare("SELECT COUNT(*) n FROM ops_job_facts").get().n,999);
+  assert.equal(r.database.prepare("SELECT active FROM ops_job_facts WHERE id='1'").get().active,0);
+  assert.equal(r.database.prepare("SELECT COUNT(*) n FROM ops_job_facts WHERE id='2'").get().n,0);
+  assert.equal(r.object(r.manifest().domains.jobs).counts.running,998);
+  const writes = r.database.prepare("SELECT total_changes() n").get().n - before;
+  assert.ok(writes < 100, `one changed and one removed job must not rewrite 1000 jobs (${writes} rows changed)`);
 });
 
 test("partial member updates cannot borrow old commits to claim current-generation completeness", async (t) => {
