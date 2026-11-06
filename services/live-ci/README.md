@@ -56,6 +56,15 @@ is provisional. An unavailable or unfinished input remains explicit.
 Publication runs independently of repair batches, so initial reconciliation
 cannot hold up snapshots of incoming webhook activity.
 
+Operations PR lookups retain 64 index slots. Up to four neighboring slots share
+one immutable lookup object, so a batch-version change does not require a
+separate upload for every slot. The existing `prs` dictionary and full member
+identities remain compatible with older readers. Groups split by encoded byte
+size above 256 KiB; an individual bucket retains its existing payload limit.
+Dirty groups capture unchanged neighbors before upload. Publication still uses
+the global four-upload limit, immutable objects before the manifest pointer,
+and the existing captured-generation and scope fences.
+
 Self-hosted jobs have their own fleet and runner-minute series. Their build
 outcomes, durations and waits contribute to the same PR and merge statistics as
 GitHub-hosted and Namespace jobs.
