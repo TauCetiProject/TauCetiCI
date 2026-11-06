@@ -27,6 +27,8 @@ type SourceRow = {
 export class Operations {
   private sql: SqlStorage;
   private publishing?: Promise<void>;
+  private publicationStarted?: number;
+  private publicationPending = new Set<string>();
   private get env(): Env {
     return bindings as Env;
   }
@@ -1421,7 +1423,10 @@ export class Operations {
       (queueCache?.version !== queueVersion || this.get("domain_error/queue"))
         ? this.captureQueue(source)
         : null;
-    await this.collectJobs();
+    this.publicationStarted = Date.now();
+    this.publicationPending.add("facts");
+    try { await this.collectJobs(); }
+    finally { this.publicationPending.delete("facts"); }
     const domains: Record<string, any> = {},
       caches: any[] = [];
     let updates: { kind: string; id: string; data: any }[] = [];
@@ -1443,7 +1448,10 @@ export class Operations {
       const failed = this.get("domain_error/" + kind);
       if (!failed || failed.due <= now()) {
         try {
-          const value = await build();
+          this.publicationPending.add(kind);
+          let value;
+          try { value = await build(); }
+          finally { this.publicationPending.delete(kind); }
           domains[kind] = value;
           caches.push({ kind, version, scope, value });
           this.set("domain_error/" + kind, null);
@@ -1530,6 +1538,7 @@ export class Operations {
       generated_at: new Date(clock * 1000).toISOString(),
       domains,
     };
+    this.publicationPending.add("manifest");
     await this.env.ARCHIVE.put(
       "public/v1/operations/manifest.json",
       JSON.stringify(manifest),
@@ -1551,6 +1560,8 @@ export class Operations {
         "DELETE FROM ops_views WHERE kind='batch' AND id NOT IN (SELECT id FROM ops_entities WHERE collection='batches')",
       );
       this.sql.exec("DELETE FROM ops_dirty WHERE revision<=?", revision);
+      this.publicationPending.delete("manifest");
+      this.set("publication_elapsed_ms", Date.now() - this.publicationStarted!);
       this.set("published", clock);
       this.set("published_revision", revision);
       this.set("publication_error", false);
@@ -1595,6 +1606,7 @@ export class Operations {
       await this.publishing;
     } finally {
       this.publishing = undefined;
+      this.publicationPending.clear();
     }
   }
   private domainRetries(): { due: number }[] {
@@ -1857,6 +1869,12 @@ export class Operations {
     }
     if (path === "/health")
       return json({
+        publisher_version: this.env.CF_VERSION?.id || null,
+        alarm_at: await this.ctx.storage.getAlarm(),
+        publication_in_flight: !!this.publishing,
+        publication_started_at: this.publicationStarted || null,
+        publication_pending: [...this.publicationPending],
+        publication_elapsed_ms: this.get("publication_elapsed_ms") ?? null,
         published_at: this.get("published") || null,
         publication_error: !!this.get("publication_error"),
         revision: this.get("revision") || 0,
