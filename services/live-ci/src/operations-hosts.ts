@@ -55,7 +55,7 @@ export function hostFrame(value: any, registry: PublicHost[]) {
   for (const host of value.hosts) {
     object(
       host,
-      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated admission activity",
+      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated admission activity capacity_context",
     );
     if (
       !registry.some(
@@ -81,6 +81,19 @@ export function hostFrame(value: any, registry: PublicHost[]) {
       flag(host[key]);
     for (const key of ["ci_enabled", "workers_enabled", "memory_pressure"])
       flag(host[key], true);
+    if (host.capacity_context !== undefined) {
+      const c = host.capacity_context;
+      object(c, "observed_at scope coverage observer_error running_jobs");
+      stamp(c.observed_at);
+      if (
+        c.scope !== "organization_all_workflow_jobs" ||
+        !["observed", "unavailable"].includes(c.coverage)
+      )
+        throw new Error("Invalid capacity scope");
+      flag(c.observer_error);
+      object(c.running_jobs, "github namespace self-hosted");
+      for (const v of Object.values(c.running_jobs)) if (v !== null) integer(v);
+    }
     if (host.admission !== undefined) {
       object(
         host.admission,

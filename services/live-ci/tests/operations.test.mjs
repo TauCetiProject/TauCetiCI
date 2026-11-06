@@ -675,6 +675,13 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     workers_enabled: true,
     ci_max_jobs: 0,
     worker_limit: 2,
+    capacity_context: {
+      observed_at: new Date(Date.now() - 120000).toISOString(),
+      scope: "organization_all_workflow_jobs",
+      coverage: "observed",
+      observer_error: false,
+      running_jobs: { github: 3, namespace: 4, "self-hosted": null },
+    },
     admission: {
       ci_kinds: ["pr", "staging"],
       staging_slots: 1,
@@ -831,6 +838,13 @@ test("combined large queue, job and host fixture binds exact candidate/run/attem
     workers_enabled: true,
     ci_max_jobs: 1,
     worker_limit: 2,
+    capacity_context: {
+      observed_at: new Date(Date.now() - 120000).toISOString(),
+      scope: "organization_all_workflow_jobs",
+      coverage: "observed",
+      observer_error: false,
+      running_jobs: { github: 3, namespace: 4, "self-hosted": null },
+    },
     admission: {
       ci_kinds: ["pr", "staging"],
       staging_slots: 1,
@@ -1034,4 +1048,145 @@ test("quiet heartbeats do not rewrite every reachable object timestamp", async (
       .get(row.hash);
     assert.equal(after.referenced, row.referenced);
   }
+});
+
+test("canonical SHA and recorded token coverage accept only their public contracts", async (t) => {
+  const r = runtime(t),
+    frame = structuredClone(seed);
+  frame.metadata.canonical_sha = "a".repeat(40);
+  const task = {
+    id: "99",
+    kind: "repair",
+    batch_id: "1",
+    batch_version: 1,
+    state: "open",
+    resolution: "",
+    ci_attempt_id: null,
+    created_at: seed.metadata.observed_at,
+    resolved_at: null,
+    progress: {
+      coverage: "observed",
+      state: "agent_running",
+      observed_at: seed.metadata.observed_at,
+      seconds: 10,
+      providers: ["codex"],
+      models: ["gpt-6.1"],
+      cost: {
+        recorded_usd: 1,
+        recorded_attempts: 1,
+        unknown_attempts: 0,
+        coverage: "recorded_subtotal_only",
+      },
+      usage: {
+        input_tokens: {
+          recorded_tokens: 100,
+          recorded_attempts: 1,
+          unknown_attempts: 0,
+        },
+        output_tokens: {
+          recorded_tokens: 0,
+          recorded_attempts: 0,
+          unknown_attempts: 1,
+        },
+      },
+    },
+  };
+  frame.changes.push({ collection: "tasks", id: "99", value: task });
+  const bad = structuredClone(frame);
+  bad.metadata.canonical_sha = "PRIVATE_PATH";
+  await r.send(bad, 400);
+  const secret = structuredClone(frame);
+  secret.changes.at(-1).value.progress.usage.private_prompt = "PRIVATE";
+  await r.send(secret, 400);
+  await r.send(frame);
+  await r.operations.alarm();
+  assert.equal(
+    r.object(r.manifest().domains.queue).canonical_sha,
+    "a".repeat(40),
+  );
+});
+
+test("GitHub event time stays separate from fact receipt time", async (t) => {
+  const r = runtime(t),
+    partition = repo + "/2027-01-15";
+  const event = new Date(Date.now() - 120000).toISOString(),
+    receipt = new Date(Date.now()).toISOString();
+  globalThis.__operationsTestEnv.CONTROL = {
+    getByName: () => ({
+      fetch: async () => Response.json({ partitions: [], inventory: [] }),
+    }),
+  };
+  r.database.prepare("INSERT INTO ops_partitions VALUES (?,?,?,?,?)").run(
+    partition,
+    1,
+    0,
+    Math.floor(Date.now() / 1000),
+    JSON.stringify({
+      received_at: receipt,
+      pending_workflows: [
+        {
+          repository: repo,
+          run_id: "1",
+          run_attempt: 1,
+          status: "queued",
+          workflow: ".github/workflows/pr-build.yml",
+          observed_at: event,
+        },
+      ],
+      pending_workflows_count: 1,
+    }),
+  );
+  await r.operations.alarm();
+  const root = r.object(r.manifest().domains.jobs);
+  assert.equal(root.observed_at, event);
+  assert.equal(root.received_at, receipt);
+  assert.equal(root.observer.last_event_at, event);
+});
+
+test("build, control and maintenance are separate monitoring classes", async () => {
+  const code = await build({
+    entryPoints: ["src/operations-jobs.ts"],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    write: false,
+  });
+  const { publicJob } = await import(
+    "data:text/javascript;base64," +
+      Buffer.from(code.outputFiles[0].text).toString("base64")
+  );
+  const run = {
+    id: "1",
+    repo,
+    attempt: 1,
+    workflow: ".github/workflows/pr-build.yml",
+    trigger: "pr",
+    status: "in_progress",
+    head: "a".repeat(40),
+  };
+  const job = {
+    id: "2",
+    attempt: 1,
+    name: "sandboxed-build",
+    kind: "github",
+    status: "in_progress",
+    steps: [],
+    labels: [],
+    created: 1,
+    updated: 2,
+  };
+  assert.equal(publicJob(run, job).job_class, "pr_build");
+  assert.equal(
+    publicJob(run, { ...job, name: "pick-runner" }).job_class,
+    "control",
+  );
+  assert.equal(
+    publicJob({ ...run, workflow: ".github/workflows/live-ci-tests.yml" }, job)
+      .job_class,
+    "maintenance",
+  );
+  assert.equal(
+    publicJob({ ...run, workflow: "unknown.yml" }, job).job_class,
+    "other",
+  );
 });
