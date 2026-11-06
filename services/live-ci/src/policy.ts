@@ -24,6 +24,7 @@ export function compactEvent(event: any): any {
   if (event.jobs) value.jobs = event.jobs.map((job: any) => ({
     ...pick(job, ['id', 'job_id', 'run_id', 'run_attempt', 'name', 'status', 'conclusion',
       'created_at', 'started_at', 'completed_at', 'labels', 'runner_id', 'runner_name',
+      'check_run_url',
       'runner_kind', 'assigned', 'weight', 'estimated', 'failure', 'failure_class', 'failure_excerpt']),
     steps: (job.steps || []).map((step: any) => pick(step, ['name', 'number', 'n', 'started_at', 'completed_at', 'conclusion'])),
   }));
