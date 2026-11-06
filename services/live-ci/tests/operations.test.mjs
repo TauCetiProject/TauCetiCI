@@ -3295,3 +3295,29 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   new Operations(r.ctx);
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,0,'upgraded cached facts stay quiet');
 });
+
+test("historical activity migration leaves two live source lanes and still advances old work", async t => {
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const clock=Date.now()/1000, day=new Date(Date.now()).toISOString().slice(0,10), calls=[];
+ const insert=r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)');
+ for(let n=1;n<=12;n++)insert.run(repo+'/2026-10-'+String(n).padStart(2,'0'),1,clock-10000+n,JSON.stringify({computed_at:new Date((clock-20000)*1000).toISOString(),pending_workflows:[],activity:{complete:false,pools:[]}}));
+ const hot=[repo+'/'+day,repo+'/'+new Date((clock-86400)*1000).toISOString().slice(0,10)];
+ for(const partition of hot)insert.run(partition,1,clock,JSON.stringify({computed_at:new Date((clock-100)*1000).toISOString(),pending_workflows:[],activity:{complete:false,pools:[]}}));
+ globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls.push(partition);return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,jobs:[],pending_workflows:[],computed_at:new Date(Date.now()).toISOString(),activity:{complete:true,pools:[]}});}})};
+ await r.request('/tick');await r.drain();
+ assert.equal(calls.length,3);assert.ok(hot.every(p=>calls.includes(p)),'both live sources advance before the historical backlog empties');
+ assert.ok(calls.some(p=>p.endsWith('/2026-10-01')),'historical work retains a lane');
+ for(const p of hot)assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(p).pending,0);
+});
+
+test("pool activity includes cached source metadata beyond the 200-partition job display limit", async t => {
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const clock=Date.now()/1000, minute=Math.floor(clock/60)*60;
+ const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
+ for(let n=0;n<205;n++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/'+new Date((clock-n*86400)*1000).toISOString().slice(0,10),1,clock-n,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date(Date.now()).toISOString(),activity:{complete:true,pools:[{pool:'github',all:scope,builds:scope,bins:[[minute-120,1,0,0,0,0,1,0,0,0,0]]}]}}));
+ r.operations.set('jobs_revision',99);await r.request('/tick');await r.flush();
+ const value=r.object(r.manifest().domains.jobs);
+ assert.equal(value.source_truncated,true);
+ assert.equal(value.pool_activity.coverage,'retained_observations');
+ assert.equal(value.pool_activity.pools[0].builds.windows[0].finished,205);
+});

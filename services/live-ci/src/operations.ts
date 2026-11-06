@@ -1120,15 +1120,19 @@ export class Operations {
     return true;
   }
   private async collectJobs(projection: Projection) {
-    const pending = this.sql
-      .exec<{
-        name: string;
-        revision: number;
-      }>(
-        "SELECT p.name,p.revision FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1 AND (f.due IS NULL OR f.due<=?) ORDER BY p.received LIMIT 3",
-        now(),
-      )
-      .toArray();
+    const eligible = `FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name
+      WHERE p.pending=1 AND (f.due IS NULL OR f.due<=?)`;
+    // Migration must not starve currently changing jobs. Reserve two of the
+    // existing three source reads for recent/active partitions, oldest capture
+    // first; the remaining lane always advances historical work.
+    const hot = this.sql.exec<{name:string;revision:number}>(
+      `SELECT p.name,p.revision ${eligible} AND (substr(p.name,-10)>=? OR
+        EXISTS(SELECT 1 FROM ops_job_facts j WHERE j.partition=p.name AND j.active=1))
+       ORDER BY COALESCE(json_extract(p.data,'$.computed_at'),''),p.received,p.name LIMIT 2`,
+      now(),new Date((now()-86400)*1000).toISOString().slice(0,10)).toArray();
+    const oldest = this.sql.exec<{name:string;revision:number}>(
+      `SELECT p.name,p.revision ${eligible} ORDER BY p.received,p.name LIMIT 3`,now()).toArray();
+    const pending = [...hot,...oldest.filter(p=>!hot.some(h=>h.name===p.name))].slice(0,3);
     await Promise.all(
       pending.map(async (p) => {
         try {
@@ -1693,8 +1697,15 @@ export class Operations {
           truncated: completedOther.length > 50,
         },
       },
-      pool_activity: mergeActivity(facts, now(), partitions.length > 200 ||
-        partitions.some(p => p.pending || !p.data)),
+      pool_activity: (() => {
+        // Activity has no job-list or 200-partition display limit. Cached
+        // metadata contains compact bins/references, never the full job list.
+        const sources = this.sql.exec<{name:string;data:string|null;pending:number}>(
+          "SELECT name,data,pending FROM ops_partitions").toArray()
+          .filter(p=>projection.repositories.includes(p.name.split("/").slice(0,2).join("/")));
+        return mergeActivity(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),now(),
+          sources.some(p=>p.pending || !p.data));
+      })(),
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
         last_event_at: observed,

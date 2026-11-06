@@ -49,9 +49,9 @@ test('oldest running uses actual starts, waiting uses creation, and references l
 });
 test('backfill is bounded, restartable and partial until every retained fact is indexed',t=>{
  const r=runtime(t);for(let i=0;i<1201;i++){const j=job(10000+i);r.sql.exec('INSERT INTO jobs VALUES (?,?,?,?,?)',j.id,j.run,1,0,JSON.stringify(j));}
- r.index.backfill(()=>run);assert.equal(r.sql.exec('SELECT count(*) n FROM ops_activity').one().n,500);assert.equal(merged(r).coverage,'partial');
- new ActivityIndex(r.sql).backfill(()=>run);assert.equal(r.sql.exec('SELECT count(*) n FROM ops_activity').one().n,1000);
- r.index.backfill(()=>run);assert.equal(merged(r).coverage,'retained_observations');assert.equal(pool(merged(r)).builds.windows[0].finished,1201);assert.equal(r.index.backfill(()=>run),false);
+ r.index.backfill(()=>run);assert.equal(r.sql.exec('SELECT count(*) n FROM ops_activity').one().n,100);assert.equal(merged(r).coverage,'partial');
+ new ActivityIndex(r.sql).backfill(()=>run);assert.equal(r.sql.exec('SELECT count(*) n FROM ops_activity').one().n,200);
+ for(let i=0;i<11;i++)r.index.backfill(()=>run);assert.equal(merged(r).coverage,'retained_observations');assert.equal(pool(merged(r)).builds.windows[0].finished,1201);assert.equal(r.index.backfill(()=>run),false);
  r.index.removeRun('100',1);assert.equal(pool(merged(r)).builds.windows[0].finished,0);
 });
 test('partition merge preserves pool aliases, latest outcome and explicit missing coverage',t=>{

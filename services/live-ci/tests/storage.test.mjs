@@ -766,7 +766,7 @@ test("operations pool activity counts retained facts beyond the public list and 
   assert.equal(result.jobs.length, 1100);
   assert.equal(result.truncated, true);
   assert.equal(result.activity.complete, false);
-  await read(); result = await read();
+  for(let i=0;i<12;i++) result = await read();
   assert.equal(result.activity.complete, true);
   const all = result.activity.pools.find(p => p.pool === "github");
   assert.equal(all.bins.reduce((n,b) => n + b[1], 0),1201);
