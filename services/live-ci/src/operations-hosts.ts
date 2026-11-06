@@ -55,7 +55,7 @@ export function hostFrame(value: any, registry: PublicHost[]) {
   for (const host of value.hosts) {
     object(
       host,
-      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated",
+      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated admission activity",
     );
     if (
       !registry.some(
@@ -81,6 +81,34 @@ export function hostFrame(value: any, registry: PublicHost[]) {
       flag(host[key]);
     for (const key of ["ci_enabled", "workers_enabled", "memory_pressure"])
       flag(host[key], true);
+    if (host.admission !== undefined) {
+      object(
+        host.admission,
+        "ci_kinds staging_slots memory_budget_gib reservation_error",
+      );
+      const a = host.admission;
+      if (
+        a.ci_kinds !== null &&
+        !['["pr"]', '["staging"]', '["pr","staging"]'].includes(
+          JSON.stringify(a.ci_kinds),
+        )
+      )
+        throw new Error("Invalid CI classes");
+      num(a.staging_slots);
+      num(a.memory_budget_gib);
+      flag(a.reservation_error);
+    }
+    if (host.activity !== undefined) {
+      object(
+        host.activity,
+        "observed_at window_hours finished_rounds failed_rounds unknown_rounds",
+      );
+      stamp(host.activity.observed_at);
+      if (host.activity.window_hours !== 24)
+        throw new Error("Invalid activity window");
+      for (const k of ["finished_rounds", "failed_rounds", "unknown_rounds"])
+        num(host.activity[k]);
+    }
     num(host.ci_max_jobs);
     num(host.worker_limit);
     num(host.cpu_idle_fraction);

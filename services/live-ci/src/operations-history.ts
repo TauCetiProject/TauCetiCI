@@ -23,13 +23,52 @@ export function historyFrame(v: any, repositories: string[]) {
   if (!Array.isArray(v.windows) || v.windows.length > 3)
     throw new Error("Invalid windows");
   for (const w of v.windows) {
-    object(w, "key label from until hours summary heads heads_truncated");
+    object(
+      w,
+      "key label from until hours summary heads heads_truncated criteria",
+    );
     if (!["24h", "7d", "pilot"].includes(w.key))
       throw new Error("Invalid window");
     string(w.label, 40);
     stamp(w.from);
     stamp(w.until);
     numeric(w.hours);
+    if (w.criteria !== undefined) {
+      object(w.criteria, "scenario week");
+      const { scenario, week } = w.criteria;
+      object(
+        scenario,
+        "status eligible_count qualifying_count qualifying_batches",
+      );
+      if (
+        ![
+          "timing_met_verification_required",
+          "not_met_in_observed_data",
+          "not_observed",
+        ].includes(scenario.status)
+      )
+        throw new Error("Invalid scenario status");
+      numeric(scenario.eligible_count);
+      numeric(scenario.qualifying_count);
+      if (
+        !Array.isArray(scenario.qualifying_batches) ||
+        scenario.qualifying_batches.length > 100 ||
+        scenario.qualifying_batches.some(
+          (b: any) => typeof b !== "string" || !/^\d{1,20}$/.test(b),
+        )
+      )
+        throw new Error("Invalid qualifying batches");
+      object(week, "status observed_days rate_above_baseline");
+      if (
+        ![
+          "not_yet_observable",
+          "requires_attribution_and_comment_audit",
+        ].includes(week.status) ||
+        typeof week.rate_above_baseline !== "boolean"
+      )
+        throw new Error("Invalid week criterion");
+      numeric(week.observed_days);
+    }
     object(
       w.summary,
       METRICS +

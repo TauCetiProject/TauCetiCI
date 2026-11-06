@@ -675,6 +675,19 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     workers_enabled: true,
     ci_max_jobs: 0,
     worker_limit: 2,
+    admission: {
+      ci_kinds: ["pr", "staging"],
+      staging_slots: 1,
+      memory_budget_gib: 64,
+      reservation_error: false,
+    },
+    activity: {
+      observed_at: new Date(Date.now() - 60000).toISOString(),
+      window_hours: 24,
+      finished_rounds: 8,
+      failed_rounds: 1,
+      unknown_rounds: 2,
+    },
     resources: { cpus: 16, memory_total: 1e10, memory_available: 1e9 },
     cpu_idle_fraction: 0.2,
     memory_pressure: true,
@@ -698,6 +711,9 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
   const bad = structuredClone(frame);
   bad.hosts[0].environment = { TOKEN: "private" };
   assert.equal((await r.request("/hosts", bad)).status, 400);
+  const privateAdmission = structuredClone(frame);
+  privateAdmission.hosts[0].admission.private_command = "PRIVATE";
+  assert.equal((await r.request("/hosts", privateAdmission)).status, 400);
   assert.equal((await r.request("/hosts", frame)).status, 200);
   await r.operations.alarm();
   const hosts = r.object(r.manifest().domains.hosts);
@@ -815,6 +831,19 @@ test("combined large queue, job and host fixture binds exact candidate/run/attem
     workers_enabled: true,
     ci_max_jobs: 1,
     worker_limit: 2,
+    admission: {
+      ci_kinds: ["pr", "staging"],
+      staging_slots: 1,
+      memory_budget_gib: 64,
+      reservation_error: false,
+    },
+    activity: {
+      observed_at: new Date(Date.now() - 60000).toISOString(),
+      window_hours: 24,
+      finished_rounds: 8,
+      failed_rounds: 1,
+      unknown_rounds: 2,
+    },
     resources: { cpus: 16, memory_total: 1e10, memory_available: 1e9 },
     cpu_idle_fraction: 0.2,
     memory_pressure: true,
