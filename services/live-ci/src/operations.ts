@@ -648,7 +648,7 @@ export class Operations {
       }));
     const prs = Array.from({ length: 64 }, (_, bucket) => {
       if (
-        cached.has("pr:" + bucket) &&
+        cached.get("pr:" + bucket)?.waiting_records &&
         !dirty.some((d) => d.kind === "pr" && d.id === String(bucket))
       )
         return null;
@@ -718,10 +718,11 @@ export class Operations {
           });
           pr[kind].push(item);
         }
+      const waiting = inputs.filter((i) => ["waiting", "reserved"].includes(i.state));
       save("pr", String(bucket), {
         ref: await this.object({ schema: "tauceti.operations.prs/v1", prs }),
-        waiting: inputs.filter((i) => ["waiting", "reserved"].includes(i.state))
-          .length,
+        waiting: waiting.length,
+        waiting_records: waiting,
       });
     }
     const shards: any[][] = Array.from({ length: 64 }, () => []);
@@ -751,6 +752,8 @@ export class Operations {
         ]),
       ).values(),
     ];
+    const waiting = Array.from({ length: 64 }, (_, i) => cached.get("pr:" + i).waiting_records)
+      .flat().sort((a, b) => (a.approved_at || "").localeCompare(b.approved_at || "") || a.id.localeCompare(b.id));
     const ref = await this.object({
       ...meta,
       schema: QUEUE_SCHEMA,
@@ -778,6 +781,7 @@ export class Operations {
         { length: 64 },
         (_, i) => cached.get("pr:" + i).ref,
       ),
+      waiting_pages: await this.pages("tauceti.operations.inputs/v1", waiting),
     });
     return { ref, updates };
   }
@@ -1402,7 +1406,7 @@ export class Operations {
     const sourceId = this.get("queue_source"),
       source = sourceId && this.source(sourceId);
     const queueCache = this.get("domain_cache/queue"),
-      queueVersion = source?.snapshot || "unavailable";
+      queueVersion = source?.snapshot ? "2/" + source.snapshot : "unavailable";
     const captured =
       source?.metadata &&
       this.repositories().length &&
