@@ -119,6 +119,15 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
       CREATE INDEX IF NOT EXISTS ops_host_samples_age ON ops_host_samples(resolution,bucket);
     `);
+    // Quiet historical sources will not emit another webhook. Revisit legacy
+    // cached partitions through the existing bounded collector to seed activity.
+    const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
+      WHERE pending=0 AND data IS NOT NULL AND json_type(data,'$.activity') IS NULL
+      RETURNING name`).toArray();
+    if (legacy.length) {
+      this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
+      this.set("revision", (this.get("revision") || 0) + 1);
+    }
   }
   private get(key: string): any {
     const row = this.sql
