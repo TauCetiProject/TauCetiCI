@@ -270,7 +270,7 @@ export function record(
 export function metadata(value: any, repositories: string[]) {
   object(
     value,
-    "schema observed_at source_revision coverage truncated scope service status_observed_at conditions outbox settings claims workers event_history_truncated claim_history_truncated collection_counts collection_complete active_batch_ids retained_batch_ids history canonical_sha",
+    "schema observed_at source_revision coverage truncated scope service status_observed_at conditions outbox settings claims workers event_history_truncated claim_history_truncated collection_counts collection_complete active_batch_ids retained_batch_ids history canonical_sha dispatch_config",
   );
   if (
     value.schema !== QUEUE_SCHEMA ||
@@ -296,6 +296,19 @@ export function metadata(value: any, repositories: string[]) {
   object(value.scope, "repositories");
   list(value.scope.repositories, 50);
   value.scope.repositories.forEach((r: any) => repository(r, repositories));
+  if (value.dispatch_config !== undefined && value.dispatch_config !== null) {
+    const c = value.dispatch_config;
+    object(c, "repository revision namespace_build_cap pr_order staging_order");
+    repository(c.repository, value.scope.repositories);
+    if (typeof c.revision !== "string" || !sha.test(c.revision) || c.revision !== value.canonical_sha)
+      throw new Error("Dispatch config must identify the observed canonical commit");
+    integer(c.namespace_build_cap, 0, 10000);
+    for (const order of [c.pr_order, c.staging_order]) {
+      list(order, 20);
+      if (!order.length || new Set(order).size !== order.length || order.some((name: any) => typeof name !== "string" || !/^[a-z][a-z0-9_-]{0,59}$/.test(name)))
+        throw new Error("Invalid dispatch order");
+    }
+  }
   object(
     value.service,
     "revision started_at mode controller publication_enabled",
