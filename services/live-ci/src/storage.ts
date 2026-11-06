@@ -16,6 +16,7 @@ import {
 } from "./model";
 import { call, json, now, type Env } from "./types";
 import { publicJob } from "./operations-jobs";
+import { ActivityIndex } from "./operations-activity";
 import { retained } from "./policy";
 const REFRESH_SECONDS = 300;
 const DAY_NOTIFY_MS = 60_000;
@@ -63,6 +64,8 @@ export class RunDirectory {
 /** One repository/day. Facts, prior contributions and transactional outbox commit together. */
 export class FactPartition {
   private sql: SqlStorage;
+  private activity?: ActivityIndex;
+  private activityIndex() { return this.activity ||= new ActivityIndex(this.sql); }
   constructor(
     private ctx: DurableObjectState,
     private env: Env,
@@ -152,6 +155,7 @@ export class FactPartition {
       data,
       JSON.stringify(after),
     );
+    this.activityIndex().record(run, next, active);
     if (!before || before.data !== data || before.active !== active) this.operationsChanged();
     const groups = new Map<string, Row[]>();
     for (const r of delta) {
@@ -468,6 +472,7 @@ export class FactPartition {
             this.sql.exec("SELECT 1 FROM outbox LIMIT 1").toArray().length
           )
             return;
+          this.activityIndex().removeRun(r.id, r.attempt);
           this.sql.exec(
             "DELETE FROM jobs WHERE run=? AND attempt=?",
             r.id,
@@ -490,6 +495,10 @@ export class FactPartition {
       });
     }
     if (path === "/operations") {
+      this.ctx.storage.transactionSync(() => {
+        if (this.activityIndex().backfill((id, attempt) => this.run(id, attempt))) this.operationsChanged();
+      });
+      if (this.meta("operations_pending")) await scheduleSoon(this.ctx);
       const rows = this.sql.exec<{data: string; run: string; attempt: number}>(
         "SELECT data,run,attempt FROM jobs WHERE json_extract(data,'$.estimated')=0 ORDER BY active DESC,CAST(json_extract(data,'$.updated') AS REAL) DESC LIMIT 1101").toArray();
       const jobs = rows.slice(0, 1100).map(row => {
@@ -500,7 +509,7 @@ export class FactPartition {
       const pendingRuns = runs.filter(r => !actualRuns.has(r.id + "/" + r.attempt));
       return json({ schema: "tauceti.operations.partition/v1", partition: this.meta("partition"), revision: this.meta("operations_revision") || 0,
         received_at: this.meta("operations_received") ? iso(this.meta("operations_received")) : null,
-        computed_at: iso(now()), jobs, pending_workflows_count: pendingRuns.length, pending_workflows: pendingRuns.slice(0, 50).map(r => ({
+        computed_at: iso(now()), jobs, activity: this.activityIndex().snapshot(now()), pending_workflows_count: pendingRuns.length, pending_workflows: pendingRuns.slice(0, 50).map(r => ({
           repository: r.repo, run_id: r.id, run_attempt: r.attempt, status: r.status, workflow: r.workflow, observed_at: iso(r.updated), url: `https://github.com/${r.repo}/actions/runs/${r.id}` })),
         truncated: rows.length > 1100 || runs.length > 500 });
     }
@@ -708,6 +717,7 @@ export class FactPartition {
               const old: Job = JSON.parse(sibling.data);
               if (old.estimated) {
                 this.replaceJob(run, { ...old, weight: 0 }, now());
+                this.activityIndex().remove(old.id);
                 this.sql.exec("DELETE FROM jobs WHERE id=?", old.id);
               }
             }

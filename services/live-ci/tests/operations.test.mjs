@@ -3254,3 +3254,23 @@ test("duplicate arrivals do not upload again and event-driven heartbeats preserv
       "the minimum pointer interval is preserved",
     );
 });
+
+test("pool activity is independent of list cohorts, advances cached windows and obeys repository withdrawal", async t => {
+  const r=runtime(t);
+  await r.send(seed); await r.flush();
+  const clock=Date.now()/1000, minute=Math.floor(clock/60)*60;
+  const scope={running:12,waiting:3,latest_completion:null,oldest_running:null,oldest_waiting:null};
+  const activity={complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'brett',all:scope,builds:scope,bins:[[minute-3600,1700,2,3,0,0,1600,1,1,0,0]]}]};
+  r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-06',1,clock,JSON.stringify({jobs:[],activity,pending_workflows:[],received_at:new Date(Date.now()).toISOString()}));
+  r.operations.set('jobs_revision',99); await r.request('/tick'); await r.flush();
+  let jobs=r.object(r.manifest().domains.jobs);
+  assert.equal(jobs.pool_activity.pools[0].builds.windows[0].finished,1602);
+  assert.equal(jobs.counts.running,0, 'the separately bounded list is not the source for pool counts');
+  r.advance(61000); await r.request('/tick'); await r.flush();
+  jobs=r.object(r.manifest().domains.jobs);
+  assert.equal(jobs.pool_activity.pools[0].builds.windows[0].finished,0);
+  assert.equal(jobs.pool_activity.pools[0].builds.windows[1].finished,1602);
+  globalThis.__operationsTestEnv.OPERATIONS_PUBLIC_REPOSITORIES='[]';
+  await r.request('/tick'); await r.flush();
+  assert.deepEqual(r.object(r.manifest().domains.jobs).pool_activity.pools,[]);
+});
