@@ -1,6 +1,7 @@
 import { publicJob } from "./operations-jobs";
 import { RUNNERS, type Job, type Run } from "./model";
 
+const BACKFILL_PAGE = 100;
 const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
@@ -64,16 +65,16 @@ export class ActivityIndex {
       return row ? JSON.parse(row.value) : null;
     };
     if (read("activity_index_complete")) return false;
-    const rows = this.sql.exec<any>("SELECT id,run,attempt,active,data FROM jobs WHERE id>? ORDER BY id LIMIT 501",
+    const rows = this.sql.exec<any>(`SELECT id,run,attempt,active,data FROM jobs WHERE id>? ORDER BY id LIMIT ${BACKFILL_PAGE+1}`,
       read("activity_index_cursor") || "").toArray();
-    for (const row of rows.slice(0, 500)) {
+    for (const row of rows.slice(0, BACKFILL_PAGE)) {
       const run = resolve(row.run, row.attempt);
       if (!run) throw new Error("Activity source parent missing");
       this.record(run, JSON.parse(row.data), row.active);
     }
-    const key = rows.length > 500 ? "activity_index_cursor" : "activity_index_complete";
+    const key = rows.length > BACKFILL_PAGE ? "activity_index_cursor" : "activity_index_complete";
     this.sql.exec("INSERT OR REPLACE INTO meta VALUES (?,?)", key,
-      JSON.stringify(rows.length > 500 ? rows[499].id : true));
+      JSON.stringify(rows.length > BACKFILL_PAGE ? rows[BACKFILL_PAGE-1].id : true));
     return true;
   }
   snapshot(clock: number) {
