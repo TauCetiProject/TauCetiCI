@@ -217,6 +217,10 @@ test("repair build observations retain numeric progress separately from phase ag
   const build = {stage:"preparation",completed_tasks:58742,total_tasks:60357,sampled_at:seed.metadata.observed_at,log_updated_at:seed.metadata.observed_at,last_progress_at:null};
   const task = {id:"21",kind:"rebase_conflict",batch_id:head.id,batch_version:head.version,state:"open",resolution:"",ci_attempt_id:null,created_at:seed.metadata.observed_at,resolved_at:null,progress:{coverage:"observed",state:"sources_ready",observed_at:"2026-01-01T00:00:00Z",seconds:null,providers:[],models:[],cost:{recorded_usd:0,recorded_attempts:0,unknown_attempts:0,coverage:"recorded_subtotal_only"},build}};
   frame.changes.push({collection:"tasks",id:task.id,value:task});
+  task.progress.models_truncated = false;
+  const invalidCoverage=structuredClone(frame);
+  invalidCoverage.changes.at(-1).value.progress.models_truncated="PRIVATE";
+  await r.send(invalidCoverage,400);
   for (const change of [
     b => {b.private_log="PRIVATE";},
     b => {b.completed_tasks=60358;},

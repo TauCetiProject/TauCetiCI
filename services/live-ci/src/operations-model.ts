@@ -185,13 +185,15 @@ export function record(
     } else if (key === "progress") {
       object(
         item,
-        "coverage state observed_at seconds providers models cost usage build",
+        "coverage state observed_at seconds providers models models_truncated cost usage build",
       );
       if (!["observed", "unavailable"].includes(item.coverage))
         throw new Error("Invalid task progress");
       if (item.coverage !== "observed" && item.build !== undefined)
         throw new Error("Build requires an observed task");
       stamp(item.observed_at);
+      if (item.models_truncated !== undefined && typeof item.models_truncated !== "boolean")
+        throw new Error("Invalid model coverage");
       if (item.coverage === "observed") {
         string(item.state, 40);
         if (item.build !== undefined) {
