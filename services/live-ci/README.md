@@ -310,3 +310,13 @@ The 1x/10x fixture checks contribution growth and independence from retained
 history. Its local timings are not evidence of Cloudflare network capacity;
 observe production queue age, request usage, storage and processing costs during
 rollout before asserting a production throughput limit.
+
+The operations jobs report includes per-pool activity computed before the public
+job-list limits: running and waiting counts, oldest running/waiting references,
+latest observed completion and rolling 1/3/24-hour outcome counts. A rebuildable
+Facts index backfills in pages of 500; coverage remains partial until every
+source finishes. Completion windows end at the latest whole minute and advance
+from cached minute bins on publisher ticks, without GitHub discovery requests.
+Success, failure (including timeout), cancellation, skip and other outcomes stay
+separate. Counts cover retained observations, not an assertion of full GitHub
+inventory. Raw fact retirement removes the corresponding index records.

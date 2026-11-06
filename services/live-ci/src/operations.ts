@@ -1,5 +1,6 @@
 /** Prepared operations publication. Public GETs never enter this object. */
 import { historyFrame } from "./operations-history";
+import { mergeActivity } from "./operations-activity";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
@@ -1681,6 +1682,8 @@ export class Operations {
           truncated: completedOther.length > 50,
         },
       },
+      pool_activity: mergeActivity(facts, now(), partitions.length > 200 ||
+        partitions.some(p => p.pending || !p.data)),
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
         last_event_at: observed,
@@ -1793,7 +1796,7 @@ export class Operations {
     const source = this.source(this.get("queue_source") || "");
     return {
       queue: source?.snapshot ? "3/" + source.snapshot : "unavailable",
-      jobs: "4/" + (this.get("jobs_revision") || 0),
+      jobs: "5/" + (this.get("jobs_revision") || 0) + "/" + (this.sql.exec("SELECT 1 FROM ops_partitions LIMIT 1").toArray().length ? Math.floor(now() / 60) : 0),
       hosts: canonical({
         bridge: this.get("hosts")?.source || null,
         pushed: this.sql

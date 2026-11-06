@@ -756,3 +756,25 @@ test("operations notifications carry job-only changes from alarms and cannot blo
   await f.fact.alarm();
   assert.ok(f.fact.meta("operations_pending"), "failed observer notification remains retryable");
 });
+
+test("operations pool activity counts retained facts beyond the public list and follows source corrections", async t => {
+  const f = fixture(t, 1201), stamp = Date.now() / 1000;
+  const originals = f.ctx.storage.sql.exec("SELECT data FROM jobs").toArray().map(r => JSON.parse(r.data));
+  for (const j of originals) f.fact.replaceJob(f.run, { ...j, status: "completed", conclusion: "success", completed: stamp - 120 }, stamp);
+  const read = async () => (await f.fact.fetch(new Request("https://internal/operations", { method: "POST", body: "{}" }))).json();
+  let result = await read();
+  assert.equal(result.jobs.length, 1100);
+  assert.equal(result.truncated, true);
+  assert.equal(result.activity.complete, false);
+  await read(); result = await read();
+  assert.equal(result.activity.complete, true);
+  const all = result.activity.pools.find(p => p.pool === "github");
+  assert.equal(all.bins.reduce((n,b) => n + b[1], 0),1201);
+  assert.equal(all.all.running,0); assert.equal(all.all.waiting,0);
+  f.fact.replaceJob(f.run, { ...originals[0], status: "completed", conclusion: "failure", completed: stamp - 120, updated: stamp + 1 }, stamp + 1);
+  f.fact.replaceJob(f.run, { ...originals[0], id: "900000", status: "in_progress", assigned: true, started: stamp - 60, completed: null, updated: stamp + 1 }, stamp + 1);
+  result = await read();
+  const corrected = result.activity.pools.find(p => p.pool === "github");
+  assert.equal(corrected.bins.reduce((n,b) => n + b[1],0),1200);
+  assert.equal(corrected.builds.running,1);
+});
