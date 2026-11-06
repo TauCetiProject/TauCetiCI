@@ -511,7 +511,7 @@ test("public reads use R2 and cache only, with scoped ingestion, ETags and zero 
     manifest.headers.get("access-control-allow-origin"),
     "https://taucetiproject.org",
   );
-  assert.match(manifest.headers.get("cache-control"), /max-age=5,/);
+  assert.equal(manifest.headers.get("cache-control"), "no-store");
   assert.equal(
     (
       await mf.dispatchFetch(url + "/v1/operations/manifest.json", {
@@ -521,6 +521,8 @@ test("public reads use R2 and cache only, with scoped ingestion, ETags and zero 
     304,
   );
   const queue = (await manifest.json()).domains.queue;
+  const cachedManifest = await mf.dispatchFetch(url + "/v1/operations/manifest.json");
+  assert.equal(cachedManifest.headers.get("cache-control"), "no-store");
   const reads = await Promise.all(
     Array.from({ length: 100 }, () => mf.dispatchFetch(url + queue.url)),
   );

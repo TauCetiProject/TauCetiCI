@@ -223,11 +223,16 @@ async function handle(
       cacheKey = new Request(url.origin + path + (scope ? "?scope=" + scope : ""));
     const cached = await cache.match(cacheKey);
     if (cached) {
+      const headers = new Headers(cached.headers);
+      // Zone browser-TTL settings can rewrite headers on Cache API hits.
+      // The mutable pointer keeps its five-second edge entry, but viewers
+      // must revalidate through this handler rather than retain that rewrite.
+      if (operations && path.endsWith("/manifest.json")) headers.set("Cache-Control", "no-store");
       if (request.headers.get("if-none-match") === cached.headers.get("etag"))
-        return new Response(null, { status: 304, headers: cached.headers });
+        return new Response(null, { status: 304, headers });
       return request.method === "HEAD"
-        ? new Response(null, { headers: cached.headers })
-        : cached;
+        ? new Response(null, { headers })
+        : new Response(cached.body, { headers });
     }
     const object = await env.ARCHIVE.get("public" + path);
     if (!object)
@@ -257,11 +262,14 @@ async function handle(
     };
     const response = new Response(object.body, { headers });
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    const deliveryHeaders = operations && path.endsWith("/manifest.json")
+      ? { ...headers, "Cache-Control": "no-store" }
+      : headers;
     if (request.headers.get("if-none-match") === etag)
-      return new Response(null, { status: 304, headers });
+      return new Response(null, { status: 304, headers: deliveryHeaders });
     return request.method === "HEAD"
-      ? new Response(null, { headers })
-      : response;
+      ? new Response(null, { headers: deliveryHeaders })
+      : new Response(response.body, { headers: deliveryHeaders });
   }
   if (path === "/webhooks/github" && request.method === "POST") {
     const raw = await body(request, 25_000_000);
