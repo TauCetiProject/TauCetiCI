@@ -732,6 +732,41 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     r.database.prepare("SELECT COUNT(*) n FROM ops_host_samples").get().n,
     3,
   );
+  // Both transports initially report no prepared host state after a restart.
+  // Keep the real facts, their original time and history instead of publishing
+  // an empty host until its next successful observation arrives.
+  const empty = {
+    ...structuredClone(host),
+    observed_at: null,
+    transport_at: null,
+    connected: false,
+    coverage: "unavailable",
+    ci_enabled: null,
+    resources: { cpus: null, memory_total: null, memory_available: null },
+  };
+  const restarted = {
+    ...frame,
+    source: { ...frame.source, epoch: frame.source.epoch + 1, sequence: 1 },
+    hosts: [empty],
+  };
+  assert.equal((await r.request("/hosts", restarted)).status, 200);
+  await r.operations.alarm();
+  let retained = r.object(r.manifest().domains.hosts).hosts[0];
+  assert.equal(retained.observed_at, host.observed_at);
+  assert.equal(retained.resources.cpus, 16);
+  assert.equal(retained.connected, false);
+  assert.equal((await r.request("/host", frame)).status, 200);
+  assert.equal((await r.request("/host", restarted)).status, 200);
+  await r.operations.alarm();
+  retained = r.object(r.manifest().domains.hosts).hosts[0];
+  assert.equal(retained.observed_at, host.observed_at);
+  assert.equal(retained.resources.cpus, 16);
+  assert.equal(retained.connected, false);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_host_samples").get().n,
+    3,
+    "a restart must not manufacture another historical host sample",
+  );
 });
 
 test("shared pilot report exposes bounded public metrics without private snapshot or outcome paths", async (t) => {

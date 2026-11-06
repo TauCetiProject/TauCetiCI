@@ -1,6 +1,6 @@
 /** Prepared operations publication. Public GETs never enter this object. */
 import { historyFrame } from "./operations-history";
-import { hostFrame, publicHosts } from "./operations-hosts";
+import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
 import { call, digest, json, now, operationsScope, type Env } from "./types";
@@ -1736,11 +1736,11 @@ export class Operations {
       } catch {
         return json({ error: "Invalid scoped host observation" }, 400);
       }
-      const host = frame.hosts[0],
-        source = frame.source;
+      let host = frame.hosts[0];
+      const source = frame.source;
       const old = this.sql
         .exec<any>(
-          "SELECT source,epoch,sequence FROM ops_hosts WHERE machine=?",
+          "SELECT source,epoch,sequence,data FROM ops_hosts WHERE machine=?",
           host.machine_id,
         )
         .toArray()[0];
@@ -1751,6 +1751,7 @@ export class Operations {
           (old.epoch === source.epoch && old.sequence >= source.sequence))
       )
         return json({ error: "Superseded scoped host observation" }, 409);
+      host = retainHostFacts(host, old ? JSON.parse(old.data) : null);
       this.ctx.storage.transactionSync(() => {
         this.sql.exec(
           "INSERT OR REPLACE INTO ops_hosts VALUES (?,?,?,?,?,?)",
@@ -1789,6 +1790,12 @@ export class Operations {
           { error: "Superseded host observation or changed source identity" },
           409,
         );
+      frame.hosts = frame.hosts.map((host: any) =>
+        retainHostFacts(
+          host,
+          previous?.hosts.find((old: any) => old.machine_id === host.machine_id),
+        ),
+      );
       this.ctx.storage.transactionSync(() => {
         this.set("hosts", frame);
         this.set("hosts_received", new Date(now() * 1000).toISOString());
