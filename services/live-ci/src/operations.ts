@@ -13,6 +13,21 @@ import {
 } from "./operations-model";
 
 const PREFIX = "/v1/operations/objects/";
+type Projection = {
+  scope: string;
+  lane: string;
+  repositories: string[];
+  hosts: string;
+};
+type Ready = { scope: string; version: string; value: any; revision: number };
+const DOMAINS = ["jobs", "hosts", "host_history", "queue", "history"] as const;
+type Domain = (typeof DOMAINS)[number];
+type Preparation = {
+  version: string;
+  scope: string;
+  started: number;
+  promise: Promise<void>;
+};
 type SourceRow = {
   id: string;
   epoch: number;
@@ -28,10 +43,16 @@ export class Operations {
   private sql: SqlStorage;
   private publishing?: Promise<void>;
   private publicationStarted?: number;
+  private preparing = new Map<string, Preparation>();
+  private pointer?: Promise<void>;
+  private pointerStarted?: number;
+  private maintenance?: Promise<void>;
+  private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
   private activeUploads = 0;
-  private uploadWaiters: (() => void)[] = [];
+  private uploadWaiters: { lane: string; resolve: () => void }[] = [];
+  private lastUploadLane?: string;
   private get env(): Env {
     return bindings as Env;
   }
@@ -53,6 +74,8 @@ export class Operations {
       CREATE INDEX IF NOT EXISTS ops_entities_batch ON ops_entities(source,collection,batch,id);
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
       CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
+      CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
+      CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
       CREATE TABLE IF NOT EXISTS ops_links(parent TEXT,child TEXT,PRIMARY KEY(parent,child));
       CREATE TABLE IF NOT EXISTS ops_dirty(kind TEXT,id TEXT,revision INTEGER,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS ops_views(kind TEXT,id TEXT,data TEXT,PRIMARY KEY(kind,id));
@@ -85,10 +108,21 @@ export class Operations {
   private repositories(): string[] {
     return JSON.parse(this.env.OPERATIONS_PUBLIC_REPOSITORIES || "[]");
   }
-  private async schedule() {
+  private alarmUpdate(work: () => Promise<void>) {
+    const next = this.alarmUpdates.then(work);
+    this.alarmUpdates = next.catch(() => {});
+    return next;
+  }
+  private schedule() {
+    return this.alarmUpdate(() => this.scheduleObservation());
+  }
+  private async scheduleObservation() {
     // Coalesce at the next allowed publication slot, rather than adding a
     // full interval after every idle arrival. The write cadence stays bounded.
-    const lastStarted = Math.max(this.publicationStarted || 0, (this.get("published") || 0) * 1000);
+    const lastStarted = Math.max(
+      this.publicationStarted || 0,
+      (this.get("published") || 0) * 1000,
+    );
     const next = Math.max(
         Date.now() + 1000,
         lastStarted + 10_000,
@@ -97,8 +131,7 @@ export class Operations {
       old = await this.ctx.storage.getAlarm();
     // A due alarm may be waiting for delivery. Incoming observations must
     // preserve it: resetting an overdue deadline can starve publication.
-    if (old === null || old > next)
-      await this.ctx.storage.setAlarm(next);
+    if (old === null || old > next) await this.ctx.storage.setAlarm(next);
   }
   private source(id: string) {
     return this.sql
@@ -157,7 +190,9 @@ export class Operations {
       return { error: "Sequence already has a snapshot", status: 409 };
     const wire = JSON.stringify({ frame, hash: fingerprint });
     const existing = this.sql
-      .exec<{ data: string }>(
+      .exec<{
+        data: string;
+      }>(
         "SELECT data FROM ops_frames WHERE snapshot=? AND part=?",
         frame.snapshot,
         frame.part,
@@ -238,7 +273,10 @@ export class Operations {
       JSON.stringify(frame.base),
     );
     const staged = this.sql
-      .exec<{ count: number; bytes: number }>(
+      .exec<{
+        count: number;
+        bytes: number;
+      }>(
         "SELECT COUNT(*) count,COALESCE(SUM(bytes),0) bytes FROM ops_frames WHERE source=?",
         id,
       )
@@ -466,7 +504,9 @@ export class Operations {
       );
     }
     let retainedBytes = this.sql
-      .exec<{ bytes: number }>(
+      .exec<{
+        bytes: number;
+      }>(
         "SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) bytes FROM ops_entities",
       )
       .one().bytes;
@@ -562,57 +602,154 @@ export class Operations {
       .toArray()
       .map((r) => JSON.parse(r.data));
   }
-  /** Bound R2 connections across every concurrently projected domain. */
-  private async upload<T>(write: () => Promise<T>): Promise<T> {
+  /** A held put retains its permit. Pointer writes take the next available
+   * permit; bulk lanes alternate when more than one lane is waiting. */
+  private async upload<T>(lane: string, write: () => Promise<T>): Promise<T> {
     if (this.activeUploads >= 4)
-      await new Promise<void>((resolve) => this.uploadWaiters.push(resolve));
+      await new Promise<void>((resolve) =>
+        this.uploadWaiters.push({ lane, resolve }),
+      );
     else this.activeUploads++;
-    try { return await write(); }
-    finally {
-      const next = this.uploadWaiters.shift();
-      if (next) next();
+    this.lastUploadLane = lane;
+    try {
+      return await write();
+    } finally {
+      const pointer = this.uploadWaiters.findIndex(
+        (w) => w.lane === "manifest",
+      );
+      const other = this.uploadWaiters.findIndex(
+        (w) => w.lane !== this.lastUploadLane,
+      );
+      const index = pointer >= 0 ? pointer : other >= 0 ? other : 0;
+      const next = this.uploadWaiters.splice(index, 1)[0];
+      if (next) next.resolve();
       else this.activeUploads--;
     }
   }
-  private async parallel<T, R>(values: T[], build: (value: T) => Promise<R>): Promise<R[]> {
+  private async parallel<T, R>(
+    values: T[],
+    build: (value: T) => Promise<R>,
+  ): Promise<R[]> {
     const result: R[] = [];
     let next = 0;
-    const workers = await Promise.allSettled(Array.from({length: Math.min(4, values.length)}, async () => {
-      while (next < values.length) {
-        const index = next++;
-        result[index] = await build(values[index]);
-      }
-    }));
+    const workers = await Promise.allSettled(
+      Array.from({ length: Math.min(4, values.length) }, async () => {
+        while (next < values.length) {
+          const index = next++;
+          result[index] = await build(values[index]);
+        }
+      }),
+    );
     const failure = workers.find((r) => r.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
     return result;
   }
-  private async object(value: any): Promise<{ url: string }> {
+  private async object(
+    value: any,
+    projection: Projection,
+  ): Promise<{ url: string }> {
     const data = JSON.stringify(value),
-      hash = (await operationsScope(this.env)) + "/" + (await digest(data)),
-      clock = now();
-    const pending = this.objectWrites.get(hash);
+      logical = projection.scope + "/" + (await digest(data));
+    const pending = this.objectWrites.get(logical);
     if (pending) return pending;
     const work = (async () => {
-      const exists = this.sql.exec("SELECT 1 FROM ops_objects WHERE hash=?", hash).toArray().length;
-      if (!exists) {
-        await this.upload(() => this.env.ARCHIVE.put("public" + PREFIX + hash + ".json", data, {
-          httpMetadata: { contentType: "application/json" },
-        }));
-        this.sql.exec("INSERT OR IGNORE INTO ops_objects VALUES (?,?)", hash, clock);
-        for (const match of data.matchAll(/\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g))
-          this.sql.exec("INSERT OR IGNORE INTO ops_links VALUES (?,?)", hash, match[1]);
-      } else this.sql.exec("UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?", clock, hash, clock - 3600);
+      let allocation = this.sql
+        .exec<{
+          hash: string;
+        }>("SELECT hash FROM ops_object_keys WHERE logical=?", logical)
+        .toArray()[0];
+      // Existing deployments used the logical content hash as the physical key.
+      // Reuse a live legacy receipt; after retirement never recreate that key.
+      if (
+        !allocation &&
+        this.sql
+          .exec("SELECT 1 FROM ops_objects WHERE hash=?", logical)
+          .toArray().length
+      ) {
+        this.sql.exec(
+          "UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?",
+          now(),
+          logical,
+          now() - 3600,
+        );
+        return { url: PREFIX + logical + ".json" };
+      }
+      if (!allocation) {
+        const hash =
+          projection.scope +
+          "/" +
+          (await digest(logical + "/" + crypto.randomUUID()));
+        // Persist allocation BEFORE upload so an ambiguous put/restart retries
+        // the same incarnation instead of leaving a new orphan on every retry.
+        this.sql.exec(
+          "INSERT OR IGNORE INTO ops_object_keys VALUES (?,?,?)",
+          logical,
+          hash,
+          now(),
+        );
+        allocation = this.sql
+          .exec<{
+            hash: string;
+          }>("SELECT hash FROM ops_object_keys WHERE logical=?", logical)
+          .one();
+      }
+      const hash = allocation.hash;
+      if (
+        !this.sql.exec("SELECT 1 FROM ops_objects WHERE hash=?", hash).toArray()
+          .length
+      ) {
+        await this.upload(projection.lane, () =>
+          this.env.ARCHIVE.put("public" + PREFIX + hash + ".json", data, {
+            httpMetadata: { contentType: "application/json" },
+          }),
+        );
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec(
+            "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
+            hash,
+            now(),
+          );
+          for (const match of data.matchAll(
+            /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
+          ))
+            this.sql.exec(
+              "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
+              hash,
+              match[1],
+            );
+        });
+      } else
+        this.sql.exec(
+          "UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?",
+          now(),
+          hash,
+          now() - 3600,
+        );
       return { url: PREFIX + hash + ".json" };
     })();
-    this.objectWrites.set(hash, work);
-    try { return await work; }
-    finally { this.objectWrites.delete(hash); }
+    this.objectWrites.set(logical, work);
+    try {
+      return await work;
+    } finally {
+      if (this.objectWrites.get(logical) === work)
+        this.objectWrites.delete(logical);
+    }
   }
-  private async pages(schema: string, records: any[], size = 100) {
-    const starts = Array.from({length: Math.ceil(records.length / size)}, (_, index) => index * size);
+  private async pages(
+    schema: string,
+    records: any[],
+    size = 100,
+    projection: Projection,
+  ) {
+    const starts = Array.from(
+      { length: Math.ceil(records.length / size) },
+      (_, index) => index * size,
+    );
     return this.parallel(starts, async (start) => ({
-      ...(await this.object({schema, records: records.slice(start, start + size)})),
+      ...(await this.object(
+        { schema, records: records.slice(start, start + size) },
+        projection,
+      )),
       count: Math.min(size, records.length - start),
     }));
   }
@@ -620,17 +757,21 @@ export class Operations {
    * remain dirty for the next flush; a busy source cannot starve publication. */
   private captureQueue(source: SourceRow) {
     const views = this.sql
-      .exec<{ kind: string; id: string; data: string }>(
-        "SELECT * FROM ops_views",
-      )
+      .exec<{
+        kind: string;
+        id: string;
+        data: string;
+      }>("SELECT * FROM ops_views")
       .toArray();
     const cached = new Map(
       views.map((v) => [v.kind + ":" + v.id, JSON.parse(v.data)]),
     );
     const dirty = this.sql
-      .exec<{ kind: string; id: string; revision: number }>(
-        "SELECT * FROM ops_dirty",
-      )
+      .exec<{
+        kind: string;
+        id: string;
+        revision: number;
+      }>("SELECT * FROM ops_dirty")
       .toArray();
     const batches = this.rows(source.id, "batches").filter((b) =>
       this.repositories().includes(b.repository),
@@ -680,7 +821,13 @@ export class Operations {
     }).filter((p) => p !== null);
     return { source, cached, dirty, batches, changed, prs };
   }
-  private async queueView(capture: ReturnType<Operations["captureQueue"]>) {
+  private async queueView(
+    capture: ReturnType<Operations["captureQueue"]>,
+    projection: Projection,
+  ) {
+    const object = (value: any) => this.object(value, projection),
+      pages = (schema: string, records: any[], size = 100) =>
+        this.pages(schema, records, size, projection);
     const { source, cached, batches } = capture,
       meta = JSON.parse(source.metadata!);
     const updates: { kind: string; id: string; data: any }[] = [];
@@ -688,40 +835,40 @@ export class Operations {
       cached.set(kind + ":" + id, data);
       updates.push({ kind, id, data });
     };
-    await this.parallel(capture.changed, async ({ batch, members, attempts, tasks, events }) => {
-      const activeMembers = members.filter(
-        (m) => !m.removed && m.batch_version === batch.version,
-      );
-      const detail = await this.object({
-        schema: "tauceti.operations.batch/v1",
-        source_id: source.id,
-        batch,
-        member_pages: await this.pages(
-          "tauceti.operations.members/v1",
-          members,
-        ),
-        attempt_pages: await this.pages(
-          "tauceti.operations.attempts/v1",
-          attempts,
-          20,
-        ),
-        task_pages: await this.pages("tauceti.operations.tasks/v1", tasks),
-        event_pages: await this.pages("tauceti.operations.events/v1", events),
-        member_details_complete: activeMembers.length === batch.size,
-        member_count: activeMembers.length,
-        removed_count: members.length - activeMembers.length,
-      });
-      save("batch", batch.id, {
-        ...batch,
-        detail,
-        member_count: activeMembers.length,
-        latest_attempt:
-          [...attempts].sort((a, b) =>
-            BigInt(a.id) > BigInt(b.id) ? -1 : 1,
-          )[0] || null,
-        active_tasks: tasks.filter((t) => t.state === "open").slice(0, 10),
-      });
-    });
+    await this.parallel(
+      capture.changed,
+      async ({ batch, members, attempts, tasks, events }) => {
+        const activeMembers = members.filter(
+          (m) => !m.removed && m.batch_version === batch.version,
+        );
+        const detail = await object({
+          schema: "tauceti.operations.batch/v1",
+          source_id: source.id,
+          batch,
+          member_pages: await pages("tauceti.operations.members/v1", members),
+          attempt_pages: await pages(
+            "tauceti.operations.attempts/v1",
+            attempts,
+            20,
+          ),
+          task_pages: await pages("tauceti.operations.tasks/v1", tasks),
+          event_pages: await pages("tauceti.operations.events/v1", events),
+          member_details_complete: activeMembers.length === batch.size,
+          member_count: activeMembers.length,
+          removed_count: members.length - activeMembers.length,
+        });
+        save("batch", batch.id, {
+          ...batch,
+          detail,
+          member_count: activeMembers.length,
+          latest_attempt:
+            [...attempts].sort((a, b) =>
+              BigInt(a.id) > BigInt(b.id) ? -1 : 1,
+            )[0] || null,
+          active_tasks: tasks.filter((t) => t.state === "open").slice(0, 10),
+        });
+      },
+    );
     await this.parallel(capture.prs, async ({ bucket, inputs, members }) => {
       const prs: Record<string, any> = {};
       for (const [kind, records] of [
@@ -738,9 +885,11 @@ export class Operations {
           });
           pr[kind].push(item);
         }
-      const waiting = inputs.filter((i) => ["waiting", "reserved"].includes(i.state));
+      const waiting = inputs.filter((i) =>
+        ["waiting", "reserved"].includes(i.state),
+      );
       save("pr", String(bucket), {
-        ref: await this.object({ schema: "tauceti.operations.prs/v1", prs }),
+        ref: await object({ schema: "tauceti.operations.prs/v1", prs }),
         waiting: waiting.length,
         waiting_records: waiting,
       });
@@ -752,9 +901,12 @@ export class Operations {
       memberCount += view.member_count;
       shards[Number(BigInt(batch.id) % 64n)].push(view);
     }
-    const batchIndex = await this.parallel(shards, (shard) => this.object({
-      schema: "tauceti.operations.batches/v1", batches: shard,
-    }));
+    const batchIndex = await this.parallel(shards, (shard) =>
+      object({
+        schema: "tauceti.operations.batches/v1",
+        batches: shard,
+      }),
+    );
     const active = new Set(meta.active_batch_ids);
     const recent = [...batches]
       .sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? -1 : 1))
@@ -767,9 +919,17 @@ export class Operations {
         ]),
       ).values(),
     ];
-    const waiting = Array.from({ length: 64 }, (_, i) => cached.get("pr:" + i).waiting_records)
-      .flat().sort((a, b) => (a.approved_at || "").localeCompare(b.approved_at || "") || a.id.localeCompare(b.id));
-    const ref = await this.object({
+    const waiting = Array.from(
+      { length: 64 },
+      (_, i) => cached.get("pr:" + i).waiting_records,
+    )
+      .flat()
+      .sort(
+        (a, b) =>
+          (a.approved_at || "").localeCompare(b.approved_at || "") ||
+          a.id.localeCompare(b.id),
+      );
+    const ref = await object({
       ...meta,
       schema: QUEUE_SCHEMA,
       source_id: source.id,
@@ -796,7 +956,7 @@ export class Operations {
         { length: 64 },
         (_, i) => cached.get("pr:" + i).ref,
       ),
-      waiting_pages: await this.pages("tauceti.operations.inputs/v1", waiting),
+      waiting_pages: await pages("tauceti.operations.inputs/v1", waiting),
     });
     return { ref, updates };
   }
@@ -823,9 +983,12 @@ export class Operations {
     this.set("revision", (this.get("revision") || 0) + 1);
     return true;
   }
-  private async collectJobs() {
+  private async collectJobs(projection: Projection) {
     const pending = this.sql
-      .exec<{ name: string; revision: number }>(
+      .exec<{
+        name: string;
+        revision: number;
+      }>(
         "SELECT p.name,p.revision FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1 AND (f.due IS NULL OR f.due<=?) ORDER BY p.received LIMIT 3",
         now(),
       )
@@ -847,10 +1010,27 @@ export class Operations {
             value.partition !== p.name
           )
             throw new Error("Facts version skew");
+          if (
+            projection.scope !== this.get("public_scope") ||
+            projection.scope !== (await operationsScope(this.env)) ||
+            !projection.repositories.includes(
+              p.name.split("/").slice(0, 2).join("/"),
+            ) ||
+            !this.sql
+              .exec("SELECT 1 FROM ops_partitions WHERE name=?", p.name)
+              .toArray().length
+          )
+            return;
           this.ctx.storage.transactionSync(() => {
-            const previous = new Set(this.sql
-              .exec<{id:string}>("SELECT id FROM ops_job_facts WHERE partition=?", p.name)
-              .toArray().map(row=>row.id));
+            const previous = new Set(
+              this.sql
+                .exec<{ id: string }>(
+                  "SELECT id FROM ops_job_facts WHERE partition=?",
+                  p.name,
+                )
+                .toArray()
+                .map((row) => row.id),
+            );
             for (const job of value.jobs) {
               previous.delete(job.id);
               this.sql.exec(
@@ -867,7 +1047,11 @@ export class Operations {
               );
             }
             for (const id of previous.keys())
-              this.sql.exec("DELETE FROM ops_job_facts WHERE partition=? AND id=?", p.name, id);
+              this.sql.exec(
+                "DELETE FROM ops_job_facts WHERE partition=? AND id=?",
+                p.name,
+                id,
+              );
             this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
             const { jobs: _jobs, ...metadata } = value;
             this.sql.exec(
@@ -882,9 +1066,18 @@ export class Operations {
             );
           });
         } catch {
+          if (
+            !(await this.eligible(projection)) ||
+            !this.sql
+              .exec("SELECT 1 FROM ops_partitions WHERE name=?", p.name)
+              .toArray().length
+          )
+            return;
           const failures =
             (this.sql
-              .exec<{ failures: number }>(
+              .exec<{
+                failures: number;
+              }>(
                 "SELECT failures FROM ops_failures WHERE kind='partition' AND id=?",
                 p.name,
               )
@@ -913,8 +1106,12 @@ export class Operations {
     for (const slot of host.slots)
       if (slot.runner_id && slot.instance_id) {
         const old = this.sql
-          .exec<{ machine: string; instance: string }>(
-            "SELECT machine,instance FROM ops_runner_hosts WHERE runner=?",
+          .exec<{
+            machine: string;
+            instance: string;
+            slot: number;
+          }>(
+            "SELECT machine,instance,slot FROM ops_runner_hosts WHERE runner=?",
             slot.runner_id,
           )
           .toArray()[0];
@@ -923,7 +1120,7 @@ export class Operations {
           (old.machine !== host.machine_id || old.instance !== slot.instance_id)
         )
           continue;
-        if (!old)
+        if (!old || old.slot !== slot.slot)
           this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
         this.sql.exec(
           "INSERT OR REPLACE INTO ops_runner_hosts VALUES (?,?,?,?,?)",
@@ -934,10 +1131,12 @@ export class Operations {
           now(),
         );
       }
-    this.sql.exec(
+    const pruned = this.sql.exec(
       "DELETE FROM ops_runner_hosts WHERE seen<?",
       now() - 30 * 86400,
     );
+    if (pruned.rowsWritten)
+      this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
     const sampleBucket = Math.floor(now() / 15) * 15;
     if (
       this.sql
@@ -982,7 +1181,9 @@ export class Operations {
     for (const resolution of [300, 86400]) {
       const bucket = Math.floor(now() / resolution) * resolution;
       const previous = this.sql
-        .exec<{ data: string }>(
+        .exec<{
+          data: string;
+        }>(
           "SELECT data FROM ops_host_samples WHERE machine=? AND bucket=? AND resolution=?",
           host.machine_id,
           bucket,
@@ -1029,17 +1230,13 @@ export class Operations {
       if (rows.length < 1000) this.set("host_pruned", now());
     }
   }
-  private async hostHistory() {
-    const cached = this.get("host_history");
-    if (
-      cached &&
-      Math.floor((this.get("host_history_at") || 0) / 300) ===
-        Math.floor(now() / 300)
-    )
-      return cached;
+  private async hostHistory(projection: Projection) {
+    const object = (value: any) => this.object(value, projection),
+      pages = (schema: string, records: any[], size = 100) =>
+        this.pages(schema, records, size, projection);
     // Capture the bounded five-minute history synchronously. Live host frames
     // can continue while immutable pages are uploaded.
-    const registry = publicHosts(this.env.OPERATIONS_PUBLIC_HOSTS);
+    const registry = publicHosts(projection.hosts);
     const rows = registry.map((host) => ({
       host,
       records: this.sql
@@ -1058,13 +1255,13 @@ export class Operations {
     for (const row of rows)
       hosts.push({
         ...row.host,
-        pages: await this.pages(
+        pages: await pages(
           "tauceti.operations.host-history-page/v1",
           row.records,
           500,
         ),
       });
-    const ref = await this.object({
+    const ref = await object({
       schema: "tauceti.operations.host-history/v1",
       observed_at: new Date(now() * 1000).toISOString(),
       resolution_seconds: 300,
@@ -1073,13 +1270,14 @@ export class Operations {
       coverage: "recorded_samples_only",
       before_activation: "unknown",
     });
-    this.set("host_history", ref);
-    this.set("host_history_at", now());
     return ref;
   }
-  private async hostsView() {
+  private async hostsView(projection: Projection) {
+    const object = (value: any) => this.object(value, projection),
+      pages = (schema: string, records: any[], size = 100) =>
+        this.pages(schema, records, size, projection);
     const frame = this.get("hosts"),
-      registry = publicHosts(this.env.OPERATIONS_PUBLIC_HOSTS);
+      registry = publicHosts(projection.hosts);
     const pushedAt = this.sql
       .exec<{ at: number | null }>("SELECT MAX(received) at FROM ops_hosts")
       .one().at;
@@ -1119,10 +1317,9 @@ export class Operations {
       ],
       hosts: registry.map((h) => {
         const pushed = this.sql
-          .exec<{ data: string }>(
-            "SELECT data FROM ops_hosts WHERE machine=?",
-            h.machine_id,
-          )
+          .exec<{
+            data: string;
+          }>("SELECT data FROM ops_hosts WHERE machine=?", h.machine_id)
           .toArray()[0];
         const bridge = frame?.hosts.find(
           (v: any) => v.machine_id === h.machine_id,
@@ -1151,21 +1348,30 @@ export class Operations {
       }),
     };
     return {
-      ...(await this.object(value)),
+      ...(await object(value)),
       coverage: value.coverage,
       observed_at: value.observed_at,
       received_at: value.received_at,
     };
   }
-  private async jobsView() {
+  private async jobsView(projection: Projection) {
+    const object = (value: any) => this.object(value, projection),
+      pages = (schema: string, records: any[], size = 100) =>
+        this.pages(schema, records, size, projection);
     const partitions = this.sql
-      .exec<{ name: string; data: string | null; pending: number }>(
+      .exec<{
+        name: string;
+        data: string | null;
+        pending: number;
+      }>(
         "SELECT name,data,pending FROM ops_partitions ORDER BY received DESC LIMIT 201",
       )
       .toArray();
     const facts = partitions
       .filter((p) =>
-        this.repositories().includes(p.name.split("/").slice(0, 2).join("/")),
+        projection.repositories.includes(
+          p.name.split("/").slice(0, 2).join("/"),
+        ),
       )
       .flatMap((p) => (p.data ? [JSON.parse(p.data)] : []));
     const reporters = this.sql
@@ -1184,7 +1390,7 @@ export class Operations {
       .toArray();
     let registry: ReturnType<typeof publicHosts> = [];
     try {
-      registry = publicHosts(this.env.OPERATIONS_PUBLIC_HOSTS);
+      registry = publicHosts(projection.hosts);
     } catch {
       /* Host configuration is a separate domain. */
     }
@@ -1194,7 +1400,7 @@ export class Operations {
       )
       .toArray()
       .map((r) => JSON.parse(r.data));
-    const publicRepositories = this.repositories();
+    const publicRepositories = projection.repositories;
     const rawJobs = publicRepositories.length
       ? this.sql
           .exec<{ data: string }>(
@@ -1308,7 +1514,7 @@ export class Operations {
           ? "partial"
           : "observed"
         : "unavailable",
-      scope: { repositories: this.repositories() },
+      scope: { repositories: projection.repositories },
       truncated:
         partitions.length > 200 ||
         rawJobs.length > 2200 ||
@@ -1334,11 +1540,11 @@ export class Operations {
         ),
         active: active.length,
       },
-      job_pages: await this.pages("tauceti.operations.job-page/v1", [
+      job_pages: await pages("tauceti.operations.job-page/v1", [
         ...active.slice(0, 2000),
         ...terminal,
       ]),
-      workflow_pages: await this.pages(
+      workflow_pages: await pages(
         "tauceti.operations.workflow-page/v1",
         facts.flatMap((p) => p.pending_workflows).slice(0, 1000),
       ),
@@ -1346,7 +1552,7 @@ export class Operations {
       github_budget: context?.github_budget || null,
     };
     return {
-      ...(await this.object(value)),
+      ...(await object(value)),
       observed_at: observed,
       received_at: received,
       coverage: value.coverage,
@@ -1361,7 +1567,12 @@ export class Operations {
       publicSet = new Set(repositories);
     this.ctx.storage.transactionSync(() => {
       for (const row of this.sql
-        .exec<{ source: string; collection: string; id: string; data: string }>(
+        .exec<{
+          source: string;
+          collection: string;
+          id: string;
+          data: string;
+        }>(
           "SELECT source,collection,id,data FROM ops_entities WHERE collection IN ('batches','inputs','members')",
         )
         .toArray()) {
@@ -1385,9 +1596,9 @@ export class Operations {
         "DELETE FROM ops_job_facts WHERE partition NOT IN (SELECT name FROM ops_partitions)",
       );
       for (const row of this.sql
-        .exec<{ repository: string }>(
-          "SELECT DISTINCT repository FROM ops_progress",
-        )
+        .exec<{
+          repository: string;
+        }>("SELECT DISTINCT repository FROM ops_progress")
         .toArray())
         if (!publicSet.has(row.repository))
           this.sql.exec(
@@ -1397,7 +1608,9 @@ export class Operations {
       const history = this.get("history");
       if (history?.scope.repositories.some((r: string) => !publicSet.has(r)))
         this.set("history", null);
-      this.sql.exec("DELETE FROM ops_meta WHERE key LIKE 'domain_cache/%'");
+      this.sql.exec(
+        "DELETE FROM ops_meta WHERE key LIKE 'domain_cache/%' OR key LIKE 'domain_ready/%' OR key LIKE 'domain_target/%' OR key LIKE 'domain_error/%'",
+      );
       this.sql.exec("DELETE FROM ops_views");
       this.set("host_history", null);
       this.set("public_scope", scope);
@@ -1407,180 +1620,378 @@ export class Operations {
       }
     });
   }
-  private async performPublish() {
-    if ((this.get("publication_retry") || 0) > now()) return;
-    await this.syncScope();
-    const revision = this.get("revision") || 0,
-      clock = now();
-    if (
-      revision === this.get("published_revision") &&
-      !this.domainRetries().some((r) => r.due <= now()) &&
-      (this.get("manifest_heartbeat") || 0) <= (this.get("published") || 0) &&
-      !this.sql
-        .exec(
-          "SELECT 1 FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1 AND (f.due IS NULL OR f.due<=?) LIMIT 1",
+  private projection(lane: string): Projection {
+    return {
+      lane,
+      scope: this.get("public_scope"),
+      repositories: this.repositories(),
+      hosts: this.env.OPERATIONS_PUBLIC_HOSTS || "[]",
+    };
+  }
+  private targets(): Record<Domain, string> {
+    const source = this.source(this.get("queue_source") || "");
+    return {
+      queue: source?.snapshot ? "3/" + source.snapshot : "unavailable",
+      jobs: "3/" + (this.get("jobs_revision") || 0),
+      hosts: canonical({
+        bridge: this.get("hosts")?.source || null,
+        pushed: this.sql
+          .exec("SELECT machine,epoch,sequence FROM ops_hosts ORDER BY machine")
+          .toArray(),
+      }),
+      host_history: String(Math.floor(now() / 300)),
+      history: this.get("history")
+        ? canonical([
+            this.get("history").observed_at,
+            this.get("history_revision") || 0,
+          ])
+        : "unavailable",
+    };
+  }
+  private state(kind: Domain, ready = true): Ready | undefined {
+    const value =
+      (ready && this.get("domain_ready/" + kind)) ||
+      this.get("domain_cache/" + kind);
+    return value?.scope === this.get("public_scope") ? value : undefined;
+  }
+  private changedReady(): boolean {
+    return DOMAINS.some((kind) => {
+      const ready = this.state(kind),
+        committed = this.state(kind, false);
+      return (
+        ready &&
+        canonical([ready.version, ready.value]) !==
+          canonical([committed?.version, committed?.value])
+      );
+    });
+  }
+  private async eligible(projection: Projection) {
+    return (
+      projection.scope === this.get("public_scope") &&
+      projection.scope === (await operationsScope(this.env))
+    );
+  }
+  /** An alarm is a short scheduling pump. Slow preparations and puts retain
+   * their own lifetime promises, rather than retaining the alarm handler. */
+  private rearm() {
+    return this.alarmUpdate(() => this.performRearm());
+  }
+  private async performRearm() {
+    const targets = this.targets(),
+      clock = Date.now(),
+      times: number[] = [];
+    for (const kind of DOMAINS) {
+      const state = this.state(kind),
+        failure = this.get("domain_error/" + kind);
+      if (
+        !this.preparing.has(kind) &&
+        (state?.version !== targets[kind] || failure)
+      )
+        times.push(
+          Math.max(
+            clock + 1000,
+            (this.get("domain_started/" + kind) || 0) + 10000,
+            (failure?.due || 0) * 1000,
+          ),
+        );
+    }
+    if (!this.preparing.has("facts")) {
+      const due = this.sql
+        .exec<{
+          due: number | null;
+        }>(
+          "SELECT MIN(COALESCE(f.due,?)) due FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1",
           now(),
         )
-        .toArray().length
+        .one().due;
+      if (due !== null)
+        times.push(
+          Math.max(
+            clock + 1000,
+            due * 1000,
+            (this.get("domain_started/facts") || 0) + 10000,
+          ),
+        );
+    }
+    if (
+      !this.pointer &&
+      (this.changedReady() ||
+        (this.get("manifest_heartbeat") || 0) > (this.get("published") || 0))
     )
-      return;
-    const sourceId = this.get("queue_source"),
-      source = sourceId && this.source(sourceId);
-    const queueCache = this.get("domain_cache/queue"),
-      queueVersion = source?.snapshot ? "2/" + source.snapshot : "unavailable";
-    const captured =
-      source?.metadata &&
-      this.repositories().length &&
-      (queueCache?.version !== queueVersion || this.get("domain_error/queue"))
-        ? this.captureQueue(source)
-        : null;
-    this.publicationStarted = Date.now();
-    this.publicationPending.add("facts");
-    try { await this.collectJobs(); }
-    finally { this.publicationPending.delete("facts"); }
-    const domains: Record<string, any> = {},
-      caches: any[] = [];
-    let updates: { kind: string; id: string; data: any }[] = [];
-    const project = async (
-      kind: string,
-      version: any,
-      build: () => Promise<any>,
-    ) => {
-      const previous = this.get("domain_cache/" + kind),
-        scope = this.get("public_scope");
-      if (
-        previous?.scope === scope &&
-        previous.version === version &&
-        !this.get("domain_error/" + kind)
-      ) {
-        domains[kind] = previous.value;
-        return;
-      }
-      const failed = this.get("domain_error/" + kind);
-      if (!failed || failed.due <= now()) {
-        try {
-          this.publicationPending.add(kind);
-          let value;
-          try { value = await build(); }
-          finally { this.publicationPending.delete(kind); }
-          domains[kind] = value;
-          caches.push({ kind, version, scope, value });
-          this.set("domain_error/" + kind, null);
-          return;
-        } catch {
-          const failures = (failed?.failures || 0) + 1;
-          this.set("domain_error/" + kind, {
-            failures,
-            due: now() + Math.min(300, 10 * 2 ** Math.min(5, failures - 1)),
-            error: "projection_unavailable",
-          });
-          console.warn("operations: " + kind + " projection unavailable");
+      times.push(
+        Math.max(
+          clock + 1000,
+          (this.pointerStarted || (this.get("published") || 0) * 1000) + 10000,
+          (this.get("publication_retry") || 0) * 1000,
+        ),
+      );
+    // Durable retry survives an isolate restart, including loss of in-memory workers.
+    if (this.preparing.size || this.pointer) times.push(clock + 30000);
+    if (times.length) {
+      const next = Math.min(...times),
+        old = await this.ctx.storage.getAlarm();
+      if (old === null || old > next) await this.ctx.storage.setAlarm(next);
+    } else await this.ctx.storage.deleteAlarm();
+  }
+  private start(
+    kind: string,
+    version: string,
+    projection: Projection,
+    work: () => Promise<void>,
+  ) {
+    if (this.preparing.has(kind)) return;
+    const entry: Preparation = {
+      scope: projection.scope,
+      version,
+      started: Date.now(),
+      promise: Promise.resolve(),
+    };
+    this.preparing.set(kind, entry);
+    this.publicationPending.add(kind);
+    entry.promise = Promise.resolve()
+      .then(work)
+      .catch(() => {
+        console.warn("operations: background preparation unavailable");
+      })
+      .finally(async () => {
+        if (this.preparing.get(kind) === entry) {
+          this.preparing.delete(kind);
+          this.publicationPending.delete(kind);
         }
-      }
-      domains[kind] = {
-        ...(previous?.scope === scope
-          ? previous.value
+        await this.rearm();
+      });
+    this.ctx.waitUntil(entry.promise);
+  }
+  private async prepare(kind: Domain, projection: Projection) {
+    const version = this.targets()[kind],
+      revision = this.get("revision") || 0;
+    this.set("domain_target/" + kind, {
+      scope: projection.scope,
+      version,
+      revision,
+    });
+    // All SQL/input captures occur before their projection's first network await.
+    const source = this.source(this.get("queue_source") || ""),
+      capture =
+        kind === "queue" && source?.metadata && projection.repositories.length
+          ? this.captureQueue(source)
+          : null;
+    try {
+      let value: any,
+        updates: { kind: string; id: string; data: any }[] = [];
+      if (kind === "queue") {
+        if (!capture)
+          value = {
+            url: null,
+            coverage: "unavailable",
+            observed_at: null,
+            received_at: null,
+          };
+        else {
+          const result = await this.queueView(capture, projection),
+            metadata = JSON.parse(capture.source.metadata!);
+          updates = result.updates;
+          value = {
+            ...result.ref,
+            observed_at: metadata.observed_at,
+            received_at: new Date(capture.source.received * 1000).toISOString(),
+            coverage: metadata.coverage,
+            source_revision: metadata.source_revision,
+            truncated: metadata.truncated,
+          };
+        }
+      } else if (kind === "jobs") value = await this.jobsView(projection);
+      else if (kind === "hosts") value = await this.hostsView(projection);
+      else if (kind === "host_history")
+        value = {
+          ...(await this.hostHistory(projection)),
+          coverage: "recorded_samples_only",
+        };
+      else {
+        const history = this.get("history"),
+          received = this.get("history_received");
+        value = history
+          ? {
+              ...(await this.object(history, projection)),
+              observed_at: history.observed_at,
+              received_at: received,
+              coverage: history.coverage,
+            }
           : {
               url: null,
               coverage: "unavailable",
               observed_at: null,
               received_at: null,
-            }),
+            };
+      }
+      if (!(await this.eligible(projection))) return;
+      if (
+        capture &&
+        (this.get("queue_source") !== capture.source.id ||
+          this.source(capture.source.id)?.committed_epoch !==
+            capture.source.committed_epoch)
+      )
+        return;
+      this.ctx.storage.transactionSync(() => {
+        for (const v of updates)
+          this.sql.exec(
+            "INSERT OR REPLACE INTO ops_views VALUES (?,?,?)",
+            v.kind,
+            v.id,
+            JSON.stringify(v.data),
+          );
+        if (capture) {
+          const ids = new Set(capture.batches.map((b) => b.id));
+          for (const row of this.sql
+            .exec<{ id: string }>("SELECT id FROM ops_views WHERE kind='batch'")
+            .toArray())
+            if (!ids.has(row.id))
+              this.sql.exec(
+                "DELETE FROM ops_views WHERE kind='batch' AND id=?",
+                row.id,
+              );
+          for (const d of capture.dirty)
+            this.sql.exec(
+              "DELETE FROM ops_dirty WHERE kind=? AND id=? AND revision=?",
+              d.kind,
+              d.id,
+              d.revision,
+            );
+        }
+        this.set("domain_ready/" + kind, {
+          scope: projection.scope,
+          version,
+          value,
+          revision,
+        });
+        this.set("domain_error/" + kind, null);
+      });
+    } catch {
+      if (!(await this.eligible(projection))) return;
+      const previous = this.state(kind),
+        failed = this.get("domain_error/" + kind),
+        failures = (failed?.failures || 0) + 1;
+      this.set("domain_error/" + kind, {
+        failures,
+        due: now() + Math.min(300, 10 * 2 ** Math.min(5, failures - 1)),
         error: "projection_unavailable",
-      };
-    };
-    const hostVersion = canonical({
-      bridge: this.get("hosts")?.source || null,
-      pushed: this.sql
-        .exec("SELECT machine,epoch,sequence FROM ops_hosts ORDER BY machine")
-        .toArray(),
-    });
-    await Promise.all([
-      project("jobs", "2/" + (this.get("jobs_revision") || 0), () => this.jobsView()),
-      project("hosts", hostVersion, () => this.hostsView()),
-      project("host_history", Math.floor(now() / 300), async () => ({
-        ...(await this.hostHistory()),
-        coverage: "recorded_samples_only",
-      })),
-      project("queue", queueVersion, async () => {
-        if (!source?.metadata || !this.repositories().length)
-          return {
+      });
+      this.set("domain_ready/" + kind, {
+        scope: projection.scope,
+        version,
+        revision,
+        value: {
+          ...(previous?.value || {
+            url: null,
             coverage: "unavailable",
             observed_at: null,
             received_at: null,
-            url: null,
-          };
-        const metadata = JSON.parse(source.metadata),
-          result = await this.queueView(captured || this.captureQueue(source));
-        updates = result.updates;
-        return {
-          ...result.ref,
-          observed_at: metadata.observed_at,
-          received_at: new Date(source.received * 1000).toISOString(),
-          coverage: metadata.coverage,
-          source_revision: metadata.source_revision,
-          truncated: metadata.truncated,
-        };
-      }),
-      project(
-        "history",
-        this.get("history")?.observed_at || "unavailable",
-        async () => {
-          const history = this.get("history");
-          return history
-            ? {
-                ...(await this.object(history)),
-                observed_at: history.observed_at,
-                received_at: this.get("history_received"),
-                coverage: history.coverage,
-              }
-            : {
-                url: null,
-                coverage: "unavailable",
-                observed_at: null,
-                received_at: null,
-              };
+          }),
+          error: "projection_unavailable",
         },
-      ),
-    ]);
-    const manifest = {
-      schema: "tauceti.operations.manifest/v1",
-      scope: this.get("public_scope"),
-      generated_at: new Date(clock * 1000).toISOString(),
-      domains,
-    };
-    this.publicationPending.add("manifest");
-    await this.env.ARCHIVE.put(
-      "public/v1/operations/manifest.json",
-      JSON.stringify(manifest),
-      {
-        httpMetadata: { contentType: "application/json" },
-        customMetadata: { scope: this.get("public_scope") },
-      },
+      });
+      console.warn("operations: " + kind + " projection unavailable");
+    }
+  }
+  private startPointer() {
+    if (
+      this.pointer ||
+      (this.get("publication_retry") || 0) > now() ||
+      Date.now() <
+        (this.pointerStarted || (this.get("published") || 0) * 1000) + 10000 ||
+      (!this.changedReady() &&
+        (this.get("manifest_heartbeat") || 0) <= (this.get("published") || 0))
+    )
+      return;
+    const projection = this.projection("manifest"),
+      captured = Object.fromEntries(
+        DOMAINS.map((kind) => [kind, this.state(kind)]),
+      ) as Record<Domain, Ready | undefined>;
+    const domains = Object.fromEntries(
+      DOMAINS.map((kind) => [
+        kind,
+        captured[kind]?.value || {
+          url: null,
+          coverage: "unavailable",
+          observed_at: null,
+          received_at: null,
+        },
+      ]),
     );
-    this.ctx.storage.transactionSync(() => {
-      for (const c of caches) this.set("domain_cache/" + c.kind, c);
-      for (const v of updates)
-        this.sql.exec(
-          "INSERT OR REPLACE INTO ops_views VALUES (?,?,?)",
-          v.kind,
-          v.id,
-          JSON.stringify(v.data),
+    const clock = now();
+    this.pointerStarted = Date.now();
+    this.publicationPending.add("manifest");
+    this.pointer = (async () => {
+      try {
+        if (!(await this.eligible(projection))) return;
+        await this.upload("manifest", () =>
+          this.env.ARCHIVE.put(
+            "public/v1/operations/manifest.json",
+            JSON.stringify({
+              schema: "tauceti.operations.manifest/v1",
+              scope: projection.scope,
+              generated_at: new Date(clock * 1000).toISOString(),
+              domains,
+            }),
+            {
+              httpMetadata: { contentType: "application/json" },
+              customMetadata: { scope: projection.scope },
+            },
+          ),
         );
-      this.sql.exec(
-        "DELETE FROM ops_views WHERE kind='batch' AND id NOT IN (SELECT id FROM ops_entities WHERE collection='batches')",
-      );
-      this.sql.exec("DELETE FROM ops_dirty WHERE revision<=?", revision);
-      this.publicationPending.delete("manifest");
-      this.set("publication_elapsed_ms", Date.now() - this.publicationStarted!);
-      this.set("published", clock);
-      this.set("published_revision", revision);
-      this.set("publication_error", false);
-      this.set("publication_retry", null);
-      this.set("publication_failures", 0);
-      const roots = Object.values(domains)
-        .filter((d) => d.url)
-        .map((d) => d.url.slice(PREFIX.length, -5));
+        if (!(await this.eligible(projection))) return;
+        this.ctx.storage.transactionSync(() => {
+          for (const kind of DOMAINS)
+            if (captured[kind])
+              this.set("domain_cache/" + kind, captured[kind]);
+          this.set("published", clock);
+          const targets = this.targets();
+          if (
+            DOMAINS.every(
+              (kind) =>
+                captured[kind]?.version === targets[kind] &&
+                !this.get("domain_error/" + kind),
+            ) &&
+            !this.sql
+              .exec("SELECT 1 FROM ops_partitions WHERE pending=1 LIMIT 1")
+              .toArray().length
+          )
+            this.set("published_revision", this.get("revision") || 0);
+          this.set("publication_elapsed_ms", Date.now() - this.pointerStarted!);
+          this.set("publication_error", false);
+          this.set("publication_retry", null);
+          this.set("publication_failures", 0);
+        });
+        this.startMaintenance();
+      } catch {
+        const failures = (this.get("publication_failures") || 0) + 1;
+        this.set("publication_failures", failures);
+        this.set("publication_error", true);
+        this.set(
+          "publication_retry",
+          now() + Math.min(300, 10 * 2 ** Math.min(5, failures - 1)),
+        );
+        console.warn("operations: public pointer unavailable");
+      } finally {
+        this.pointer = undefined;
+        this.publicationPending.delete("manifest");
+        await this.rearm();
+      }
+    })();
+    this.ctx.waitUntil(this.pointer);
+  }
+  private startMaintenance() {
+    if (this.maintenance || (this.get("maintenance_at") || 0) > now() - 60)
+      return;
+    this.set("maintenance_at", now());
+    this.maintenance = (async () => {
+      const clock = now(),
+        roots = DOMAINS.flatMap((kind) => [
+          this.state(kind),
+          this.state(kind, false),
+        ])
+          .filter((s) => s?.value.url)
+          .map((s) => s!.value.url.slice(PREFIX.length, -5));
       if (roots.length)
         this.sql.exec(
           `WITH RECURSIVE live(hash) AS (
@@ -1591,24 +2002,109 @@ export class Operations {
           clock,
           clock - 3600,
         );
-    });
-    for (const row of this.sql
-      .exec<{ hash: string }>(
-        "SELECT hash FROM ops_objects WHERE referenced<? LIMIT 20",
-        clock - 7 * 86400,
-      )
-      .toArray()) {
-      // Remove the existence receipt first. A crash can leave an orphan object,
-      // but can never make a later projection skip uploading a missing object.
-      this.sql.exec("DELETE FROM ops_objects WHERE hash=?", row.hash);
-      this.sql.exec("DELETE FROM ops_links WHERE parent=?", row.hash);
-      await this.env.ARCHIVE.delete("public" + PREFIX + row.hash + ".json");
+      for (const row of this.sql
+        .exec<{ hash: string; referenced: number; logical: string | null }>(
+          `SELECT o.hash,o.referenced,k.logical FROM ops_objects o LEFT JOIN ops_object_keys k ON k.hash=o.hash WHERE o.referenced<?
+         UNION ALL SELECT k.hash,k.allocated referenced,k.logical FROM ops_object_keys k WHERE k.allocated<?
+         AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash) LIMIT 20`,
+          clock - 7 * 86400,
+          clock - 7 * 86400,
+        )
+        .toArray()) {
+        // A preceding R2 await can make a selected candidate reachable again.
+        // An active logical write also protects its pending physical allocation.
+        const receipt = this.sql
+          .exec<{
+            referenced: number;
+          }>("SELECT referenced FROM ops_objects WHERE hash=?", row.hash)
+          .toArray()[0];
+        const allocation = this.sql
+          .exec<{
+            logical: string;
+            allocated: number;
+          }>("SELECT logical,allocated FROM ops_object_keys WHERE hash=?", row.hash)
+          .toArray()[0];
+        if (
+          (receipt ? receipt.referenced : allocation?.allocated) !==
+            row.referenced ||
+          this.objectWrites.has(allocation?.logical || row.hash)
+        )
+          continue;
+        // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
+        // physical key even if this old delete finishes after an isolate restart.
+        this.ctx.storage.transactionSync(() => {
+          this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", row.hash);
+          this.sql.exec("DELETE FROM ops_objects WHERE hash=?", row.hash);
+          this.sql.exec("DELETE FROM ops_links WHERE parent=?", row.hash);
+        });
+        await this.upload("maintenance", () =>
+          this.env.ARCHIVE.delete("public" + PREFIX + row.hash + ".json"),
+        );
+      }
+      this.sql.exec(
+        "DELETE FROM ops_changes WHERE snapshot IN (SELECT snapshot FROM ops_frames WHERE received<?)",
+        clock - 3600,
+      );
+      this.sql.exec("DELETE FROM ops_frames WHERE received<?", clock - 3600);
+    })()
+      .catch(() => console.warn("operations: object maintenance unavailable"))
+      .finally(() => {
+        this.maintenance = undefined;
+      });
+    this.ctx.waitUntil(this.maintenance);
+  }
+  private async performPublish() {
+    await this.syncScope();
+    const targets = this.targets(),
+      clock = Date.now();
+    if (
+      !this.preparing.has("facts") &&
+      clock >= (this.get("domain_started/facts") || 0) + 10000 &&
+      this.sql
+        .exec(
+          "SELECT 1 FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1 AND (f.due IS NULL OR f.due<=?) LIMIT 1",
+          now(),
+        )
+        .toArray().length
+    ) {
+      const projection = this.projection("facts");
+      this.set("domain_started/facts", clock);
+      this.start(
+        "facts",
+        String(this.get("jobs_revision") || 0),
+        projection,
+        () => this.collectJobs(projection),
+      );
     }
-    this.sql.exec(
-      "DELETE FROM ops_changes WHERE snapshot IN (SELECT snapshot FROM ops_frames WHERE received<?)",
-      clock - 3600,
-    );
-    this.sql.exec("DELETE FROM ops_frames WHERE received<?", clock - 3600);
+    for (const kind of DOMAINS) {
+      const target = {
+        scope: this.get("public_scope"),
+        version: targets[kind],
+        revision: this.get("revision") || 0,
+      };
+      if (
+        this.get("domain_target/" + kind)?.version !== target.version ||
+        this.get("domain_target/" + kind)?.scope !== target.scope
+      )
+        this.set("domain_target/" + kind, target);
+      const failure = this.get("domain_error/" + kind);
+      if (
+        this.preparing.has(kind) ||
+        (this.state(kind)?.version === targets[kind] && !failure) ||
+        (failure?.due || 0) > now() ||
+        clock < (this.get("domain_started/" + kind) || 0) + 10000
+      )
+        continue;
+      this.publicationStarted = clock;
+      this.set("domain_started/" + kind, clock);
+      const projection = this.projection(kind);
+      this.start(kind, targets[kind], projection, async () => {
+        if (kind === "jobs") await this.preparing.get("facts")?.promise;
+        await this.prepare(kind, projection);
+      });
+    }
+    this.startPointer();
+    await this.rearm();
   }
   async publish() {
     if (this.publishing) return this.publishing;
@@ -1617,52 +2113,10 @@ export class Operations {
       await this.publishing;
     } finally {
       this.publishing = undefined;
-      this.publicationPending.clear();
     }
-  }
-  private domainRetries(): { due: number }[] {
-    return this.sql
-      .exec<{ value: string }>(
-        "SELECT value FROM ops_meta WHERE key LIKE 'domain_error/%' AND value!='null'",
-      )
-      .toArray()
-      .map((r) => JSON.parse(r.value));
   }
   async alarm() {
-    await this.ctx.storage.setAlarm(Date.now() + 30_000);
-    try {
-      await this.publish();
-    } catch {
-      const failures = (this.get("publication_failures") || 0) + 1;
-      this.set("publication_failures", failures);
-      this.set("publication_error", true);
-      this.set(
-        "publication_retry",
-        now() + Math.min(300, 10 * 2 ** Math.min(5, failures - 1)),
-      );
-      console.warn("operations: public pointer unavailable");
-    }
-    const partitionDue = this.sql
-      .exec<{ due: number | null }>(
-        "SELECT MIN(COALESCE(f.due,?)) due FROM ops_partitions p LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name WHERE p.pending=1",
-        now() + 10,
-      )
-      .one().due;
-    const retryAt = Math.min(
-      ...this.domainRetries().map((r) => r.due),
-      partitionDue ?? Infinity,
-    );
-    if ((this.get("revision") || 0) !== (this.get("published_revision") ?? -1))
-      await this.schedule();
-    else if (Number.isFinite(retryAt))
-      await this.ctx.storage.setAlarm(
-        Math.max(
-          Date.now() + 1000,
-          retryAt * 1000,
-          (this.get("publication_retry") || 0) * 1000,
-        ),
-      );
-    else await this.ctx.storage.deleteAlarm();
+    await this.publish();
   }
 
   async fetch(request: Request) {
@@ -1708,6 +2162,8 @@ export class Operations {
       const old = this.get("history");
       if (old && Date.parse(value.observed_at) < Date.parse(old.observed_at))
         return json({ error: "Older report" }, 409);
+      if (canonical(old) !== canonical(value))
+        this.set("history_revision", (this.get("history_revision") || 0) + 1);
       this.set("history", value);
       this.set("history_received", new Date(now() * 1000).toISOString());
       this.set("revision", (this.get("revision") || 0) + 1);
@@ -1828,7 +2284,9 @@ export class Operations {
       frame.hosts = frame.hosts.map((host: any) =>
         retainHostFacts(
           host,
-          previous?.hosts.find((old: any) => old.machine_id === host.machine_id),
+          previous?.hosts.find(
+            (old: any) => old.machine_id === host.machine_id,
+          ),
         ),
       );
       this.ctx.storage.transactionSync(() => {
@@ -1882,7 +2340,20 @@ export class Operations {
       return json({
         publisher_version: this.env.CF_VERSION?.id || null,
         alarm_at: await this.ctx.storage.getAlarm(),
-        publication_in_flight: !!this.publishing,
+        publication_in_flight:
+          !!this.publishing || !!this.pointer || this.preparing.size > 0,
+        domain_publication: Object.fromEntries(
+          DOMAINS.map((kind) => [
+            kind,
+            {
+              target: this.get("domain_target/" + kind)?.version || null,
+              prepared: this.state(kind)?.version || null,
+              committed: this.state(kind, false)?.version || null,
+              started_at: this.preparing.get(kind)?.started || null,
+              retry_at: this.get("domain_error/" + kind)?.due || null,
+            },
+          ]),
+        ),
         publication_started_at: this.publicationStarted || null,
         publication_pending: [...this.publicationPending],
         publication_elapsed_ms: this.get("publication_elapsed_ms") ?? null,
