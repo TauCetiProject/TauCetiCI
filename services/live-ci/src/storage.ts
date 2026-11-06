@@ -19,11 +19,11 @@ import { publicJob } from "./operations-jobs";
 import { retained } from "./policy";
 const REFRESH_SECONDS = 300;
 const DAY_NOTIFY_MS = 60_000;
-async function scheduleSoon(ctx: DurableObjectState, delayMs = 1000) {
+async function scheduleSoon(ctx: DurableObjectState, delayMs = 1000, recoverExpired = false) {
   const next = Date.now() + delayMs;
   const scheduled = await ctx.storage.getAlarm();
-  // A busy partition must not keep postponing its notification indefinitely.
-  if (scheduled === null || scheduled <= Date.now() || scheduled > next)
+  // A due alarm is pending delivery too; later events must preserve its deadline.
+  if (scheduled === null || scheduled > next || (recoverExpired && scheduled <= Date.now()))
     await ctx.storage.setAlarm(next);
 }
 /** Sharded locator: workflow_job does not carry its parent run creation date. */
@@ -285,7 +285,7 @@ export class FactPartition {
     else if (this.meta("operations_pending")) {
       const retry = Math.max(1000, ((this.meta("operations_retry_at") || now()) - now()) * 1000);
       const refresh = stillActive ? Math.max(1000, (this.meta("alarm_refresh_due") - now()) * 1000) : retry;
-      await this.ctx.storage.setAlarm(Date.now() + Math.min(retry, refresh));
+      await scheduleSoon(this.ctx, Math.min(retry, refresh));
     }
     else if (stillActive) {
       const next = Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000);
@@ -923,8 +923,9 @@ export class DayAggregate {
     if (date >= day(now() - 90 * DAY)) return { done: false, reason: "inside detail retention" };
     if (this.meta("notification")) {
       // Older deployments can leave a pending send with no usable alarm.
-      // The existing retention tick also repairs that state autonomously.
-      await scheduleSoon(this.ctx, DAY_NOTIFY_MS);
+      // The retention sweep explicitly re-arms that legacy recovery case;
+      // normal incoming observations preserve even overdue pending alarms.
+      await scheduleSoon(this.ctx, DAY_NOTIFY_MS, true);
       return { done: false, reason: "notification pending" };
     }
     if (!this.meta("closed")) {
