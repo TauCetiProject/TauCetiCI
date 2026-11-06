@@ -833,13 +833,16 @@ export class Operations {
           )
             throw new Error("Facts version skew");
           this.ctx.storage.transactionSync(() => {
-            this.sql.exec(
-              "DELETE FROM ops_job_facts WHERE partition=?",
-              p.name,
-            );
-            for (const job of value.jobs)
+            const previous = new Set(this.sql
+              .exec<{id:string}>("SELECT id FROM ops_job_facts WHERE partition=?", p.name)
+              .toArray().map(row=>row.id));
+            for (const job of value.jobs) {
+              previous.delete(job.id);
               this.sql.exec(
-                "INSERT INTO ops_job_facts VALUES (?,?,?,?,?,?)",
+                `INSERT INTO ops_job_facts VALUES (?,?,?,?,?,?)
+                 ON CONFLICT(partition,id) DO UPDATE SET repository=excluded.repository,
+                   active=excluded.active,observed=excluded.observed,data=excluded.data
+                 WHERE ops_job_facts.data!=excluded.data`,
                 p.name,
                 job.id,
                 job.repository,
@@ -847,6 +850,9 @@ export class Operations {
                 Date.parse(job.observed_at) / 1000 || 0,
                 JSON.stringify(job),
               );
+            }
+            for (const id of previous.keys())
+              this.sql.exec("DELETE FROM ops_job_facts WHERE partition=? AND id=?", p.name, id);
             this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
             const { jobs: _jobs, ...metadata } = value;
             this.sql.exec(
