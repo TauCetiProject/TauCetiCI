@@ -1201,7 +1201,9 @@ export class Operations {
               p.name,
             );
           });
-        } catch {
+        } catch (error) {
+          console.warn("operations Facts projection failed", p.name,
+            error instanceof Error ? error.name + ": " + error.message.slice(0, 300) : "unknown error");
           if (
             !(await this.eligible(projection)) ||
             !this.sql
