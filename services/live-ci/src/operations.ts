@@ -1072,7 +1072,11 @@ export class Operations {
       scope: { hosts: registry.map((h) => h.machine_id) },
       truncated: false,
       pools: [
-        ...PUBLIC_POOLS.filter(p => !("machine_id" in p) || registry.some(h => h.machine_id === p.machine_id)),
+        ...PUBLIC_POOLS.filter(
+          (p) =>
+            !("machine_id" in p) ||
+            registry.some((h) => h.machine_id === p.machine_id),
+        ),
         ...registry
           .filter(
             (h) =>
@@ -1538,9 +1542,10 @@ export class Operations {
           `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
         UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
-        UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live)`,
+        UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
           ...roots,
           clock,
+          clock - 3600,
         );
     });
     for (const row of this.sql

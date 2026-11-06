@@ -1014,3 +1014,24 @@ test("an invalid host configuration leaves queue and GitHub publication working"
     false,
   );
 });
+
+test("quiet heartbeats do not rewrite every reachable object timestamp", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.operations.alarm();
+  const before = r.database
+    .prepare("SELECT hash,referenced FROM ops_objects")
+    .all();
+  r.advance(10000);
+  const heartbeat = r.next();
+  heartbeat.changes = [];
+  heartbeat.base = { epoch: seed.source.epoch, sequence: seed.source.sequence };
+  await r.send(heartbeat);
+  await r.operations.alarm();
+  for (const row of before) {
+    const after = r.database
+      .prepare("SELECT referenced FROM ops_objects WHERE hash=?")
+      .get(row.hash);
+    assert.equal(after.referenced, row.referenced);
+  }
+});
