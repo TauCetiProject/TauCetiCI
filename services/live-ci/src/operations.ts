@@ -1257,9 +1257,19 @@ export class Operations {
     const active = jobs.filter((j) => j.active),
       terminal = jobs.filter((j) => !j.active).slice(0, 200);
     const context = this.get("jobs_context");
-    const observed =
+    const received =
       facts
         .map((f) => f.received_at)
+        .filter(Boolean)
+        .sort()
+        .at(-1) || null;
+    const observed =
+      [
+        ...jobs.map((j) => j.observed_at),
+        ...facts.flatMap((f) =>
+          f.pending_workflows.map((w: any) => w.observed_at),
+        ),
+      ]
         .filter(Boolean)
         .sort()
         .at(-1) || null;
@@ -1267,7 +1277,7 @@ export class Operations {
       schema: "tauceti.operations.jobs/v1",
       observed_at: observed,
       computed_at: new Date(now() * 1000).toISOString(),
-      received_at: observed,
+      received_at: received,
       coverage: facts.length
         ? partitions.some((p) => p.pending)
           ? "partial"
@@ -1313,7 +1323,7 @@ export class Operations {
     return {
       ...(await this.object(value)),
       observed_at: observed,
-      received_at: observed,
+      received_at: received,
       coverage: value.coverage,
       truncated: value.truncated,
     };

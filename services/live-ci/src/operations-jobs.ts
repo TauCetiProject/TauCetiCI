@@ -24,6 +24,29 @@ export function publicJob(run: Run, job: Job) {
   const kind = reportingKind(job.kind, labels, job.runnerName);
   const build = run.workflow === WORKFLOW && job.name === "sandboxed-build";
   const active = job.status !== "completed" && run.status !== "completed";
+  const workflow = run.workflow.split("/").at(-1) || "";
+  const control =
+    run.workflow === WORKFLOW ||
+    [
+      "pick-runner.yml",
+      "pr-status.yml",
+      "pr-labels.yml",
+      "auto-merge.yml",
+      "merge-sweep.yml",
+      "ci-live-summary.yml",
+      "ready-to-merge.yml",
+      "queue-release.yml",
+    ].includes(workflow);
+  const maintenance = [
+    "ci.yml",
+    "tests.yml",
+    "live-ci-tests.yml",
+    "website-tests.yml",
+    "nightly-verify.yml",
+    "warm-dependencies.yml",
+    "lint-repair.yml",
+    "pages.yml",
+  ].includes(workflow);
   return {
     repository: run.repo,
     id: job.id,
@@ -38,7 +61,11 @@ export function publicJob(run: Run, job: Job) {
         : ["bors_staging", "merge_queue"].includes(run.trigger)
           ? "staging_build"
           : "other_build"
-      : "other",
+      : control
+        ? "control"
+        : maintenance
+          ? "maintenance"
+          : "other",
     status: job.status,
     conclusion: job.conclusion,
     active,

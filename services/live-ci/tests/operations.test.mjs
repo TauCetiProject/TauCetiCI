@@ -1105,3 +1105,88 @@ test("canonical SHA and recorded token coverage accept only their public contrac
     "a".repeat(40),
   );
 });
+
+test("GitHub event time stays separate from fact receipt time", async (t) => {
+  const r = runtime(t),
+    partition = repo + "/2027-01-15";
+  const event = new Date(Date.now() - 120000).toISOString(),
+    receipt = new Date(Date.now()).toISOString();
+  globalThis.__operationsTestEnv.CONTROL = {
+    getByName: () => ({
+      fetch: async () => Response.json({ partitions: [], inventory: [] }),
+    }),
+  };
+  r.database.prepare("INSERT INTO ops_partitions VALUES (?,?,?,?,?)").run(
+    partition,
+    1,
+    0,
+    Math.floor(Date.now() / 1000),
+    JSON.stringify({
+      received_at: receipt,
+      pending_workflows: [
+        {
+          repository: repo,
+          run_id: "1",
+          run_attempt: 1,
+          status: "queued",
+          workflow: ".github/workflows/pr-build.yml",
+          observed_at: event,
+        },
+      ],
+      pending_workflows_count: 1,
+    }),
+  );
+  await r.operations.alarm();
+  const root = r.object(r.manifest().domains.jobs);
+  assert.equal(root.observed_at, event);
+  assert.equal(root.received_at, receipt);
+  assert.equal(root.observer.last_event_at, event);
+});
+
+test("build, control and maintenance are separate monitoring classes", async () => {
+  const code = await build({
+    entryPoints: ["src/operations-jobs.ts"],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    write: false,
+  });
+  const { publicJob } = await import(
+    "data:text/javascript;base64," +
+      Buffer.from(code.outputFiles[0].text).toString("base64")
+  );
+  const run = {
+    id: "1",
+    repo,
+    attempt: 1,
+    workflow: ".github/workflows/pr-build.yml",
+    trigger: "pr",
+    status: "in_progress",
+    head: "a".repeat(40),
+  };
+  const job = {
+    id: "2",
+    attempt: 1,
+    name: "sandboxed-build",
+    kind: "github",
+    status: "in_progress",
+    steps: [],
+    labels: [],
+    created: 1,
+    updated: 2,
+  };
+  assert.equal(publicJob(run, job).job_class, "pr_build");
+  assert.equal(
+    publicJob(run, { ...job, name: "pick-runner" }).job_class,
+    "control",
+  );
+  assert.equal(
+    publicJob({ ...run, workflow: ".github/workflows/live-ci-tests.yml" }, job)
+      .job_class,
+    "maintenance",
+  );
+  assert.equal(
+    publicJob({ ...run, workflow: "unknown.yml" }, job).job_class,
+    "other",
+  );
+});
