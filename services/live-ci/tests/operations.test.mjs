@@ -458,6 +458,32 @@ test("1200 members have complete stable pagination and only changed detail objec
   );
 });
 
+test("waiting inputs have bounded pages and leave the prepared list atomically on insertion", async (t) => {
+  const r = runtime(t), frame = structuredClone(seed);
+  const template = frame.changes.find(c => c.collection === "inputs").value;
+  const waiting = Array.from({length:1200}, (_, i) => ({
+    ...template, id: String(10000+i), pr: String(20000+i), state: "waiting", batch_id: null,
+  }));
+  frame.changes.push(...waiting.map(value=>({collection:"inputs",id:value.id,value})));
+  frame.metadata.collection_counts.inputs += waiting.length;
+  for (const part of split(frame,400)) await r.send(part);
+  await r.operations.alarm();
+  let queue = r.object(r.manifest().domains.queue);
+  assert.equal(queue.counts.waiting,1200);
+  assert.equal(queue.waiting_pages.length,12);
+  assert.deepEqual(queue.waiting_pages.flatMap(p=>r.object(p).records).map(i=>i.id).sort(),waiting.map(i=>i.id).sort());
+  const delta = r.next();
+  delta.base = {epoch:frame.source.epoch,sequence:frame.source.sequence};
+  delta.changes = [{collection:"inputs",id:waiting[0].id,value:{...waiting[0],state:"inserted",batch_id:"1"}}];
+  delta.metadata.collection_counts.inputs = frame.metadata.collection_counts.inputs;
+  await r.send(delta);
+  assert.equal(r.object(r.manifest().domains.queue).counts.waiting,1200);
+  await r.operations.alarm();
+  queue = r.object(r.manifest().domains.queue);
+  assert.equal(queue.counts.waiting,1199);
+  assert.ok(!queue.waiting_pages.flatMap(p=>r.object(p).records).some(i=>i.id===waiting[0].id));
+});
+
 test("public reads use R2 and cache only, with scoped ingestion, ETags and zero upstream requests", async (t) => {
   let upstream = 0;
   const options = convertV4MiniflareOptions({
@@ -813,6 +839,12 @@ test("combined large queue, job and host fixture binds exact candidate/run/attem
         disposition: i % 3 ? "clean_replay" : "agent_edited",
       },
     });
+  const inputTemplate = frame.changes.find(c => c.collection === "inputs").value;
+  for (let i=0;i<120;i++) {
+    const value = {...inputTemplate,id:String(10000+i),pr:String(20000+i),state:"waiting",batch_id:null,no_repair:i===0};
+    frame.changes.push({collection:"inputs",id:value.id,value});
+  }
+  frame.metadata.collection_counts.inputs += 120;
   frame.metadata.collection_counts.members = 1200;
   for (const part of split(frame, 400)) await r.send(part);
   const partition = repo + "/2026-11-06",
