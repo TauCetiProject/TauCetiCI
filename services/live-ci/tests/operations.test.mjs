@@ -217,6 +217,102 @@ function split(frame, size = 3) {
   }));
 }
 
+function lookupFrame(r, count = 256, large = false) {
+  const frame = r.next(1),
+    template = frame.changes.find((c) => c.collection === "members").value;
+  const batch = frame.changes.find(
+    (c) => c.collection === "batches" && c.id === template.batch_id,
+  ).value;
+  batch.size = count;
+  frame.changes = frame.changes.filter((c) => c.collection !== "members");
+  for (let i = 0; i < count; i++) {
+    const pr = String(large ? Math.floor(i / 4) * 64 + (i % 4) + 64 : i + 1);
+    frame.changes.push({
+      collection: "members",
+      id: String(i + 1),
+      value: {
+        ...template,
+        id: String(i + 1),
+        pr,
+        position: i + 1,
+        pr_url: `https://github.com/${repo}/pull/${pr}`,
+        ...(large
+          ? { title: "🧮".repeat(300), explanation: "🧮".repeat(300) }
+          : {}),
+      },
+    });
+  }
+  frame.metadata.collection_counts.members = count;
+  return frame;
+}
+
+test("a full membership version update shares bounded lookup objects with the existing reader", async (t) => {
+  const r = runtime(t), frame = lookupFrame(r);
+  for (const part of split(frame, 100)) await r.send(part);
+  await r.flush();
+  const before = r.writes.length;
+  frame.source.sequence++;
+  frame.snapshot = crypto.randomUUID();
+  for (const c of frame.changes) {
+    if (c.collection === "batches") c.value.version++;
+    if (c.collection === "members") c.value.batch_version++;
+  }
+  for (const part of split(frame, 100)) await r.send(part);
+  await r.flush();
+  const queue = r.object(r.manifest().domains.queue),
+    puts = r.writes.slice(before).filter((key) =>
+      JSON.parse(r.objects.get(key)).schema === "tauceti.operations.prs/v1",
+    );
+  assert.equal(queue.pr_shards.length, 64);
+  assert.equal(puts.length, 16, "64 changed buckets need only 16 writes");
+  for (const c of frame.changes.filter((c) => c.collection === "members")) {
+    // This is the existing browser's lookup, with no new schema or fallback.
+    const record = r.object(queue.pr_shards[Number(BigInt(c.value.pr) % 64n)])
+      .prs[`${repo}#${c.value.pr}`];
+    assert.deepEqual(record.members, [c.value]);
+  }
+});
+
+test("a changed or removed lookup member preserves unchanged neighboring buckets", async (t) => {
+  const r = runtime(t), frame = lookupFrame(r);
+  for (const part of split(frame, 100)) await r.send(part);
+  await r.flush();
+  const previous = r.object(r.manifest().domains.queue);
+  frame.source.sequence++;
+  frame.snapshot = crypto.randomUUID();
+  frame.changes.find((c) => c.collection === "members" && c.id === "1")
+    .value.explanation = "Updated explanation";
+  frame.changes.find((c) => c.collection === "members" && c.id === "2")
+    .value = null;
+  frame.metadata.collection_counts.members--;
+  frame.changes.find((c) => c.collection === "batches" && c.id === "1")
+    .value.size--;
+  for (const part of split(frame, 100)) await r.send(part);
+  await r.flush();
+  const queue = r.object(r.manifest().domains.queue);
+  assert.equal(r.object(queue.pr_shards[1]).prs[`${repo}#1`].members[0]
+    .explanation, "Updated explanation");
+  assert.equal(r.object(queue.pr_shards[2]).prs[`${repo}#2`]?.members.length || 0, 0);
+  assert.deepEqual(r.object(queue.pr_shards[3]).prs[`${repo}#3`],
+    r.object(previous.pr_shards[3]).prs[`${repo}#3`]);
+  assert.deepEqual(queue.pr_shards[4], previous.pr_shards[4],
+    "an unrelated group keeps its immutable reference");
+  assert.equal(queue.counts.waiting, previous.counts.waiting);
+});
+
+test("lookup grouping splits by UTF-8 bytes before uploading oversized groups", async (t) => {
+  const r = runtime(t), frame = lookupFrame(r, 256, true);
+  for (const part of split(frame, 50)) await r.send(part);
+  await r.flush();
+  const queue = r.object(r.manifest().domains.queue);
+  assert.equal(new Set(queue.pr_shards.slice(0, 4).map((r) => r.url)).size, 4);
+  for (const ref of queue.pr_shards)
+    assert.ok(Buffer.byteLength(r.objects.get("public" + ref.url)) <= 262144);
+  for (const c of frame.changes.filter((c) => c.collection === "members"))
+    assert.deepEqual(r.object(queue.pr_shards[Number(BigInt(c.value.pr) % 64n)])
+      .prs[`${repo}#${c.value.pr}`].members, [c.value]);
+});
+
 test("independent queue children and PR lookups advance while a member upload is held", async (t) => {
   const r = runtime(t),
     archive = globalThis.__operationsTestEnv.ARCHIVE;

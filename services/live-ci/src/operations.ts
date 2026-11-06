@@ -884,17 +884,22 @@ export class Operations {
         tasks: this.rows(source.id, "tasks", "AND batch=?", [batch.id]),
         events: this.rows(source.id, "events", "AND batch=?", [batch.id]),
       }));
-    const prs = Array.from({ length: 64 }, (_, bucket) => {
+    const prs = Array.from({ length: 16 }, (_, group) => {
+      const buckets = Array.from({ length: 4 }, (_, n) => group * 4 + n);
       if (
-        cached.get("pr:" + bucket)?.waiting_records &&
-        !dirty.some((d) => d.kind === "pr" && d.id === String(bucket))
+        buckets.every(
+          (bucket) =>
+            cached.get("pr:" + bucket)?.waiting_records &&
+            cached.get("pr:" + bucket)?.lookup_group === 1 &&
+            !dirty.some((d) => d.kind === "pr" && d.id === String(bucket)),
+        )
       )
         return null;
-      return {
+      return buckets.map((bucket) => ({
         bucket,
         inputs: this.rows(source.id, "inputs", "AND pr_bucket=?", [bucket]),
         members: this.rows(source.id, "members", "AND pr_bucket=?", [bucket]),
-      };
+      }));
     }).filter((p) => p !== null);
     return { source, cached, dirty, batches, changed, prs };
   }
@@ -951,29 +956,62 @@ export class Operations {
     );
     const prWork = this.parallel(
       capture.prs,
-      async ({ bucket, inputs, members }) => {
-        const prs: Record<string, any> = {};
-        for (const [kind, records] of [
-          ["inputs", inputs],
-          ["members", members],
-        ] as const)
-          for (const item of records) {
-            const key = `${item.repository}#${item.pr}`;
-            const pr = (prs[key] ||= {
-              repository: item.repository,
-              pr: item.pr,
-              inputs: [],
-              members: [],
+      async (buckets) => {
+        const prepared = buckets.map(({ bucket, inputs, members }) => {
+          const prs: Record<string, any> = {};
+          for (const [kind, records] of [
+            ["inputs", inputs],
+            ["members", members],
+          ] as const)
+            for (const item of records) {
+              const key = `${item.repository}#${item.pr}`;
+              const pr = (prs[key] ||= {
+                repository: item.repository,
+                pr: item.pr,
+                inputs: [],
+                members: [],
+              });
+              pr[kind].push(item);
+            }
+          return {
+            bucket,
+            prs,
+            waiting: inputs.filter((i) =>
+              ["waiting", "reserved"].includes(i.state),
+            ),
+          };
+        });
+        // The existing reader selects a PR by key, not by object ownership.
+        // Share one immutable object across up to four lookup slots, preserving
+        // all member/version fields. Split large groups before upload so a
+        // cold lookup never becomes larger than an existing individual bucket
+        // or this 256 KiB grouping budget. Capture includes unchanged neighbors
+        // too: a dirty bucket cannot erase another bucket's records.
+        const packs: { buckets: typeof prepared; value: any }[] = [];
+        const pack = (buckets: typeof prepared) => {
+          const value = {
+            schema: "tauceti.operations.prs/v1",
+            prs: Object.assign({}, ...buckets.map((b) => b.prs)),
+          };
+          if (
+            buckets.length > 1 &&
+            new TextEncoder().encode(JSON.stringify(value)).length > 262144
+          ) {
+            const middle = Math.ceil(buckets.length / 2);
+            pack(buckets.slice(0, middle));
+            pack(buckets.slice(middle));
+          } else packs.push({ buckets, value });
+        };
+        pack(prepared);
+        await this.parallel(packs, async ({ buckets, value }) => {
+          const ref = await object(value);
+          for (const { bucket, waiting } of buckets)
+            save("pr", String(bucket), {
+              ref,
+              lookup_group: 1,
+              waiting: waiting.length,
+              waiting_records: waiting,
             });
-            pr[kind].push(item);
-          }
-        const waiting = inputs.filter((i) =>
-          ["waiting", "reserved"].includes(i.state),
-        );
-        save("pr", String(bucket), {
-          ref: await object({ schema: "tauceti.operations.prs/v1", prs }),
-          waiting: waiting.length,
-          waiting_records: waiting,
         });
       },
     );
