@@ -3321,3 +3321,25 @@ test("pool activity includes cached source metadata beyond the 200-partition job
  assert.equal(value.pool_activity.coverage,'retained_observations');
  assert.equal(value.pool_activity.pools[0].builds.windows[0].finished,205);
 });
+
+test("native internal Facts reads may finish after three seconds without a false observer failure", async t => {
+ const bundled=await build({stdin:{resolveDir:process.cwd(),loader:'js',contents:`
+ import {Operations} from './src/operations.ts'; export {Operations};
+ export class Facts {async fetch(){
+   await new Promise(resolve=>setTimeout(resolve,3500));
+   const scope={running:1,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
+   return Response.json({schema:'tauceti.operations.partition/v1',partition:'${repo}/2026-11-06',revision:1,computed_at:new Date().toISOString(),received_at:new Date().toISOString(),jobs:[],pending_workflows:[],activity:{complete:true,pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});
+ }}
+ export default{fetch(request,env){return env.OPERATIONS.get(env.OPERATIONS.idFromName('test')).fetch(request)}};
+ `},bundle:true,platform:'browser',format:'esm',external:['cloudflare:workers'],write:false});
+ const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:bundled.outputFiles[0].text,compatibilityDate:'2026-10-15',durableObjects:{OPERATIONS:{className:'Operations',useSQLite:true},FACTS:{className:'Facts',useSQLite:true}},r2Buckets:['ARCHIVE'],bindings:{OPERATIONS_PUBLIC_REPOSITORIES:JSON.stringify([repo])}}));
+ t.after(()=>mf.dispose());
+ const bucket=await mf.getR2Bucket('ARCHIVE');
+ assert.equal((await mf.dispatchFetch('https://internal/partition',{method:'POST',body:JSON.stringify({partition:repo+'/2026-11-06',revision:1})})).status,200);
+ for(let i=0;i<400;i++){
+  const object=await bucket.get('public/v1/operations/manifest.json');
+  if(object){const manifest=await object.json(),ref=manifest.domains.jobs;if(ref?.url){const value=await (await bucket.get('public'+ref.url)).json();if(value.pool_activity?.pools[0]?.builds.running===1){assert.equal(value.pool_activity.coverage,'retained_observations');return;}}}
+  await new Promise(resolve=>setTimeout(resolve,50));
+ }
+ assert.fail('A valid slow internal source never became visible');
+});

@@ -1140,8 +1140,9 @@ export class Operations {
             this.env.FACTS.idFromName(p.name),
           ).fetch("https://internal/operations", {
             method: "POST",
+            // This is a bounded internal SQLite projection, not an upstream
+            // discovery call. Cold reads may legitimately exceed three seconds.
             body: "{}",
-            signal: AbortSignal.timeout(3000),
           });
           if (!response.ok) throw new Error("Facts unavailable");
           const value: any = await response.json();
