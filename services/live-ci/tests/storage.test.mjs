@@ -529,6 +529,35 @@ test("a burst over drain capacity settles without regenerating interval updates"
   assert.equal((await f.backlog()).outbox, 60);
 });
 
+for (const operationsOnly of [false, true]) test(
+  `continued observations preserve an overdue ${operationsOnly ? "operations" : "control"} notification`, async (t) => {
+    const f = fixture(t, 0), notices = [];
+    if (operationsOnly) {
+      await f.fact.flush(true); // Existing Control eligibility is already acknowledged.
+      f.env.OPERATIONS = { idFromName: id => id, get: () => ({ fetch: async (_url, options) => {
+        notices.push(JSON.parse(options.body));
+        return Response.json({ ok: true });
+      } }) };
+    }
+    const observe = (delivery) => post(f.fact, "/event", {
+      repo: f.run.repo, partition: f.fact.meta("partition"), delivery,
+      run: rawRun(f.run, {head_branch: delivery, updated_at: new Date(Date.now()).toISOString()}),
+    });
+    await observe("first");
+    const deadline = await f.ctx.storage.getAlarm();
+    assert.equal(deadline, Date.now() + 1000);
+    f.advance(2); // Alarm delivery lags while another real observation arrives.
+    await observe("second");
+    assert.equal(await f.ctx.storage.getAlarm(), deadline);
+    assert.equal(notices.length, 0, "ingestion must not enter a reentrant notification chain");
+    await f.fact.alarm();
+    if (operationsOnly) {
+      assert.equal(notices.length, 1);
+      assert.equal(notices[0].revision, f.fact.meta("operations_revision"));
+    } else assert.equal(f.notifications.length, 1);
+  },
+);
+
 test("frequent notifications do not postpone the persisted refresh deadline", async (t) => {
   const f = fixture(t, 1);
   await f.catchUp();
