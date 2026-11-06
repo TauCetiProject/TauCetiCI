@@ -459,7 +459,8 @@ test("charts include dedicated work and retain pending staging observations", as
   for (const file of ["ci-runner-minutes.svg", "ci-fleet-72h.svg", "ci-build-duration.svg", "ci-build-wait.svg"]) {
     assert.match(assets[file], /eastanglia/);
     assert.match(assets[file], /leanfro/);
-    assert.doesNotMatch(assets[file], /tauchonki|Chris/);
+    assert.match(assets[file], /yael/);
+    assert.match(assets[file], /brett/);
   }
   assert.match(assets["ci-build-duration.svg"], /Other self-hosted, median/);
   assert.match(assets["ci-picker.svg"], /cy="320"/); // One quarter of PR builds use GitHub, counting both named hosts.

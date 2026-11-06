@@ -11,6 +11,56 @@ const decode = (s: string) =>
   );
 /** Only the trusted, main-branch summary workflow may reserve reads or submit summaries. */
 export async function verifyPublisher(token: string, env: Env): Promise<any> {
+  return verify(
+    token,
+    env,
+    (claims) =>
+      claims.repository === "TauCetiProject/TauCeti" &&
+      claims.ref === "refs/heads/main" &&
+      claims.event_name === "workflow_run" &&
+      claims.workflow_ref ===
+        "TauCetiProject/TauCeti/.github/workflows/ci-live-summary.yml@refs/heads/main",
+    "tauceti-live-ci",
+  );
+}
+/** A build token has authority only over its own run/attempt/check-run telemetry.
+ * check_run_id is signed by GitHub; neither a body job ID nor runner name is an identity grant. */
+export async function verifyProgress(token: string, env: Env): Promise<any> {
+  const repositories = JSON.parse(env.OPERATIONS_PUBLIC_REPOSITORIES || "[]");
+  return verify(
+    token,
+    env,
+    (c) =>
+      repositories.includes(c.repository) &&
+      c.repository_visibility === "public" &&
+      (c.workflow_ref ===
+        `${c.repository}/.github/workflows/pr-build.yml@refs/heads/main` ||
+        (c.event_name === "merge_group" &&
+          typeof c.ref === "string" &&
+          /^refs\/heads\/gh-readonly-queue\/main\/[A-Za-z0-9_./-]{1,200}$/.test(
+            c.ref,
+          ) &&
+          c.workflow_ref ===
+            `${c.repository}/.github/workflows/pr-build.yml@${c.ref}`)) &&
+      [
+        "pull_request_target",
+        "repository_dispatch",
+        "workflow_dispatch",
+        "merge_group",
+      ].includes(c.event_name) &&
+      /^\d{1,20}$/.test(String(c.run_id)) &&
+      /^\d{1,20}$/.test(String(c.check_run_id)) &&
+      Number.isSafeInteger(Number(c.run_attempt)) &&
+      Number(c.run_attempt) > 0,
+    "tauceti-operations-progress",
+  );
+}
+async function verify(
+  token: string,
+  env: Env,
+  policy: (claims: any) => boolean,
+  audience: string,
+): Promise<any> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Invalid publisher token");
   const head = JSON.parse(new TextDecoder().decode(decode(parts[0]))),
@@ -19,16 +69,14 @@ export async function verifyPublisher(token: string, env: Env): Promise<any> {
   if (
     head.alg !== "RS256" ||
     claims.iss !== "https://token.actions.githubusercontent.com" ||
-    claims.aud !== "tauceti-live-ci" ||
+    claims.aud !== audience ||
+    ![claims.exp, claims.nbf, claims.iat].every(Number.isFinite) ||
     claims.exp < clock ||
     claims.nbf > clock + 30 ||
     claims.iat > clock + 30 ||
     clock - claims.iat > 600 ||
-    claims.repository !== "TauCetiProject/TauCeti" ||
-    claims.ref !== "refs/heads/main" ||
-    claims.event_name !== "workflow_run" ||
-    claims.workflow_ref !==
-      "TauCetiProject/TauCeti/.github/workflows/ci-live-summary.yml@refs/heads/main"
+    claims.exp - claims.iat > 3600 ||
+    !policy(claims)
   )
     throw new Error("Publisher claims rejected");
   const object = await env.ARCHIVE.get("private/oidc-jwks.json");

@@ -1433,6 +1433,15 @@ export class Control {
   async fetch(request: Request) {
     const path = new URL(request.url).pathname,
       b: any = await request.json();
+    if (path === "/operations-context") {
+      const repos = JSON.parse(this.env.OPERATIONS_PUBLIC_REPOSITORIES || "[]");
+      const partitions = repos.flatMap((repository: string) => this.sql.exec<{name: string; active: number; seen: number}>(
+        "SELECT name,active,seen FROM partitions WHERE (active>0 OR seen>?) AND name GLOB ? ORDER BY active DESC,seen DESC LIMIT 201", now() - DAY, repository + "/*").toArray())
+        .sort((a: {active: number; seen: number}, b: {active: number; seen: number}) => b.active - a.active || b.seen - a.seen);
+      return json({ observed_at: iso(now()), partitions: partitions.slice(0, 200), truncated: partitions.length > 200,
+        inventory: repos.map((repository: string) => ({ repository, confirmed_through: this.sql.exec<{until: number}>("SELECT MAX(until) until FROM coverage WHERE repo=?", repository).one().until || null })),
+        github_budget: { rolling_hour_limit: Number(this.env.GITHUB_HOURLY_BUDGET), optional_details_limit: 60 } });
+    }
     if (path === "/event") {
       await this.ingest(b);
       return json({ ok: true });

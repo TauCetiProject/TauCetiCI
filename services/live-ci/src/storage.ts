@@ -15,6 +15,7 @@ import {
   type Job,
 } from "./model";
 import { call, json, now, type Env } from "./types";
+import { publicJob } from "./operations-jobs";
 import { retained } from "./policy";
 const REFRESH_SECONDS = 300;
 const DAY_NOTIFY_MS = 60_000;
@@ -118,13 +119,15 @@ export class FactPartition {
       if (!next.steps.length) next.steps = old.steps;
       if (next.kind === "unknown") next.kind = old.kind;
       if (!next.runnerName) next.runnerName = old.runnerName;
+      if (!next.runnerId) next.runnerId = old.runnerId;
+      if (!next.checkRunId) next.checkRunId = old.checkRunId;
       if (!next.labels?.length) next.labels = old.labels;
       next.kind = reportingKind(next.kind, next.labels, next.runnerName);
       // Job identity is immutable even when its archived execution snapshot is
       // older. Learn a missing host without rolling back status or timings.
       const archivedKind = reportingKind("self-hosted", j.labels, j.runnerName);
       if (["unknown", "self-hosted"].includes(next.kind) &&
-          ["eastanglia", "leanfro"].includes(archivedKind)) {
+          !["unknown", "self-hosted"].includes(archivedKind)) {
         next.kind = archivedKind;
         next.labels = j.labels;
         next.runnerName = j.runnerName || next.runnerName;
@@ -149,6 +152,7 @@ export class FactPartition {
       data,
       JSON.stringify(after),
     );
+    if (!before || before.data !== data || before.active !== active) this.operationsChanged();
     const groups = new Map<string, Row[]>();
     for (const r of delta) {
       const group = groups.get(r.day) || [];
@@ -162,6 +166,28 @@ export class FactPartition {
           date,
           JSON.stringify(rows.slice(i, i + 200)),
         );
+  }
+  private operationsChanged() {
+    if (!this.env.OPERATIONS) return;
+    const revision = (this.meta("operations_revision") || 0) + 1;
+    this.set("operations_revision", revision); this.set("operations_pending", revision);
+    this.set("operations_received", now());
+  }
+  private async notifyOperations() {
+    const revision = this.meta("operations_pending"), partition = this.meta("partition");
+    if (!revision || !partition || !this.env.OPERATIONS || (this.meta("operations_retry_at") || 0) > now()) return;
+    try {
+      const response = await this.env.OPERATIONS.get(this.env.OPERATIONS.idFromName("operations")).fetch("https://internal/partition", {
+        method: "POST", body: JSON.stringify({ partition, revision }), signal: AbortSignal.timeout(3000),
+      });
+      if (!response.ok) throw new Error("Operations unavailable");
+      if (this.meta("operations_pending") === revision) this.set("operations_pending", null);
+      this.set("operations_retry_at", null); this.set("operations_backoff", null);
+    } catch {
+      // Observer failure must not hold the metric outbox or create a hot retry loop.
+      const delay = Math.min(60, (this.meta("operations_backoff") || 5) * 2);
+      this.set("operations_backoff", delay); this.set("operations_retry_at", now() + delay);
+    }
   }
   async flush(notify = false) {
     const partition = this.meta("partition");
@@ -256,6 +282,11 @@ export class FactPartition {
     if (stillActive && !this.meta("alarm_refresh_due"))
       this.set("alarm_refresh_due", now() + REFRESH_SECONDS);
     if (stillPending) await scheduleSoon(this.ctx);
+    else if (this.meta("operations_pending")) {
+      const retry = Math.max(1000, ((this.meta("operations_retry_at") || now()) - now()) * 1000);
+      const refresh = stillActive ? Math.max(1000, (this.meta("alarm_refresh_due") - now()) * 1000) : retry;
+      await this.ctx.storage.setAlarm(Date.now() + Math.min(retry, refresh));
+    }
     else if (stillActive) {
       const next = Math.max(Date.now() + 1000, this.meta("alarm_refresh_due") * 1000);
       if (scheduled !== next) await this.ctx.storage.setAlarm(next);
@@ -269,6 +300,7 @@ export class FactPartition {
     // Persist the next retry before any network call, including during cold
     // aggregate restoration or an extended downstream outage.
     await this.ctx.storage.setAlarm(Date.now() + 60000);
+    await this.notifyOperations();
     this.ctx.storage.transactionSync(() => {
       // Drain old receipts before producing another page of interval deltas.
       // A drain wake must not regenerate up to 1000 updates while delivering
@@ -457,6 +489,21 @@ export class FactPartition {
           : b.cursor || null,
       });
     }
+    if (path === "/operations") {
+      const rows = this.sql.exec<{data: string; run: string; attempt: number}>(
+        "SELECT data,run,attempt FROM jobs WHERE json_extract(data,'$.estimated')=0 ORDER BY active DESC,CAST(json_extract(data,'$.updated') AS REAL) DESC LIMIT 1101").toArray();
+      const jobs = rows.slice(0, 1100).map(row => {
+        const run = this.run(row.run, row.attempt); return run ? publicJob(run, JSON.parse(row.data)) : null;
+      }).filter(j => j !== null);
+      const runs = this.sql.exec<{data: string}>("SELECT data FROM runs WHERE json_extract(data,'$.status')!='completed' LIMIT 501").toArray().map(r => JSON.parse(r.data));
+      const actualRuns = new Set(jobs.filter(j => j.active).map(j => j.run_id + "/" + j.run_attempt));
+      const pendingRuns = runs.filter(r => !actualRuns.has(r.id + "/" + r.attempt));
+      return json({ schema: "tauceti.operations.partition/v1", partition: this.meta("partition"), revision: this.meta("operations_revision") || 0,
+        received_at: this.meta("operations_received") ? iso(this.meta("operations_received")) : null,
+        computed_at: iso(now()), jobs, pending_workflows_count: pendingRuns.length, pending_workflows: pendingRuns.slice(0, 50).map(r => ({
+          repository: r.repo, run_id: r.id, run_attempt: r.attempt, status: r.status, workflow: r.workflow, observed_at: iso(r.updated), url: `https://github.com/${r.repo}/actions/runs/${r.id}` })),
+        truncated: rows.length > 1100 || runs.length > 500 });
+    }
     if (path === "/current") {
       const jobs = this.sql
         .exec(
@@ -597,6 +644,7 @@ export class FactPartition {
           if (b.verified_jobs)
             this.set(`verified/${run.id}/${run.attempt}`, true);
           if (JSON.stringify(run) !== previous) {
+            this.operationsChanged();
             this.sql.exec(
               "INSERT OR REPLACE INTO runs VALUES (?,?,?)",
               run.id,
@@ -616,6 +664,7 @@ export class FactPartition {
           const previous = JSON.stringify(run);
           run.telemetry = { ...run.telemetry, ...b.telemetry };
           if (JSON.stringify(run) !== previous) {
+            this.operationsChanged();
             this.sql.exec(
               "UPDATE runs SET data=? WHERE id=? AND attempt=?",
               JSON.stringify(run),

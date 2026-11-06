@@ -9,6 +9,7 @@ its credentials only after verifying the actual organisation installation.
 import argparse
 import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
@@ -124,6 +125,26 @@ process.stdout.write(s+'.'+sign('RSA-SHA256',Buffer.from(s),readFileSync(d+'/git
     )
 
 
+def operations_config(config):
+    """Validate the explicit public scope before deploying any new producer grant."""
+    if (DIRECTORY / "operations-repositories.json").exists():
+        public = json.loads((DIRECTORY / "operations-repositories.json").read_text())
+        selected = json.loads(config["vars"]["ALLOWED_REPOSITORIES"])
+        if not isinstance(public, list) or len(public) > 50 or any(not isinstance(repo, str) or repo not in selected for repo in public) or len(public) != len(set(public)):
+            raise SystemExit("Operations repositories must be distinct selected installation repositories")
+        config["vars"]["OPERATIONS_PUBLIC_REPOSITORIES"] = json.dumps(public)
+    if (DIRECTORY / "operations-hosts.json").exists():
+        hosts = json.loads((DIRECTORY / "operations-hosts.json").read_text())
+        if not isinstance(hosts, list) or len(hosts) > 100:
+            raise SystemExit("Public host registry must be a list of at most 100 rows")
+        machines, aliases = set(), set()
+        for host in hosts:
+            if not isinstance(host, dict) or set(host) != {"machine_id", "alias"} or not re.fullmatch(r"[a-f0-9]{32}", str(host.get("machine_id", ""))) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,60}", str(host.get("alias", ""))) or host["machine_id"] in machines or host["alias"] in aliases:
+                raise SystemExit("Public hosts need distinct full machine identities and approved aliases only")
+            machines.add(host["machine_id"]); aliases.add(host["alias"])
+        config["vars"]["OPERATIONS_PUBLIC_HOSTS"] = json.dumps(hosts)
+
+
 def deploy():
     prepare()
     identity = run("npx", "--no-install", "wrangler", "whoami").stdout
@@ -150,6 +171,7 @@ def deploy():
                 if not r.get("archived")
             )
         )
+    operations_config(config)
     if (DIRECTORY / "publication-mode").exists():
         config["vars"]["PUBLICATION_MODE"] = (
             (DIRECTORY / "publication-mode").read_text().strip()
@@ -193,6 +215,9 @@ def deploy():
             ("WEBHOOK_SECRET", "webhook-secret"),
         ]
     }
+    for secret, name in [("QUEUE_MONITOR_TOKEN", "queue-monitor-token"), ("HOST_MONITOR_TOKEN", "host-monitor-token")]:
+        if (DIRECTORY / name).exists():
+            secret_values[secret] = (DIRECTORY / name).read_text().strip()
     if installation:
         secret_values["GITHUB_PRIVATE_KEY"] = (
             DIRECTORY / "github-private-key.pem"

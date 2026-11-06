@@ -30,6 +30,21 @@ class SetupTests(unittest.TestCase):
             for file in path.iterdir():
                 self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
 
+    def test_operations_scope_rejects_private_inventory_fields_and_unknown_repositories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {"vars": {"ALLOWED_REPOSITORIES": json.dumps(["TauCetiProject/TauCeti"])}}
+            (root / "operations-repositories.json").write_text(json.dumps(["Private/NotSelected"]))
+            with patch.object(setup, "DIRECTORY", root), self.assertRaises(SystemExit): setup.operations_config(config)
+            (root / "operations-repositories.json").write_text(json.dumps(["TauCetiProject/TauCeti"]))
+            host = {"machine_id": "a" * 32, "alias": "yael", "target": "private-ssh"}
+            (root / "operations-hosts.json").write_text(json.dumps([host]))
+            with patch.object(setup, "DIRECTORY", root), self.assertRaises(SystemExit): setup.operations_config(config)
+            del host["target"]
+            (root / "operations-hosts.json").write_text(json.dumps([host]))
+            with patch.object(setup, "DIRECTORY", root): setup.operations_config(config)
+            self.assertEqual(json.loads(config["vars"]["OPERATIONS_PUBLIC_HOSTS"]), [host])
+
 
 if __name__ == "__main__":
     unittest.main()
