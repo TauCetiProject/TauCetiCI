@@ -29,6 +29,9 @@ export class Operations {
   private publishing?: Promise<void>;
   private publicationStarted?: number;
   private publicationPending = new Set<string>();
+  private objectWrites = new Map<string, Promise<{ url: string }>>();
+  private activeUploads = 0;
+  private uploadWaiters: (() => void)[] = [];
   private get env(): Env {
     return bindings as Env;
   }
@@ -555,50 +558,59 @@ export class Operations {
       .toArray()
       .map((r) => JSON.parse(r.data));
   }
+  /** Bound R2 connections across every concurrently projected domain. */
+  private async upload<T>(write: () => Promise<T>): Promise<T> {
+    if (this.activeUploads >= 4)
+      await new Promise<void>((resolve) => this.uploadWaiters.push(resolve));
+    else this.activeUploads++;
+    try { return await write(); }
+    finally {
+      const next = this.uploadWaiters.shift();
+      if (next) next();
+      else this.activeUploads--;
+    }
+  }
+  private async parallel<T, R>(values: T[], build: (value: T) => Promise<R>): Promise<R[]> {
+    const result: R[] = [];
+    let next = 0;
+    const workers = await Promise.allSettled(Array.from({length: Math.min(4, values.length)}, async () => {
+      while (next < values.length) {
+        const index = next++;
+        result[index] = await build(values[index]);
+      }
+    }));
+    const failure = workers.find((r) => r.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    return result;
+  }
   private async object(value: any): Promise<{ url: string }> {
     const data = JSON.stringify(value),
       hash = (await operationsScope(this.env)) + "/" + (await digest(data)),
       clock = now();
-    const exists = this.sql
-      .exec("SELECT 1 FROM ops_objects WHERE hash=?", hash)
-      .toArray().length;
-    if (!exists) {
-      await this.env.ARCHIVE.put("public" + PREFIX + hash + ".json", data, {
-        httpMetadata: { contentType: "application/json" },
-      });
-      this.sql.exec(
-        "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
-        hash,
-        clock,
-      );
-      for (const match of data.matchAll(
-        /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
-      ))
-        this.sql.exec(
-          "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
-          hash,
-          match[1],
-        );
-    } else
-      this.sql.exec(
-        "UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?",
-        clock,
-        hash,
-        clock - 3600,
-      );
-    return { url: PREFIX + hash + ".json" };
+    const pending = this.objectWrites.get(hash);
+    if (pending) return pending;
+    const work = (async () => {
+      const exists = this.sql.exec("SELECT 1 FROM ops_objects WHERE hash=?", hash).toArray().length;
+      if (!exists) {
+        await this.upload(() => this.env.ARCHIVE.put("public" + PREFIX + hash + ".json", data, {
+          httpMetadata: { contentType: "application/json" },
+        }));
+        this.sql.exec("INSERT OR IGNORE INTO ops_objects VALUES (?,?)", hash, clock);
+        for (const match of data.matchAll(/\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g))
+          this.sql.exec("INSERT OR IGNORE INTO ops_links VALUES (?,?)", hash, match[1]);
+      } else this.sql.exec("UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?", clock, hash, clock - 3600);
+      return { url: PREFIX + hash + ".json" };
+    })();
+    this.objectWrites.set(hash, work);
+    try { return await work; }
+    finally { this.objectWrites.delete(hash); }
   }
   private async pages(schema: string, records: any[], size = 100) {
-    const result = [];
-    for (let start = 0; start < records.length; start += size)
-      result.push({
-        ...(await this.object({
-          schema,
-          records: records.slice(start, start + size),
-        })),
-        count: Math.min(size, records.length - start),
-      });
-    return result;
+    const starts = Array.from({length: Math.ceil(records.length / size)}, (_, index) => index * size);
+    return this.parallel(starts, async (start) => ({
+      ...(await this.object({schema, records: records.slice(start, start + size)})),
+      count: Math.min(size, records.length - start),
+    }));
   }
   /** Capture all SQL facts synchronously before the first R2 await. Later commits
    * remain dirty for the next flush; a busy source cannot starve publication. */
@@ -672,7 +684,7 @@ export class Operations {
       cached.set(kind + ":" + id, data);
       updates.push({ kind, id, data });
     };
-    for (const { batch, members, attempts, tasks, events } of capture.changed) {
+    await this.parallel(capture.changed, async ({ batch, members, attempts, tasks, events }) => {
       const activeMembers = members.filter(
         (m) => !m.removed && m.batch_version === batch.version,
       );
@@ -705,8 +717,8 @@ export class Operations {
           )[0] || null,
         active_tasks: tasks.filter((t) => t.state === "open").slice(0, 10),
       });
-    }
-    for (const { bucket, inputs, members } of capture.prs) {
+    });
+    await this.parallel(capture.prs, async ({ bucket, inputs, members }) => {
       const prs: Record<string, any> = {};
       for (const [kind, records] of [
         ["inputs", inputs],
@@ -728,7 +740,7 @@ export class Operations {
         waiting: waiting.length,
         waiting_records: waiting,
       });
-    }
+    });
     const shards: any[][] = Array.from({ length: 64 }, () => []);
     let memberCount = 0;
     for (const batch of batches) {
@@ -736,14 +748,9 @@ export class Operations {
       memberCount += view.member_count;
       shards[Number(BigInt(batch.id) % 64n)].push(view);
     }
-    const batchIndex = [];
-    for (const shard of shards)
-      batchIndex.push(
-        await this.object({
-          schema: "tauceti.operations.batches/v1",
-          batches: shard,
-        }),
-      );
+    const batchIndex = await this.parallel(shards, (shard) => this.object({
+      schema: "tauceti.operations.batches/v1", batches: shard,
+    }));
     const active = new Set(meta.active_batch_ids);
     const recent = [...batches]
       .sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? -1 : 1))

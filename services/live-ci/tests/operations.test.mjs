@@ -99,7 +99,7 @@ function runtime(t) {
         if (beforeWrite) {
           const callback = beforeWrite;
           beforeWrite = undefined;
-          await callback(key);
+          await callback(key, value);
         }
         if (key.endsWith("/manifest.json") && failPointer) {
           failPointer = false;
@@ -440,7 +440,30 @@ test("1200 members have complete stable pagination and only changed detail objec
   }
   value.metadata.collection_counts.members = 1200;
   for (const frame of split(value, 400)) await r.send(frame);
-  await r.operations.alarm();
+  let active = 0, peak = 0, allActive = 0, allPeak = 0, ready, release;
+  const fourPages = new Promise((resolve) => { ready = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const watch = async (_key, body) => {
+    r.onWrite(watch);
+    allActive++; allPeak = Math.max(allPeak, allActive);
+    try {
+      if (JSON.parse(body).schema !== "tauceti.operations.members/v1") return;
+      active++; peak = Math.max(peak, active);
+      if (active === 4) ready(true);
+      try { await gate; } finally { active--; }
+    } finally { allActive--; }
+  };
+  r.onWrite(watch);
+  const publication = r.operations.alarm();
+  try {
+    assert.equal(await Promise.race([fourPages, new Promise((resolve) => setTimeout(() => resolve(false), 1000))]), true,
+      "independent member pages should upload concurrently");
+    assert.equal(r.objects.has("public/v1/operations/manifest.json"), false,
+      "the pointer must wait for every dependent object");
+  } finally { release(); await publication; }
+  assert.equal(peak, 4, "independent member pages overlap");
+  assert.ok(allPeak <= 4, "R2 writes remain globally bounded across domains");
+  assert.equal(new Set(r.writes).size, r.writes.length, "identical shard objects upload once");
   const queue = r.object(r.manifest().domains.queue),
     index = r.object(queue.batch_shards[Number(BigInt(batch.id) % 64n)]);
   const detail = r.object(index.batches.find((b) => b.id === batch.id).detail);
