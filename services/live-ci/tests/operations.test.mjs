@@ -371,6 +371,22 @@ test("incoming heartbeats do not postpone an earlier publication alarm", async (
   assert.equal(r.alarm(), first);
 });
 
+test("new observations use the next publication slot without adding an idle interval", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  r.advance(15000);
+  await r.operations.alarm();
+  const published = Date.now();
+  r.advance(8000);
+  await r.send(r.next());
+  assert.equal(r.alarm(), published + 10000, "preserve the existing minimum write interval");
+  r.advance(3000);
+  await r.operations.alarm();
+  r.advance(15000);
+  await r.send(r.next(3));
+  assert.equal(r.alarm(), Date.now() + 1000, "idle arrivals need not wait another full interval");
+});
+
 test("ingestion during an R2 write cannot publish mixed member and candidate generations", async (t) => {
   const r = runtime(t);
   await r.send(seed);

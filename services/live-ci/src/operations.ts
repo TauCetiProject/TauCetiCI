@@ -85,9 +85,13 @@ export class Operations {
   private repositories(): string[] {
     return JSON.parse(this.env.OPERATIONS_PUBLIC_REPOSITORIES || "[]");
   }
-  private async schedule(delay = 10_000) {
+  private async schedule() {
+    // Coalesce at the next allowed publication slot, rather than adding a
+    // full interval after every idle arrival. The write cadence stays bounded.
+    const lastStarted = Math.max(this.publicationStarted || 0, (this.get("published") || 0) * 1000);
     const next = Math.max(
-        Date.now() + delay,
+        Date.now() + 1000,
+        lastStarted + 10_000,
         (this.get("publication_retry") || 0) * 1000,
       ),
       old = await this.ctx.storage.getAlarm();
