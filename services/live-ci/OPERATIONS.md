@@ -42,6 +42,16 @@ credentials cannot invoke admin, runner management or queue mutation endpoints.
 `GET /ingest/operations/queue/state` needs the queue grant and returns its source
 identity/fence for deliberate recovery of a lost publisher state file.
 
+Task `progress.build` is optional numeric telemetry from the queue sidecar. It
+allows only `stage` (`preparation`, `verification`, `streaming`),
+`completed_tasks`, `total_tasks`, `sampled_at`, `log_updated_at` and nullable
+`last_progress_at`. Counts refer to reported Lake build tasks, not modules.
+Sampler/log times do not refresh the task checkpoint or establish useful work;
+only an observed counter increase advances the progress-change time. A first
+sample or a reset leaves that time unknown. Raw log text and extra fields are
+rejected. Older producers may omit the object. Deploy this compatible reader
+before enabling the sidecar addition.
+
 Trusted progress POSTs use `/ingest/operations/progress` and short-lived GitHub
 OIDC tokens with audience `tauceti-operations-progress`. The main-branch trusted
 `pr-build.yml` workflow must grant `id-token: write` to its build job. The signed

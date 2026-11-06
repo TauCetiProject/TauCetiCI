@@ -185,13 +185,29 @@ export function record(
     } else if (key === "progress") {
       object(
         item,
-        "coverage state observed_at seconds providers models cost usage",
+        "coverage state observed_at seconds providers models cost usage build",
       );
       if (!["observed", "unavailable"].includes(item.coverage))
         throw new Error("Invalid task progress");
+      if (item.coverage !== "observed" && item.build !== undefined)
+        throw new Error("Build requires an observed task");
       stamp(item.observed_at);
       if (item.coverage === "observed") {
         string(item.state, 40);
+        if (item.build !== undefined) {
+          const b = item.build;
+          object(b, "stage completed_tasks total_tasks sampled_at log_updated_at last_progress_at");
+          if (!["preparation", "verification", "streaming"].includes(b.stage))
+            throw new Error("Invalid task build stage");
+          integer(b.completed_tasks, 0, 999999999);
+          integer(b.total_tasks, 1, 999999999);
+          if (b.completed_tasks > b.total_tasks) throw new Error("Invalid task build counts");
+          stamp(b.sampled_at);
+          stamp(b.log_updated_at);
+          stamp(b.last_progress_at);
+          if (b.sampled_at === null || b.log_updated_at === null)
+            throw new Error("Missing task build observation time");
+        }
         if (
           item.seconds !== null &&
           (!Number.isFinite(item.seconds) || item.seconds < 0)

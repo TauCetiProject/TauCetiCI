@@ -211,6 +211,35 @@ test("actual Python export is accepted and produces linked, paginated queue and 
   assert.equal(attempts[0].base, head.base);
 });
 
+test("repair build observations retain numeric progress separately from phase age and reject private log fields", async (t) => {
+  const r = runtime(t), frame = structuredClone(seed);
+  const head = frame.changes.find(c => c.collection === "batches").value;
+  const build = {stage:"preparation",completed_tasks:58742,total_tasks:60357,sampled_at:seed.metadata.observed_at,log_updated_at:seed.metadata.observed_at,last_progress_at:null};
+  const task = {id:"21",kind:"rebase_conflict",batch_id:head.id,batch_version:head.version,state:"open",resolution:"",ci_attempt_id:null,created_at:seed.metadata.observed_at,resolved_at:null,progress:{coverage:"observed",state:"sources_ready",observed_at:"2026-01-01T00:00:00Z",seconds:null,providers:[],models:[],cost:{recorded_usd:0,recorded_attempts:0,unknown_attempts:0,coverage:"recorded_subtotal_only"},build}};
+  frame.changes.push({collection:"tasks",id:task.id,value:task});
+  for (const change of [
+    b => {b.private_log="PRIVATE";},
+    b => {b.completed_tasks=60358;},
+    b => {b.total_tasks=0;},
+    b => {b.completed_tasks=1.5;},
+    b => {b.stage="PRIVATE_PATH";},
+    b => {delete b.last_progress_at;},
+    b => {b.sampled_at=null;},
+  ]) {
+    const invalid=structuredClone(frame);
+    change(invalid.changes.at(-1).value.progress.build);
+    await r.send(invalid,400);
+  }
+  const unavailable=structuredClone(frame);
+  unavailable.changes.at(-1).value.progress.coverage="unavailable";
+  await r.send(unavailable,400);
+  await r.send(frame);
+  await r.operations.alarm();
+  const queue=r.object(r.manifest().domains.queue);
+  assert.deepEqual(queue.batches.find(b=>b.id===head.id).active_tasks[0].progress.build,build);
+  assert.equal(queue.batches.find(b=>b.id===head.id).active_tasks[0].progress.observed_at,task.progress.observed_at);
+});
+
 test("out-of-order frames stay invisible until every part commits, including across object eviction", async (t) => {
   const r = runtime(t),
     frames = split(seed);
