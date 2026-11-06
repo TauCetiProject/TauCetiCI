@@ -183,7 +183,10 @@ export function record(
       if (!(key === "empty" && item === null) && typeof item !== "boolean")
         throw new Error("Invalid flag");
     } else if (key === "progress") {
-      object(item, "coverage state observed_at seconds providers models cost");
+      object(
+        item,
+        "coverage state observed_at seconds providers models cost usage",
+      );
       if (!["observed", "unavailable"].includes(item.coverage))
         throw new Error("Invalid task progress");
       stamp(item.observed_at);
@@ -198,6 +201,19 @@ export function record(
         item.providers.forEach((v: any) => string(v, 100));
         list(item.models, 100);
         item.models.forEach((v: any) => string(v, 100));
+        if (item.usage !== undefined) {
+          object(
+            item.usage,
+            "input_tokens cached_input_tokens output_tokens reasoning_output_tokens total_tokens",
+          );
+          for (const raw of Object.values(item.usage)) {
+            const row = raw as any;
+            object(row, "recorded_tokens recorded_attempts unknown_attempts");
+            integer(row.recorded_tokens);
+            integer(row.recorded_attempts);
+            integer(row.unknown_attempts);
+          }
+        }
         object(
           item.cost,
           "recorded_usd recorded_attempts unknown_attempts coverage",
@@ -254,7 +270,7 @@ export function record(
 export function metadata(value: any, repositories: string[]) {
   object(
     value,
-    "schema observed_at source_revision coverage truncated scope service status_observed_at conditions outbox settings claims workers event_history_truncated claim_history_truncated collection_counts collection_complete active_batch_ids retained_batch_ids history",
+    "schema observed_at source_revision coverage truncated scope service status_observed_at conditions outbox settings claims workers event_history_truncated claim_history_truncated collection_counts collection_complete active_batch_ids retained_batch_ids history canonical_sha",
   );
   if (
     value.schema !== QUEUE_SCHEMA ||
@@ -264,6 +280,12 @@ export function metadata(value: any, repositories: string[]) {
   stamp(value.observed_at);
   stamp(value.status_observed_at);
   string(value.source_revision, 40);
+  if (
+    value.canonical_sha !== undefined &&
+    value.canonical_sha !== null &&
+    (typeof value.canonical_sha !== "string" || !sha.test(value.canonical_sha))
+  )
+    throw new Error("Invalid canonical commit");
   for (const key of [
     "truncated",
     "event_history_truncated",
@@ -440,6 +462,13 @@ export function progressFrame(value: any) {
   )
     throw new Error("Invalid module");
   string(value.source_revision, 40);
-  if (value.source_revision && !sha.test(value.source_revision)) throw new Error("Invalid progress revision");
+  if (
+    value.canonical_sha !== undefined &&
+    value.canonical_sha !== null &&
+    (typeof value.canonical_sha !== "string" || !sha.test(value.canonical_sha))
+  )
+    throw new Error("Invalid canonical commit");
+  if (value.source_revision && !sha.test(value.source_revision))
+    throw new Error("Invalid progress revision");
   return value;
 }

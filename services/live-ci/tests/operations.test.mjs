@@ -675,6 +675,13 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     workers_enabled: true,
     ci_max_jobs: 0,
     worker_limit: 2,
+    capacity_context: {
+      observed_at: new Date(Date.now() - 120000).toISOString(),
+      scope: "organization_all_workflow_jobs",
+      coverage: "observed",
+      observer_error: false,
+      running_jobs: { github: 3, namespace: 4, "self-hosted": null },
+    },
     admission: {
       ci_kinds: ["pr", "staging"],
       staging_slots: 1,
@@ -831,6 +838,13 @@ test("combined large queue, job and host fixture binds exact candidate/run/attem
     workers_enabled: true,
     ci_max_jobs: 1,
     worker_limit: 2,
+    capacity_context: {
+      observed_at: new Date(Date.now() - 120000).toISOString(),
+      scope: "organization_all_workflow_jobs",
+      coverage: "observed",
+      observer_error: false,
+      running_jobs: { github: 3, namespace: 4, "self-hosted": null },
+    },
     admission: {
       ci_kinds: ["pr", "staging"],
       staging_slots: 1,
@@ -1034,4 +1048,60 @@ test("quiet heartbeats do not rewrite every reachable object timestamp", async (
       .get(row.hash);
     assert.equal(after.referenced, row.referenced);
   }
+});
+
+test("canonical SHA and recorded token coverage accept only their public contracts", async (t) => {
+  const r = runtime(t),
+    frame = structuredClone(seed);
+  frame.metadata.canonical_sha = "a".repeat(40);
+  const task = {
+    id: "99",
+    kind: "repair",
+    batch_id: "1",
+    batch_version: 1,
+    state: "open",
+    resolution: "",
+    ci_attempt_id: null,
+    created_at: seed.metadata.observed_at,
+    resolved_at: null,
+    progress: {
+      coverage: "observed",
+      state: "agent_running",
+      observed_at: seed.metadata.observed_at,
+      seconds: 10,
+      providers: ["codex"],
+      models: ["gpt-6.1"],
+      cost: {
+        recorded_usd: 1,
+        recorded_attempts: 1,
+        unknown_attempts: 0,
+        coverage: "recorded_subtotal_only",
+      },
+      usage: {
+        input_tokens: {
+          recorded_tokens: 100,
+          recorded_attempts: 1,
+          unknown_attempts: 0,
+        },
+        output_tokens: {
+          recorded_tokens: 0,
+          recorded_attempts: 0,
+          unknown_attempts: 1,
+        },
+      },
+    },
+  };
+  frame.changes.push({ collection: "tasks", id: "99", value: task });
+  const bad = structuredClone(frame);
+  bad.metadata.canonical_sha = "PRIVATE_PATH";
+  await r.send(bad, 400);
+  const secret = structuredClone(frame);
+  secret.changes.at(-1).value.progress.usage.private_prompt = "PRIVATE";
+  await r.send(secret, 400);
+  await r.send(frame);
+  await r.operations.alarm();
+  assert.equal(
+    r.object(r.manifest().domains.queue).canonical_sha,
+    "a".repeat(40),
+  );
 });
