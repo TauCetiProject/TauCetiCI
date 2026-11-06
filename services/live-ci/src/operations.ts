@@ -1465,7 +1465,7 @@ export class Operations {
         .toArray(),
     });
     await Promise.all([
-      project("jobs", this.get("jobs_revision") || 0, () => this.jobsView()),
+      project("jobs", "2/" + (this.get("jobs_revision") || 0), () => this.jobsView()),
       project("hosts", hostVersion, () => this.hostsView()),
       project("host_history", Math.floor(now() / 300), async () => ({
         ...(await this.hostHistory()),
