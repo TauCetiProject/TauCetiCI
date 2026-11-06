@@ -1,3 +1,4 @@
+import { RUNNER_HOSTS } from "./runner-registry";
 import { DAY, day, iso, RUNNERS, runnerLabel } from "./model";
 const colors = [
   "#5eead4",
@@ -10,7 +11,7 @@ const colors = [
   "#94a3b8",
 ];
 const hostColors: Record<string, string> = {
-  eastanglia: "#fde047", leanfro: "#22d3ee", "self-hosted": "#f472b6",
+  eastanglia: "#fde047", leanfro: "#22d3ee", yael: "#a3e635", brett: "#fb923c", "self-hosted": "#f472b6",
 };
 const escape = (s: any) =>
   String(s).replace(
@@ -178,8 +179,7 @@ export function renderCharts(
     for (const [i, kind] of [
       "github",
       "namespace",
-      "eastanglia",
-      "leanfro",
+      ...RUNNER_HOSTS.map(h => h.alias),
       "self-hosted",
       "merge",
       ...(metric === "wait" ? ["other"] : []),
@@ -249,7 +249,7 @@ export function renderCharts(
   plot(
     "ci-runner-minutes.svg",
     "Build minutes per day",
-    ["namespace", "github", "eastanglia", "leanfro", "self-hosted", "cancelled"].map((k) => ({
+    ["namespace", "github", ...RUNNER_HOSTS.map(h => h.alias), "self-hosted", "cancelled"].map((k) => ({
       name: runnerLabel(k),
       color: hostColors[k],
       values: daily("minutes/" + k),
@@ -313,8 +313,7 @@ export function renderCharts(
       "PR jobs on Namespace",
       "Merge validation on Namespace",
       "Other Namespace jobs",
-      "Jobs on eastanglia",
-      "Jobs on leanfro",
+      ...RUNNER_HOSTS.map(h => "Jobs on " + h.label),
       "Other self-hosted jobs",
     ];
     const running = [
@@ -324,8 +323,7 @@ export function renderCharts(
       "ns-pr",
       "ns-mq",
       "ns-other",
-      "eastanglia",
-      "leanfro",
+      ...RUNNER_HOSTS.map(h => h.alias),
       "self-hosted",
     ].map((k, i) => ({
       name: names[i],

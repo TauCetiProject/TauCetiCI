@@ -14,14 +14,16 @@
     "PUBLIC_ORIGIN": "https://taucetiproject.org",
     "PUBLICATION_MODE": "shadow",
     "GITHUB_HOURLY_BUDGET": "500",
-    "ALLOWED_REPOSITORIES": "[]"
+    "ALLOWED_REPOSITORIES": "[]",
+    "OPERATIONS_PUBLIC_REPOSITORIES": "[]"
   },
   "durable_objects": {
     "bindings": [
       { "name": "DIRECTORIES", "class_name": "RunDirectory" },
       { "name": "FACTS", "class_name": "FactPartition" },
       { "name": "DAYS", "class_name": "DayAggregate" },
-      { "name": "CONTROL", "class_name": "Control" }
+      { "name": "CONTROL", "class_name": "Control" },
+      { "name": "OPERATIONS", "class_name": "Operations" }
     ]
   },
   "migrations": [
@@ -33,7 +35,8 @@
         "DayAggregate",
         "Control"
       ]
-    }
+    },
+    { "tag": "v2-operations", "new_sqlite_classes": ["Operations"] }
   ],
   "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "tauceti-live-ci" }],
   "queues": {

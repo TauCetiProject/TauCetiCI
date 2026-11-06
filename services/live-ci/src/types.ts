@@ -3,6 +3,11 @@ export interface Env {
   DAYS: DurableObjectNamespace;
   DIRECTORIES: DurableObjectNamespace;
   CONTROL: DurableObjectNamespace;
+  OPERATIONS?: DurableObjectNamespace;
+  OPERATIONS_PUBLIC_REPOSITORIES?: string;
+  QUEUE_MONITOR_TOKEN?: string;
+  HOST_MONITOR_TOKEN?: string;
+  OPERATIONS_PUBLIC_HOSTS?: string;
   ARCHIVE: R2Bucket;
   EVENTS: Queue<{ key: string }>;
   WEBHOOK_SECRET: string;
@@ -55,4 +60,21 @@ export async function digest(data: string | ArrayBuffer): Promise<string> {
 }
 export async function equal(a: string, b: string): Promise<boolean> {
   return !!a && !!b && (await digest(a)) === (await digest(b));
+}
+
+const operationScopes = new Map<string, Promise<string>>();
+/** Scope is part of every immutable operations URL, checked before edge caches. */
+export function operationsScope(env: Env): Promise<string> {
+  const key = JSON.stringify({
+    repositories: JSON.parse(env.OPERATIONS_PUBLIC_REPOSITORIES || "[]").sort(),
+    hosts: env.OPERATIONS_PUBLIC_HOSTS || "[]",
+  });
+  let value = operationScopes.get(key);
+  if (!value) {
+    value = digest(key);
+    operationScopes.set(key, value);
+    if (operationScopes.size > 16)
+      operationScopes.delete(operationScopes.keys().next().value!);
+  }
+  return value;
 }

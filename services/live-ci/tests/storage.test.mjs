@@ -707,3 +707,23 @@ test("large discards make bounded progress and retain cumulative deletion accoun
   assert.equal((await f.backlog()).outbox_sequence, 100003);
   assert.equal((await f.backlog()).next_alarm, null);
 });
+
+test("operations notifications carry job-only changes from alarms and cannot block metric drains", async t => {
+  const f = fixture(t, 1), sent = [];
+  f.env.OPERATIONS = { idFromName: id => id, get: () => ({ fetch: async (url, options) => {
+    sent.push({ path: new URL(url).pathname, body: JSON.parse(options.body) });
+    return Response.json({ ok: true });
+  } }) };
+  const row = f.ctx.storage.sql.exec("SELECT data FROM jobs LIMIT 1").one();
+  const job = JSON.parse(row.data), run = f.fact.run(job.run, job.attempt);
+  f.fact.replaceJob(run, { ...job, runnerId: "99", checkRunId: "77", runnerName: "assigned-runner" }, Date.now()/1000);
+  assert.equal(sent.length, 0, "no reentrant Facts→Operations call during ingestion");
+  await f.fact.alarm();
+  assert.equal(sent[0].path, "/partition"); assert.ok(sent[0].body.revision > 0);
+  const observation = await (await f.fact.fetch(new Request("https://internal/operations", { method: "POST", body: "{}" }))).json();
+  assert.equal(observation.jobs[0].runner_id, "99"); assert.equal(observation.jobs[0].check_run_id, "77");
+  f.env.OPERATIONS.get = () => ({ fetch: async () => { throw new Error("observer unavailable"); } });
+  f.fact.replaceJob(run, { ...job, runnerId: "100" }, Date.now()/1000);
+  await f.fact.alarm();
+  assert.ok(f.fact.meta("operations_pending"), "failed observer notification remains retryable");
+});

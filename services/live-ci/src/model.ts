@@ -1,4 +1,5 @@
 /** Pure, reversible metric contributions. Times and durations are seconds. */
+import { RUNNER_HOSTS } from "./runner-registry";
 import { classify } from "./failure";
 export type Row = {
   day: string;
@@ -41,6 +42,8 @@ export type Job = {
   kind: string;
   labels?: string[];
   runnerName?: string;
+  runnerId?: string;
+  checkRunId?: string;
   assigned: boolean;
   steps: {
     name: string;
@@ -76,14 +79,9 @@ export const rank = (status: string) =>
   status === "completed" ? 3 : status === "in_progress" ? 2 : 1;
 // Public report aliases only; fleet credentials, admission and dispatch keep
 // their permanent identities and operator names. Unknown hosts stay separate.
-const fleetNames: Record<string, string> = {
-  "4fab2fed9a5145f894d066c7bb28ace4": "eastanglia",
-  "11e2756fc11042d798f759410573a935": "leanfro",
-};
-const hostNames: Record<string, string> = {
-  "chris-server": "eastanglia", chris: "eastanglia", tauchonki: "leanfro",
-};
-export const RUNNERS = ["github", "namespace", "eastanglia", "leanfro", "self-hosted"];
+const fleetNames: Record<string, string> = Object.fromEntries(RUNNER_HOSTS.map(h => [h.machine_id, h.alias]));
+const hostNames: Record<string, string> = Object.fromEntries(RUNNER_HOSTS.flatMap(h => h.aliases.map(a => [a, h.alias])));
+export const RUNNERS = ["github", "namespace", ...RUNNER_HOSTS.map(h => h.alias), "self-hosted"];
 export const runnerLabel = (kind: string) => ({
   github: "GitHub", namespace: "Namespace", "self-hosted": "Other self-hosted",
   merge: "Merge validation", other: "Other GitHub jobs", cancelled: "Cancelled PR builds",
@@ -183,6 +181,8 @@ export function normalizeJob(j: any): Job {
     kind: reportingKind(j.runner_kind || runner(labels), labels, j.runner_name),
     labels,
     runnerName: j.runner_name || "",
+    runnerId: j.runner_id ? String(j.runner_id) : undefined,
+    checkRunId: /\/check-runs\/(\d+)$/.exec(j.check_run_url || "")?.[1],
     assigned,
     steps,
     failure:
@@ -254,7 +254,7 @@ export function contributions(run: Run, j: Job, until: number): Row[] {
     j.name,
   );
   const series =
-    ["eastanglia", "leanfro", "self-hosted"].includes(j.kind)
+    [...RUNNER_HOSTS.map(h => h.alias), "self-hosted"].includes(j.kind)
       ? j.kind
       : j.kind === "github"
       ? isBuild

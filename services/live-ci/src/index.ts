@@ -6,13 +6,16 @@ import {
   equal,
   json,
   now,
+  operationsScope,
+  stub,
   type Env,
 } from "./types";
 import { validTelemetry } from "./model";
 import { compactEvent } from "./policy";
-import { verifyPublisher } from "./oidc";
+import { verifyPublisher, verifyProgress } from "./oidc";
 export { RunDirectory, FactPartition, DayAggregate } from "./storage";
 export { Control } from "./control";
+export { Operations } from "./operations";
 
 async function body(request: Request, max = 2_000_000): Promise<string> {
   if (Number(request.headers.get("content-length") || 0) > max)
@@ -207,14 +210,17 @@ async function handle(
       },
     );
   }
-  if (path.startsWith("/v1/ci/") && ["GET", "HEAD"].includes(request.method)) {
+  if ((path.startsWith("/v1/ci/") || path.startsWith("/v1/operations/")) && ["GET", "HEAD"].includes(request.method)) {
+    const operations = path.startsWith("/v1/operations/");
     if (
-      path !== "/v1/ci/manifest.json" &&
-      !/^\/v1\/ci\/assets\/[a-f0-9]+\/[a-z0-9-]+\.(svg|json)$/.test(path)
+      operations ? path !== "/v1/operations/manifest.json" && !/^\/v1\/operations\/objects\/[a-f0-9]{64}\/[a-f0-9]{64}\.json$/.test(path)
+      : path !== "/v1/ci/manifest.json" && !/^\/v1\/ci\/assets\/[a-f0-9]+\/[a-z0-9-]+\.(svg|json)$/.test(path)
     )
       return json({ error: "Not found" }, 404);
+    const scope = operations ? await operationsScope(env) : null;
+    if (operations && path !== "/v1/operations/manifest.json" && path.split("/")[4] !== scope) return json({ error: "Public scope withdrawn" }, 404);
     const cache = await caches.open("ci-reports-v1"),
-      cacheKey = new Request(url.origin + path);
+      cacheKey = new Request(url.origin + path + (scope ? "?scope=" + scope : ""));
     const cached = await cache.match(cacheKey);
     if (cached) {
       if (request.headers.get("if-none-match") === cached.headers.get("etag"))
@@ -236,12 +242,13 @@ async function handle(
           },
         },
       );
+    if (operations && path.endsWith("/manifest.json") && object.customMetadata?.scope !== scope) return json({ error: "Public scope is being refreshed" }, 503);
     const etag = object.httpEtag;
     const headers = {
       ...cors,
       ETag: etag,
       "Cache-Control": path.endsWith("/manifest.json")
-        ? "public,max-age=30,stale-if-error=86400"
+        ? `public,max-age=${operations ? 5 : 30},stale-if-error=86400`
         : "public,max-age=31536000,immutable",
       "Content-Type":
         object.httpMetadata?.contentType ||
@@ -299,6 +306,44 @@ async function handle(
   }
   const token =
     request.headers.get("authorization")?.replace(/^Bearer /, "") || "";
+  if (path === "/ingest/operations/history" && request.method === "POST") {
+    if (!env.QUEUE_MONITOR_TOKEN || !(await equal(token, env.QUEUE_MONITOR_TOKEN))) return json({ error: "Queue publisher authentication failed" }, 401);
+    if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+    let value;
+    try { value = JSON.parse(await body(request, 256_000)); } catch { return json({ error: "Invalid history report" }, 400); }
+    return stub(env.OPERATIONS, "operations").fetch("https://internal/history", { method: "POST", body: JSON.stringify(value) });
+  }
+  if (path === "/ingest/operations/progress" && request.method === "POST") {
+    let claims;
+    try { claims = await verifyProgress(token, env); } catch { return json({ error: "Progress publisher authentication failed" }, 401); }
+    if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+    let value;
+    try { value = JSON.parse(await body(request, 8192)); } catch { return json({ error: "Invalid progress frame" }, 400); }
+    return stub(env.OPERATIONS, "operations").fetch("https://internal/progress", { method: "POST", body: JSON.stringify({ claims: {
+      repository: claims.repository, run_id: String(claims.run_id), run_attempt: Number(claims.run_attempt), check_run_id: String(claims.check_run_id), workflow_sha: claims.workflow_sha,
+    }, value }) });
+  }
+  if (["/ingest/operations/hosts", "/ingest/operations/host"].includes(path) && request.method === "POST") {
+    if (!env.HOST_MONITOR_TOKEN || !(await equal(token, env.HOST_MONITOR_TOKEN))) return json({ error: "Host publisher authentication failed" }, 401);
+    if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+    let value;
+    try { value = JSON.parse(await body(request, 256_000)); } catch { return json({ error: "Invalid host frame" }, 400); }
+    return stub(env.OPERATIONS, "operations").fetch("https://internal/" + (path.endsWith("/host") ? "host" : "hosts"), { method: "POST", body: JSON.stringify(value) });
+  }
+  if (path === "/ingest/operations/queue/state" && request.method === "GET") {
+    if (!env.QUEUE_MONITOR_TOKEN || !(await equal(token, env.QUEUE_MONITOR_TOKEN))) return json({ error: "Queue publisher authentication failed" }, 401);
+    if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+    return stub(env.OPERATIONS, "operations").fetch("https://internal/health");
+  }
+  if (path === "/ingest/operations/queue" && request.method === "POST") {
+    if (!env.QUEUE_MONITOR_TOKEN || !(await equal(token, env.QUEUE_MONITOR_TOKEN)))
+      return json({ error: "Queue publisher authentication failed" }, 401);
+    if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+    let value;
+    try { value = JSON.parse(await body(request, 256_000)); }
+    catch { return json({ error: "Invalid operations frame" }, 400); }
+    return stub(env.OPERATIONS, "operations").fetch("https://internal/queue", { method: "POST", body: JSON.stringify(value) });
+  }
   if (path === "/telemetry/lease" && request.method === "POST") {
     let claims;
     try {
@@ -557,6 +602,7 @@ export default {
       await Promise.all(batch.messages.slice(i, i + 4).map(consume));
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    if (env.OPERATIONS) ctx.waitUntil(call(env.OPERATIONS, "operations", "/tick"));
     // Publication has its own single-flight operation: slow reconciliation
     // must not prevent a fresh snapshot of concurrently arriving webhooks.
     ctx.waitUntil(call(env.CONTROL, "control", "/publish"));
