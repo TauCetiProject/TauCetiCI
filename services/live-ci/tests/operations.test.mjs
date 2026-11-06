@@ -343,6 +343,43 @@ test("a failed queue sibling retains its preparation while another underlying pu
   await r.drain();
 });
 
+test("completed preparation timings survive sampling gaps, restart, and the single-summary format", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const first = (await (await r.request("/health")).json()).queue_preparation;
+  r.operations.set("queue_preparation", first); // live-update predecessor representation
+  for (let sequence = 2; sequence <= 12; sequence++) {
+    r.advance(10000);
+    await r.send(r.next(sequence));
+    await r.flush();
+  }
+  const restarted = new Operations(r.ctx);
+  const health = await (
+    await restarted.fetch(new Request("https://internal/health"))
+  ).json();
+  assert.deepEqual(
+    health.queue_preparations.map((v) => v.source_sequence),
+    [5, 6, 7, 8, 9, 10, 11, 12],
+  );
+  assert.deepEqual(health.queue_preparation, health.queue_preparations.at(-1));
+  assert.ok(
+    health.queue_preparations.every(
+      (v) =>
+        v.scope === r.manifest().scope &&
+        v.ready_recorded_at >= v.graph_finished_at,
+    ),
+  );
+  globalThis.__operationsTestEnv.OPERATIONS_PUBLIC_REPOSITORIES = "[]";
+  await restarted.alarm();
+  await r.drain();
+  const withdrawn = await (
+    await restarted.fetch(new Request("https://internal/health"))
+  ).json();
+  assert.deepEqual(withdrawn.queue_preparations, []);
+  assert.equal(withdrawn.queue_preparation, null);
+});
+
 test("actual Python export is accepted and produces linked, paginated queue and PR views", async (t) => {
   const r = runtime(t);
   const result = await r.send(seed);
