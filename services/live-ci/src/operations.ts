@@ -86,7 +86,9 @@ export class Operations {
         (this.get("publication_retry") || 0) * 1000,
       ),
       old = await this.ctx.storage.getAlarm();
-    if (old === null || old <= Date.now() || old > next)
+    // A due alarm may be waiting for delivery. Incoming observations must
+    // preserve it: resetting an overdue deadline can starve publication.
+    if (old === null || old > next)
       await this.ctx.storage.setAlarm(next);
   }
   private source(id: string) {

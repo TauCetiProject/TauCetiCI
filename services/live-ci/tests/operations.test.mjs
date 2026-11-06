@@ -364,6 +364,11 @@ test("incoming heartbeats do not postpone an earlier publication alarm", async (
   r.advance(5000);
   await r.send(r.next());
   assert.equal(r.alarm(), first);
+  // Delivery can lag the deadline while other requests arrive. An expired
+  // deadline is still pending work, and must not be moved into the future.
+  r.advance(6000);
+  await r.send(r.next(3));
+  assert.equal(r.alarm(), first);
 });
 
 test("ingestion during an R2 write cannot publish mixed member and candidate generations", async (t) => {
