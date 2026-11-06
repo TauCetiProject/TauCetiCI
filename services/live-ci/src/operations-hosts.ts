@@ -66,7 +66,7 @@ export function hostFrame(value: any, registry: PublicHost[]) {
   for (const host of value.hosts) {
     object(
       host,
-      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated admission activity capacity_context",
+      "machine_id alias observed_at transport_at connected coverage source_revision controller_error ci_enabled workers_enabled ci_max_jobs worker_limit resources cpu_idle_fraction memory_pressure compiler slots workers slots_truncated workers_truncated admission activity capacity_context worker_memory worker_admission ci_cooldown",
     );
     if (
       !registry.some(
@@ -92,6 +92,20 @@ export function hostFrame(value: any, registry: PublicHost[]) {
       flag(host[key]);
     for (const key of ["ci_enabled", "workers_enabled", "memory_pressure"])
       flag(host[key], true);
+    if (host.worker_memory !== undefined) {
+      object(host.worker_memory, "working_set charged maximum high swap oom_kill stall_some stall_full");
+      for (const value of Object.values(host.worker_memory)) num(value);
+    }
+    if (host.worker_admission !== undefined) {
+      object(host.worker_admission, "state reason");
+      if (!["at_ceiling", "paused", "unknown"].includes(host.worker_admission.state) ||
+          !["at_ceiling", "memory_reserve", "zero_ceiling", "disabled_or_draining", "unknown"].includes(host.worker_admission.reason))
+        throw new Error("Invalid public worker admission reason");
+    }
+    if (host.ci_cooldown !== undefined && host.ci_cooldown !== null) {
+      object(host.ci_cooldown, "until");
+      stamp(host.ci_cooldown.until);
+    }
     if (host.capacity_context !== undefined) {
       const c = host.capacity_context;
       object(c, "observed_at scope coverage observer_error running_jobs");

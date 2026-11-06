@@ -702,6 +702,9 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     ci_enabled: false,
     workers_enabled: true,
     ci_max_jobs: 0,
+    worker_memory: {working_set:123,charged:456,maximum:1000,high:800,swap:0,oom_kill:2,stall_some:0.1,stall_full:null},
+    worker_admission: {state:"paused",reason:"memory_reserve"},
+    ci_cooldown: {until:new Date(Date.now()+30000).toISOString()},
     worker_limit: 2,
     capacity_context: {
       observed_at: new Date(Date.now() - 120000).toISOString(),
@@ -744,6 +747,9 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
     hosts: [host],
   };
   const bad = structuredClone(frame);
+  bad.hosts[0].worker_memory.cgroup = "/private/cgroup";
+  assert.equal((await r.request("/hosts", bad)).status, 400);
+  delete bad.hosts[0].worker_memory.cgroup;
   bad.hosts[0].environment = { TOKEN: "private" };
   assert.equal((await r.request("/hosts", bad)).status, 400);
   const privateAdmission = structuredClone(frame);
@@ -754,6 +760,8 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
   const hosts = r.object(r.manifest().domains.hosts);
   assert.equal(hosts.hosts[0].ci_enabled, false);
   assert.equal(hosts.hosts[0].connected, true);
+  assert.equal(hosts.hosts[0].worker_memory.oom_kill,2);
+  assert.equal(hosts.hosts[0].worker_admission.reason,"memory_reserve");
   assert.notEqual(hosts.hosts[0].observed_at, hosts.hosts[0].transport_at);
   assert.equal((await r.request("/hosts", frame)).status, 409);
   assert.equal(
@@ -1123,6 +1131,13 @@ test("canonical SHA and recorded token coverage accept only their public contrac
   const r = runtime(t),
     frame = structuredClone(seed);
   frame.metadata.canonical_sha = "a".repeat(40);
+  frame.metadata.dispatch_config = {repository:repo,revision:frame.metadata.canonical_sha,namespace_build_cap:20,pr_order:["github","chris","namespace"],staging_order:["chris","namespace","github"]};
+  const wrongRevision = structuredClone(frame);
+  wrongRevision.metadata.dispatch_config.revision = "b".repeat(40);
+  assert.equal((await r.request("/queue",wrongRevision)).status,400);
+  const privatePolicy = structuredClone(frame);
+  privatePolicy.metadata.dispatch_config.environment = {TOKEN:"PRIVATE"};
+  assert.equal((await r.request("/queue",privatePolicy)).status,400);
   const task = {
     id: "99",
     kind: "repair",
