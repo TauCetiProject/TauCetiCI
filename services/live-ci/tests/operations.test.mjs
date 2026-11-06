@@ -217,6 +217,132 @@ function split(frame, size = 3) {
   }));
 }
 
+test("independent queue children and PR lookups advance while a member upload is held", async (t) => {
+  const r = runtime(t),
+    archive = globalThis.__operationsTestEnv.ARCHIVE;
+  const original = archive.put.bind(archive),
+    seen = new Set();
+  let release,
+    held = false,
+    active = 0,
+    peak = 0;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  archive.put = async (key, value) => {
+    const schema = JSON.parse(value).schema;
+    seen.add(schema);
+    active++;
+    peak = Math.max(peak, active);
+    try {
+      if (!held && schema === "tauceti.operations.members/v1") {
+        held = true;
+        await gate;
+      }
+      return await original(key, value);
+    } finally {
+      active--;
+    }
+  };
+  try {
+    await r.send(seed);
+    await pumpUntil(
+      r,
+      () =>
+        held &&
+        seen.has("tauceti.operations.attempts/v1") &&
+        seen.has("tauceti.operations.events/v1") &&
+        seen.has("tauceti.operations.prs/v1"),
+    );
+    assert.ok(
+      ![...r.objects.values()].some(
+        (v) => JSON.parse(v).schema === "tauceti.operations.queue/v1",
+      ),
+      "a root cannot reference the held child",
+    );
+    assert.ok(
+      peak <= 4,
+      "independent graphs share the four underlying upload permits",
+    );
+    r.advance(123);
+  } finally {
+    release();
+  }
+  await r.drain();
+  await r.flush();
+  const queue = r.object(r.manifest().domains.queue);
+  assert.equal(queue.source_sequence, 1);
+  const timing = (await (await r.request("/health")).json()).queue_preparation;
+  assert.equal(timing.scope, r.manifest().scope);
+  assert.equal(timing.source_sequence, queue.source_sequence);
+  assert.equal(timing.observed_at, queue.observed_at);
+  assert.ok(
+    timing.started_at <= timing.capture_finished_at &&
+      timing.capture_finished_at <= timing.graph_finished_at &&
+      timing.graph_finished_at <= timing.ready_recorded_at,
+  );
+  assert.ok(
+    timing.object_requests >= timing.puts &&
+      timing.puts > 0 &&
+      timing.shared_hits > 0,
+  );
+  assert.ok(timing.put_ms > 0 && timing.bytes_written > 0);
+  for (const value of r.objects.values())
+    for (const ref of value.matchAll(
+      /\/v1\/operations\/objects\/[a-f0-9]{64}\/[a-f0-9]{64}\.json/g,
+    ))
+      assert.ok(r.objects.has("public" + ref[0]));
+  globalThis.__operationsTestEnv.OPERATIONS_PUBLIC_REPOSITORIES = "[]";
+  await r.fire();
+  await r.drain();
+  assert.equal(
+    (await (await r.request("/health")).json()).queue_preparation,
+    null,
+    "withdrawn source timing cannot masquerade as current-scope work",
+  );
+});
+
+test("a failed queue sibling retains its preparation while another underlying put is held", async (t) => {
+  const r = runtime(t),
+    archive = globalThis.__operationsTestEnv.ARCHIVE;
+  const original = archive.put.bind(archive);
+  let release,
+    held = false,
+    failed = false;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  archive.put = async (key, value) => {
+    const schema = JSON.parse(value).schema;
+    if (!held && schema === "tauceti.operations.members/v1") {
+      held = true;
+      await gate;
+    }
+    if (!failed && schema === "tauceti.operations.prs/v1") {
+      failed = true;
+      throw Error("storage failure");
+    }
+    return original(key, value);
+  };
+  try {
+    await r.send(seed);
+    await pumpUntil(r, () => held && failed);
+    const originalPreparation = r.operations.preparing.get("queue");
+    assert.ok(originalPreparation);
+    r.advance(15000);
+    await r.send(r.next(2));
+    await r.fire();
+    assert.equal(
+      r.operations.preparing.get("queue"),
+      originalPreparation,
+      "failure cannot release ownership before the held sibling settles",
+    );
+  } finally {
+    release();
+  }
+  await r.drain();
+});
+
 test("actual Python export is accepted and produces linked, paginated queue and PR views", async (t) => {
   const r = runtime(t);
   const result = await r.send(seed);
