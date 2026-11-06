@@ -13,6 +13,9 @@ import {
 } from "./operations-model";
 
 const PREFIX = "/v1/operations/objects/";
+const BUILD_CLASSES = ["pr_build", "staging_build", "other_build"];
+const BUILD_CLASS_SQL =
+  "CASE WHEN json_extract(data,'$.job_class') IN ('pr_build','staging_build','other_build') THEN 1 ELSE 0 END";
 type Projection = {
   scope: string;
   lane: string;
@@ -85,6 +88,7 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_hosts(machine TEXT PRIMARY KEY,source TEXT,epoch INTEGER,sequence INTEGER,received INTEGER,data TEXT);
       CREATE TABLE IF NOT EXISTS ops_job_facts(partition TEXT,id TEXT,repository TEXT,active INTEGER,observed REAL,data TEXT,PRIMARY KEY(partition,id));
       CREATE INDEX IF NOT EXISTS ops_job_facts_current ON ops_job_facts(active DESC,observed DESC,id ASC);
+      CREATE INDEX IF NOT EXISTS ops_job_facts_completed_class ON ops_job_facts(active,(${BUILD_CLASS_SQL}),observed DESC,id ASC);
       CREATE INDEX IF NOT EXISTS ops_job_facts_repo ON ops_job_facts(repository,active,observed);
       CREATE TABLE IF NOT EXISTS ops_failures(kind TEXT,id TEXT,failures INTEGER,due INTEGER,error TEXT,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS ops_runner_hosts(runner TEXT PRIMARY KEY,machine TEXT,instance TEXT,slot INTEGER,seen INTEGER);
@@ -1401,15 +1405,23 @@ export class Operations {
       .toArray()
       .map((r) => JSON.parse(r.data));
     const publicRepositories = projection.repositories;
-    const rawJobs = publicRepositories.length
-      ? this.sql
-          .exec<{ data: string }>(
-            `SELECT data FROM ops_job_facts WHERE repository IN (${publicRepositories.map(() => "?").join(",")}) ORDER BY active DESC,observed DESC,id ASC LIMIT 2201`,
-            ...publicRepositories,
-          )
-          .toArray()
-          .map((r) => JSON.parse(r.data))
-      : [];
+    // Select each bounded cohort using its index before merging. A burst of
+    // skipped control jobs cannot consume the entire completed-build window.
+    const cohort = (condition: string, limit: number) =>
+      publicRepositories.length
+        ? this.sql
+            .exec<{ data: string }>(
+              `SELECT data FROM ops_job_facts WHERE repository IN (${publicRepositories.map(() => "?").join(",")}) AND ${condition} ORDER BY observed DESC,id ASC LIMIT ${limit}`,
+              ...publicRepositories,
+            )
+            .toArray()
+            .map((r) => JSON.parse(r.data))
+        : [];
+    const rawJobs = [
+      ...cohort("active=1", 2001),
+      ...cohort(`active=0 AND (${BUILD_CLASS_SQL})=1`, 151),
+      ...cohort(`active=0 AND (${BUILD_CLASS_SQL})=0`, 51),
+    ];
     const hostsByRunner = new Map(runnerHosts.map((h) => [h.runner, h]));
     const hostsById = new Map(registry.map((h) => [h.machine_id, h]));
     const attemptsByRun = new Map(
@@ -1486,7 +1498,18 @@ export class Operations {
           (b.observed_at || "").localeCompare(a.observed_at || ""),
       );
     const active = jobs.filter((j) => j.active),
-      terminal = jobs.filter((j) => !j.active).slice(0, 200);
+      completedBuilds = jobs.filter(
+        (j) => !j.active && BUILD_CLASSES.includes(j.job_class),
+      ),
+      completedOther = jobs.filter(
+        (j) => !j.active && !BUILD_CLASSES.includes(j.job_class),
+      ),
+      terminal = [
+        ...completedBuilds.slice(0, 150),
+        ...completedOther.slice(0, 50),
+      ].sort((a, b) =>
+        (b.observed_at || "").localeCompare(a.observed_at || ""),
+      );
     const context = this.get("jobs_context");
     const received =
       facts
@@ -1517,9 +1540,25 @@ export class Operations {
       scope: { repositories: projection.repositories },
       truncated:
         partitions.length > 200 ||
-        rawJobs.length > 2200 ||
+        completedBuilds.length > 150 ||
+        completedOther.length > 50 ||
         facts.some((f) => f.truncated) ||
         active.length > 2000,
+      active_truncated: active.length > 2000,
+      source_truncated:
+        partitions.length > 200 || facts.some((f) => f.truncated),
+      recent_completed: {
+        builds: {
+          limit: 150,
+          returned: Math.min(150, completedBuilds.length),
+          truncated: completedBuilds.length > 150,
+        },
+        other: {
+          limit: 50,
+          returned: Math.min(50, completedOther.length),
+          truncated: completedOther.length > 50,
+        },
+      },
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
         last_event_at: observed,
@@ -1632,7 +1671,7 @@ export class Operations {
     const source = this.source(this.get("queue_source") || "");
     return {
       queue: source?.snapshot ? "3/" + source.snapshot : "unavailable",
-      jobs: "3/" + (this.get("jobs_revision") || 0),
+      jobs: "4/" + (this.get("jobs_revision") || 0),
       hosts: canonical({
         bridge: this.get("hosts")?.source || null,
         pushed: this.sql
@@ -2022,7 +2061,10 @@ export class Operations {
           .exec<{
             logical: string;
             allocated: number;
-          }>("SELECT logical,allocated FROM ops_object_keys WHERE hash=?", row.hash)
+          }>(
+            "SELECT logical,allocated FROM ops_object_keys WHERE hash=?",
+            row.hash,
+          )
           .toArray()[0];
         if (
           (receipt ? receipt.referenced : allocation?.allocated) !==
