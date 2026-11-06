@@ -2465,3 +2465,166 @@ test("abandoned pending allocations and ambiguous orphan puts follow bounded ret
     0,
   );
 });
+
+test("completed build history survives a skipped-control burst with honest bounded coverage", async (t) => {
+  const r = runtime(t),
+    partition = repo + "/2026-11-06";
+  const job = (id, kind, seconds, conclusion) => ({
+    repository: repo,
+    id: String(id),
+    run_id: String(id),
+    run_attempt: 1,
+    active: false,
+    status: "completed",
+    conclusion,
+    job_class: kind,
+    observed_at: new Date(Date.now() - seconds * 1000).toISOString(),
+    completed_at: new Date(Date.now() - seconds * 1000).toISOString(),
+  });
+  const jobs = [
+    job(1, "pr_build", 600, "success"),
+    ...Array.from({ length: 250 }, (_, i) =>
+      job(1000 + i, "control", i, "skipped"),
+    ),
+  ];
+  globalThis.__operationsTestEnv.FACTS = {
+    idFromName: (id) => id,
+    get: () => ({
+      fetch: async () =>
+        Response.json({
+          schema: "tauceti.operations.partition/v1",
+          partition,
+          revision: 1,
+          received_at: new Date(Date.now()).toISOString(),
+          truncated: false,
+          jobs,
+          pending_workflows: [],
+        }),
+    }),
+  };
+  await r.request("/partition", { partition, revision: 1 });
+  await r.flush();
+  const root = r.object(r.manifest().domains.jobs),
+    published = root.job_pages.flatMap((ref) => r.object(ref).records);
+  assert.equal(published.filter((j) => j.job_class === "pr_build").length, 1);
+  assert.equal(root.truncated, true, "terminal overflow must be declared");
+});
+
+test("active saturation and thousands of controls keep bounded build history and repository privacy", async (t) => {
+  const r = runtime(t),
+    partition = repo + "/2026-11-06";
+  const job = (id, active, kind, seconds, repository = repo) => ({
+    repository,
+    id: String(id),
+    run_id: String(id),
+    run_attempt: 1,
+    active,
+    status: active ? "in_progress" : "completed",
+    assigned: active,
+    conclusion: active ? null : "success",
+    job_class: kind,
+    observed_at: new Date(Date.now() - seconds * 1000).toISOString(),
+  });
+  const jobs = [
+    ...Array.from({ length: 2001 }, (_, i) => job(i, true, "pr_build", i)),
+    ...Array.from({ length: 3000 }, (_, i) =>
+      job(10000 + i, false, "control", i),
+    ),
+    job(5000, false, "pr_build", 4000),
+    job(99999, true, "pr_build", 0, "PrivateOrg/Hidden"),
+    job(99998, false, "pr_build", 0, "PrivateOrg/Hidden"),
+  ];
+  globalThis.__operationsTestEnv.FACTS = {
+    idFromName: (id) => id,
+    get: () => ({
+      fetch: async () =>
+        Response.json({
+          schema: "tauceti.operations.partition/v1",
+          partition,
+          revision: 1,
+          received_at: new Date(Date.now()).toISOString(),
+          truncated: false,
+          jobs,
+          pending_workflows: [],
+        }),
+    }),
+  };
+  await r.request("/partition", { partition, revision: 1 });
+  await r.flush();
+  const root = r.object(r.manifest().domains.jobs),
+    published = root.job_pages.flatMap((ref) => r.object(ref).records);
+  assert.equal(root.counts.active, 2001);
+  assert.equal(published.filter((j) => j.active).length, 2000);
+  assert.ok(published.some((j) => j.id === "5000"));
+  assert.ok(published.every((j) => j.repository === repo));
+  assert.ok(published.length <= 2200);
+  assert.ok(root.job_pages.length <= 22);
+  assert.deepEqual(root.recent_completed, {
+    builds: { limit: 150, returned: 1, truncated: false },
+    other: { limit: 50, returned: 50, truncated: true },
+  });
+  assert.equal(root.truncated, true);
+  assert.equal(root.active_truncated, true);
+  assert.equal(root.source_truncated, false);
+});
+
+test("completed cohort exact boundaries and legacy classes preserve truthful truncation", async (t) => {
+  const r = runtime(t),
+    partition = repo + "/2026-11-06";
+  let revision = 1;
+  const job = (id, kind) => ({
+    repository: repo,
+    id: String(id),
+    run_id: String(id),
+    run_attempt: 1,
+    active: false,
+    status: "completed",
+    conclusion: "success",
+    job_class: kind,
+    observed_at: new Date(Date.now() - id * 1000).toISOString(),
+  });
+  const jobs = [
+    ...Array.from({ length: 150 }, (_, i) => job(i, "staging_build")),
+    ...Array.from({ length: 50 }, (_, i) =>
+      job(1000 + i, i < 20 ? null : i < 40 ? undefined : "legacy_unknown"),
+    ),
+  ];
+  globalThis.__operationsTestEnv.FACTS = {
+    idFromName: (id) => id,
+    get: () => ({
+      fetch: async () =>
+        Response.json({
+          schema: "tauceti.operations.partition/v1",
+          partition,
+          revision,
+          received_at: new Date(Date.now()).toISOString(),
+          truncated: false,
+          jobs,
+          pending_workflows: [],
+        }),
+    }),
+  };
+  await r.request("/partition", { partition, revision });
+  await r.flush();
+  let root = r.object(r.manifest().domains.jobs);
+  assert.equal(root.truncated, false);
+  assert.deepEqual(root.recent_completed, {
+    builds: { limit: 150, returned: 150, truncated: false },
+    other: { limit: 50, returned: 50, truncated: false },
+  });
+  jobs.push(job(5000, "pr_build"), job(5001, "control"));
+  revision++;
+  r.advance(15000);
+  await r.request("/partition", { partition, revision });
+  await r.flush();
+  root = r.object(r.manifest().domains.jobs);
+  assert.equal(root.truncated, true);
+  assert.deepEqual(root.recent_completed, {
+    builds: { limit: 150, returned: 150, truncated: true },
+    other: { limit: 50, returned: 50, truncated: true },
+  });
+  assert.equal(
+    root.job_pages.flatMap((ref) => r.object(ref).records).length,
+    200,
+  );
+});
