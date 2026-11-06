@@ -16,11 +16,32 @@ const PREFIX = "/v1/operations/objects/";
 const BUILD_CLASSES = ["pr_build", "staging_build", "other_build"];
 const BUILD_CLASS_SQL =
   "CASE WHEN json_extract(data,'$.job_class') IN ('pr_build','staging_build','other_build') THEN 1 ELSE 0 END";
+type QueuePreparation = {
+  scope: string;
+  version: string;
+  source_epoch: number;
+  source_sequence: number;
+  observed_at: string;
+  started_at: number;
+  capture_finished_at: number;
+  graph_finished_at: number | null;
+  ready_recorded_at: number | null;
+  object_requests: number;
+  cache_hits: number;
+  shared_hits: number;
+  put_attempts: number;
+  puts: number;
+  bytes_written: number;
+  permit_wait_ms: number;
+  put_ms: number;
+  max_put_ms: number;
+};
 type Projection = {
   scope: string;
   lane: string;
   repositories: string[];
   hosts: string;
+  timing?: QueuePreparation;
 };
 type Ready = { scope: string; version: string; value: any; revision: number };
 const DOMAINS = ["jobs", "hosts", "host_history", "queue", "history"] as const;
@@ -661,14 +682,27 @@ export class Operations {
     if (failure?.status === "rejected") throw failure.reason;
     return result;
   }
+  /** Await every bounded sibling even if one fails. A held child continues to
+   * own this preparation and its permit until storage actually settles. */
+  private async settled<T>(promises: Promise<T>[]): Promise<T[]> {
+    const results = await Promise.allSettled(promises);
+    const failure = results.find((r) => r.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    return results.map((r) => (r as PromiseFulfilledResult<T>).value);
+  }
   private async object(
     value: any,
     projection: Projection,
   ): Promise<{ url: string }> {
+    const timing = projection.timing;
+    if (timing) timing.object_requests++;
     const data = JSON.stringify(value),
       logical = projection.scope + "/" + (await digest(data));
     const pending = this.objectWrites.get(logical);
-    if (pending) return pending;
+    if (pending) {
+      if (timing) timing.shared_hits++;
+      return pending;
+    }
     const work = (async () => {
       let allocation = this.sql
         .exec<{
@@ -689,6 +723,7 @@ export class Operations {
           logical,
           now() - 3600,
         );
+        if (timing) timing.cache_hits++;
         return { url: PREFIX + logical + ".json" };
       }
       if (!allocation) {
@@ -715,11 +750,34 @@ export class Operations {
         !this.sql.exec("SELECT 1 FROM ops_objects WHERE hash=?", hash).toArray()
           .length
       ) {
-        await this.upload(projection.lane, () =>
-          this.env.ARCHIVE.put("public" + PREFIX + hash + ".json", data, {
-            httpMetadata: { contentType: "application/json" },
-          }),
-        );
+        const queuedAt = Date.now();
+        await this.upload(projection.lane, async () => {
+          const startedAt = Date.now();
+          if (timing) {
+            timing.permit_wait_ms += startedAt - queuedAt;
+            timing.put_attempts++;
+          }
+          try {
+            const result = await this.env.ARCHIVE.put(
+              "public" + PREFIX + hash + ".json",
+              data,
+              {
+                httpMetadata: { contentType: "application/json" },
+              },
+            );
+            if (timing) {
+              timing.puts++;
+              timing.bytes_written += new TextEncoder().encode(data).length;
+            }
+            return result;
+          } finally {
+            if (timing) {
+              const elapsed = Date.now() - startedAt;
+              timing.put_ms += elapsed;
+              timing.max_put_ms = Math.max(timing.max_put_ms, elapsed);
+            }
+          }
+        });
         this.ctx.storage.transactionSync(() => {
           this.sql.exec(
             "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
@@ -735,13 +793,15 @@ export class Operations {
               match[1],
             );
         });
-      } else
+      } else {
+        if (timing) timing.cache_hits++;
         this.sql.exec(
           "UPDATE ops_objects SET referenced=? WHERE hash=? AND referenced<?",
           now(),
           hash,
           now() - 3600,
         );
+      }
       return { url: PREFIX + hash + ".json" };
     })();
     this.objectWrites.set(logical, work);
@@ -852,24 +912,27 @@ export class Operations {
       cached.set(kind + ":" + id, data);
       updates.push({ kind, id, data });
     };
-    await this.parallel(
+    const batchWork = this.parallel(
       capture.changed,
       async ({ batch, members, attempts, tasks, events }) => {
         const activeMembers = members.filter(
           (m) => !m.removed && m.batch_version === batch.version,
         );
+        const [memberPages, attemptPages, taskPages, eventPages] =
+          await this.settled([
+            pages("tauceti.operations.members/v1", members),
+            pages("tauceti.operations.attempts/v1", attempts, 20),
+            pages("tauceti.operations.tasks/v1", tasks),
+            pages("tauceti.operations.events/v1", events),
+          ]);
         const detail = await object({
           schema: "tauceti.operations.batch/v1",
           source_id: source.id,
           batch,
-          member_pages: await pages("tauceti.operations.members/v1", members),
-          attempt_pages: await pages(
-            "tauceti.operations.attempts/v1",
-            attempts,
-            20,
-          ),
-          task_pages: await pages("tauceti.operations.tasks/v1", tasks),
-          event_pages: await pages("tauceti.operations.events/v1", events),
+          member_pages: memberPages,
+          attempt_pages: attemptPages,
+          task_pages: taskPages,
+          event_pages: eventPages,
           member_details_complete: activeMembers.length === batch.size,
           member_count: activeMembers.length,
           removed_count: members.length - activeMembers.length,
@@ -886,31 +949,35 @@ export class Operations {
         });
       },
     );
-    await this.parallel(capture.prs, async ({ bucket, inputs, members }) => {
-      const prs: Record<string, any> = {};
-      for (const [kind, records] of [
-        ["inputs", inputs],
-        ["members", members],
-      ] as const)
-        for (const item of records) {
-          const key = `${item.repository}#${item.pr}`;
-          const pr = (prs[key] ||= {
-            repository: item.repository,
-            pr: item.pr,
-            inputs: [],
-            members: [],
-          });
-          pr[kind].push(item);
-        }
-      const waiting = inputs.filter((i) =>
-        ["waiting", "reserved"].includes(i.state),
-      );
-      save("pr", String(bucket), {
-        ref: await object({ schema: "tauceti.operations.prs/v1", prs }),
-        waiting: waiting.length,
-        waiting_records: waiting,
-      });
-    });
+    const prWork = this.parallel(
+      capture.prs,
+      async ({ bucket, inputs, members }) => {
+        const prs: Record<string, any> = {};
+        for (const [kind, records] of [
+          ["inputs", inputs],
+          ["members", members],
+        ] as const)
+          for (const item of records) {
+            const key = `${item.repository}#${item.pr}`;
+            const pr = (prs[key] ||= {
+              repository: item.repository,
+              pr: item.pr,
+              inputs: [],
+              members: [],
+            });
+            pr[kind].push(item);
+          }
+        const waiting = inputs.filter((i) =>
+          ["waiting", "reserved"].includes(i.state),
+        );
+        save("pr", String(bucket), {
+          ref: await object({ schema: "tauceti.operations.prs/v1", prs }),
+          waiting: waiting.length,
+          waiting_records: waiting,
+        });
+      },
+    );
+    await this.settled([batchWork, prWork]);
     const shards: any[][] = Array.from({ length: 64 }, () => []);
     let memberCount = 0;
     for (const batch of batches) {
@@ -918,7 +985,7 @@ export class Operations {
       memberCount += view.member_count;
       shards[Number(BigInt(batch.id) % 64n)].push(view);
     }
-    const batchIndex = await this.parallel(shards, (shard) =>
+    const batchIndexWork = this.parallel(shards, (shard) =>
       object({
         schema: "tauceti.operations.batches/v1",
         batches: shard,
@@ -946,6 +1013,10 @@ export class Operations {
           (a.approved_at || "").localeCompare(b.approved_at || "") ||
           a.id.localeCompare(b.id),
       );
+    const [batchIndex, waitingPages] = await this.settled([
+      batchIndexWork,
+      pages("tauceti.operations.inputs/v1", waiting),
+    ]);
     const ref = await object({
       ...meta,
       schema: QUEUE_SCHEMA,
@@ -973,7 +1044,7 @@ export class Operations {
         { length: 64 },
         (_, i) => cached.get("pr:" + i).ref,
       ),
-      waiting_pages: await pages("tauceti.operations.inputs/v1", waiting),
+      waiting_pages: waitingPages,
     });
     return { ref, updates };
   }
@@ -1816,6 +1887,7 @@ export class Operations {
     this.ctx.waitUntil(entry.promise);
   }
   private async prepare(kind: Domain, projection: Projection) {
+    const startedAt = Date.now();
     const version = this.targets()[kind],
       revision = this.get("revision") || 0;
     this.set("domain_target/" + kind, {
@@ -1829,6 +1901,27 @@ export class Operations {
         kind === "queue" && source?.metadata && projection.repositories.length
           ? this.captureQueue(source)
           : null;
+    if (capture)
+      projection.timing = {
+        scope: projection.scope,
+        version,
+        source_epoch: capture.source.committed_epoch,
+        source_sequence: capture.source.committed_sequence,
+        observed_at: JSON.parse(capture.source.metadata!).observed_at,
+        started_at: startedAt,
+        capture_finished_at: Date.now(),
+        graph_finished_at: null,
+        ready_recorded_at: null,
+        object_requests: 0,
+        cache_hits: 0,
+        shared_hits: 0,
+        put_attempts: 0,
+        puts: 0,
+        bytes_written: 0,
+        permit_wait_ms: 0,
+        put_ms: 0,
+        max_put_ms: 0,
+      };
     try {
       let value: any,
         updates: { kind: string; id: string; data: any }[] = [];
@@ -1843,6 +1936,7 @@ export class Operations {
         else {
           const result = await this.queueView(capture, projection),
             metadata = JSON.parse(capture.source.metadata!);
+          projection.timing!.graph_finished_at = Date.now();
           updates = result.updates;
           value = {
             ...result.ref,
@@ -1918,6 +2012,10 @@ export class Operations {
           revision,
         });
         this.set("domain_error/" + kind, null);
+        if (projection.timing) {
+          projection.timing.ready_recorded_at = Date.now();
+          this.set("queue_preparation", projection.timing);
+        }
       });
     } catch {
       if (!(await this.eligible(projection))) return;
@@ -2427,6 +2525,10 @@ export class Operations {
             },
           ]),
         ),
+        queue_preparation:
+          this.get("queue_preparation")?.scope === this.get("public_scope")
+            ? this.get("queue_preparation")
+            : null,
         publication_started_at: this.publicationStarted || null,
         publication_pending: [...this.publicationPending],
         publication_elapsed_ms: this.get("publication_elapsed_ms") ?? null,
