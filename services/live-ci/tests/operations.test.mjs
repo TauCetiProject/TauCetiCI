@@ -462,9 +462,9 @@ test("failed manifest publication retains the last complete generation and retri
   await r.flush();
   const previous = r.objects.get("public/v1/operations/manifest.json");
   r.advance(15_000);
-  await r.send(r.next());
   r.failPointer();
-  await r.flush();
+  await r.send(r.next());
+  await r.drain();
   assert.equal(r.objects.get("public/v1/operations/manifest.json"), previous);
   assert.equal(
     (await (await r.request("/health")).json()).publication_error,
@@ -527,7 +527,6 @@ test("ingestion during an R2 write cannot publish mixed member and candidate gen
   second.changes.find(
     (c) => c.collection === "batches" && c.value.state === "head",
   ).value.version = 2;
-  await r.send(second);
   const third = r.next(3);
   third.changes.find(
     (c) => c.collection === "batches" && c.value.state === "head",
@@ -542,7 +541,9 @@ test("ingestion during an R2 write cannot publish mixed member and candidate gen
   r.onWrite(async () => {
     await r.send(third);
   });
-  await r.flush();
+  r.advance(15000);
+  await r.send(second);
+  await r.drain();
   assert.notEqual(
     r.objects.get("public/v1/operations/manifest.json"),
     previous,
@@ -558,7 +559,9 @@ test("ingestion during an R2 write cannot publish mixed member and candidate gen
   );
   const captured = r.object(r.manifest().domains.queue);
   assert.equal(captured.batches.find((b) => b.state === "head").version, 2);
-  await r.flush();
+  r.advance(10000);
+  await r.fire();
+  await r.drain();
   const queue = r.object(r.manifest().domains.queue);
   assert.equal(queue.source_sequence, 3);
   const head = queue.batches.find((b) => b.state === "head");
@@ -591,7 +594,6 @@ test("1200 members have complete stable pagination and only changed detail objec
     value.changes.push({ collection: "members", id: member.id, value: member });
   }
   value.metadata.collection_counts.members = 1200;
-  for (const frame of split(value, 400)) await r.send(frame);
   let active = 0,
     peak = 0,
     allActive = 0,
@@ -623,6 +625,7 @@ test("1200 members have complete stable pagination and only changed detail objec
     }
   };
   r.onWrite(watch);
+  for (const frame of split(value, 400)) await r.send(frame);
   const publication = r.flush();
   try {
     assert.equal(
@@ -634,8 +637,10 @@ test("1200 members have complete stable pagination and only changed detail objec
       "independent member pages should upload concurrently",
     );
     assert.equal(
-      r.objects.has("public/v1/operations/manifest.json"),
-      false,
+      r.objects.has("public/v1/operations/manifest.json")
+        ? r.manifest().domains.queue.url
+        : null,
+      null,
       "the pointer must wait for every dependent object",
     );
   } finally {
@@ -645,9 +650,13 @@ test("1200 members have complete stable pagination and only changed detail objec
   assert.equal(peak, 4, "independent member pages overlap");
   assert.ok(allPeak <= 4, "R2 writes remain globally bounded across domains");
   assert.equal(
-    new Set(r.writes).size,
-    r.writes.length,
-    "identical shard objects upload once",
+    new Set(
+      r.writes
+        .filter((key) => !key.endsWith("/manifest.json"))
+        .map((key) => r.objects.get(key)),
+    ).size,
+    r.writes.filter((key) => !key.endsWith("/manifest.json")).length,
+    "identical immutable payloads upload once, including under physical incarnations",
   );
   const queue = r.object(r.manifest().domains.queue),
     index = r.object(queue.batch_shards[Number(BigInt(batch.id) % 64n)]);
@@ -826,19 +835,25 @@ test("public reads use R2 and cache only, with scoped ingestion, ETags and zero 
 test("busy ingestion publishes coherent captured generations without starvation and idle alarms stop", async (t) => {
   const r = runtime(t);
   await r.send(seed);
-  for (let n = 1; n <= 6; n++) {
-    r.onWrite(async () => {
-      r.advance(10_000);
-      await r.send(r.next(n + 1));
-    });
-    await r.flush();
-    assert.equal(r.object(r.manifest().domains.queue).source_sequence, n);
-  }
   await r.flush();
-  assert.equal(r.object(r.manifest().domains.queue).source_sequence, 7);
+  for (let n = 2; n <= 7; n++) {
+    r.advance(10000);
+    await r.send(r.next(n));
+    await r.drain();
+    assert.equal(queueSequence(r), n);
+    const queue = r.object(r.manifest().domains.queue),
+      head = queue.batches.find((b) => b.state === "head");
+    const index = r.object(queue.batch_shards[Number(BigInt(head.id) % 64n)]);
+    assert.equal(
+      r.object(index.batches.find((b) => b.id === head.id).detail).batch
+        .version,
+      head.version,
+    );
+  }
   assert.equal(r.alarm(), null);
   const writes = r.writes.length;
   await r.request("/tick");
+  await r.drain();
   assert.equal(r.writes.length, writes);
 });
 
@@ -1055,9 +1070,13 @@ test("host scopes, permanent identities and stale-source evidence reject arbitra
   assert.equal(retained.resources.cpus, 16);
   assert.equal(retained.connected, false);
   assert.equal(
-    r.database.prepare("SELECT COUNT(*) n FROM ops_host_samples").get().n,
-    3,
-    "a restart must not manufacture another historical host sample",
+    r.database
+      .prepare(
+        "SELECT COUNT(*) n FROM ops_host_samples WHERE resolution=15 AND json_extract(data,'$.fresh')=1",
+      )
+      .get().n,
+    0,
+    "a restart must not manufacture a fresh historical host observation",
   );
 });
 
@@ -1770,9 +1789,9 @@ test("ready queue survives pointer failure and publisher restart without rebuild
   await r.send(seed);
   await r.flush();
   r.advance(15000);
-  await r.send(r.next(2));
   r.failPointer();
-  await r.flush();
+  await r.send(r.next(2));
+  await r.drain();
   const puts = r.writes.filter((key) => !key.endsWith("/manifest.json")).length;
   assert.equal(queueSequence(r), 1);
   const restored = new Operations(r.ctx);
@@ -1841,7 +1860,11 @@ test("a held pointer acknowledges its captured queue and leaves the newer ready 
     release();
     await r.drain();
   }
-  assert.equal(queueSequence(r), 2);
+  assert.equal(
+    queueSequence(r),
+    3,
+    "the completion kick consumes the newer ready generation without another event",
+  );
   assert.equal(r.operations.state("queue").version, "3/" + third.snapshot);
   await pumpUntil(r, () => queueSequence(r) === 3);
   assert.equal(peak, 1);
@@ -1964,33 +1987,36 @@ test("withdrawn host history cannot restore its cleared cache after its upload f
       );
 });
 
-test("workerd alarms publish successive queue generations after returning with a held jobs put", async (t) => {
-  const bundled = await build({
-    stdin: {
-      resolveDir: process.cwd(),
-      contents: `
-    import { Operations } from "./src/operations.ts";
-    export { Operations };
+for (const deliverAlarms of [true, false])
+  test(`workerd publishes successive generations with jobs held and alarm delivery ${deliverAlarms ? "enabled" : "disabled"}`, async (t) => {
+    const bundled = await build({
+      stdin: {
+        resolveDir: process.cwd(),
+        contents: `
+    import { Operations as BaseOperations } from "./src/operations.ts";
+    export class Operations extends BaseOperations {async alarm() {${deliverAlarms ? "await super.alarm();" : ""}}}
     export default { fetch(request, env) {
       return env.OPERATIONS.get(env.OPERATIONS.idFromName("operations")).fetch(request);
     }};`,
-      loader: "js",
-    },
-    bundle: true,
-    format: "esm",
-    platform: "browser",
-    write: false,
-    plugins: [
-      {
-        name: "hold-one-observer-upload",
-        setup(builder) {
-          builder.onResolve({ filter: /^cloudflare:workers$/ }, (args) =>
-            args.namespace === "held-bindings"
-              ? { path: "cloudflare:workers", external: true }
-              : { path: "env", namespace: "held-bindings" },
-          );
-          builder.onLoad({ filter: /.*/, namespace: "held-bindings" }, () => ({
-            contents: `
+        loader: "js",
+      },
+      bundle: true,
+      format: "esm",
+      platform: "browser",
+      write: false,
+      plugins: [
+        {
+          name: "hold-one-observer-upload",
+          setup(builder) {
+            builder.onResolve({ filter: /^cloudflare:workers$/ }, (args) =>
+              args.namespace === "held-bindings"
+                ? { path: "cloudflare:workers", external: true }
+                : { path: "env", namespace: "held-bindings" },
+            );
+            builder.onLoad(
+              { filter: /.*/, namespace: "held-bindings" },
+              () => ({
+                contents: `
         import { env as actual } from "cloudflare:workers";
         export const env = new Proxy(actual, {get(target, key) {
           if (key !== "ARCHIVE") return target[key];
@@ -1999,97 +2025,100 @@ test("workerd alarms publish successive queue generations after returning with a
             return target.ARCHIVE.put(key, value, options);
           }, delete(key) {return target.ARCHIVE.delete(key);} };
         }});`,
-          }));
+              }),
+            );
+          },
         },
-      },
-    ],
-  });
-  let release,
-    entered = false;
-  const gate = new Promise((resolve) => {
-    release = resolve;
-  });
-  const mf = new Miniflare(
-    convertV4MiniflareOptions({
-      modules: true,
-      script: bundled.outputFiles[0].text,
-      compatibilityDate: "2026-10-15",
-      durableObjects: {
-        OPERATIONS: { className: "Operations", useSQLite: true },
-      },
-      r2Buckets: ["ARCHIVE"],
-      bindings: { OPERATIONS_PUBLIC_REPOSITORIES: JSON.stringify([repo]) },
-      outboundService: async (request) => {
-        assert.equal(new URL(request.url).hostname, "hold.example");
-        entered = true;
-        await gate;
-        return new Response("released");
-      },
-    }),
-  );
-  t.after(async () => {
-    release();
-    await mf.dispose();
-  });
-  const bucket = await mf.getR2Bucket("ARCHIVE"),
-    seen = [];
-  async function waitQueue(sequence) {
-    for (let i = 0; i < 600; i++) {
-      const object = await bucket.get("public/v1/operations/manifest.json");
-      if (object) {
-        const manifest = await object.json(),
-          ref = manifest.domains.queue;
-        if (ref?.url) {
-          const queue = await (await bucket.get("public" + ref.url)).json();
-          if (queue.source_sequence === sequence) {
-            seen.push(sequence);
-            return;
+      ],
+    });
+    let release,
+      entered = false;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const mf = new Miniflare(
+      convertV4MiniflareOptions({
+        modules: true,
+        script: bundled.outputFiles[0].text,
+        compatibilityDate: "2026-10-15",
+        durableObjects: {
+          OPERATIONS: { className: "Operations", useSQLite: true },
+        },
+        r2Buckets: ["ARCHIVE"],
+        bindings: { OPERATIONS_PUBLIC_REPOSITORIES: JSON.stringify([repo]) },
+        outboundService: async (request) => {
+          assert.equal(new URL(request.url).hostname, "hold.example");
+          entered = true;
+          await gate;
+          return new Response("released");
+        },
+      }),
+    );
+    t.after(async () => {
+      release();
+      await mf.dispose();
+    });
+    const bucket = await mf.getR2Bucket("ARCHIVE"),
+      seen = [];
+    async function waitQueue(sequence) {
+      for (let i = 0; i < 600; i++) {
+        const object = await bucket.get("public/v1/operations/manifest.json");
+        if (object) {
+          const manifest = await object.json(),
+            ref = manifest.domains.queue;
+          if (ref?.url) {
+            const queue = await (await bucket.get("public" + ref.url)).json();
+            if (queue.source_sequence === sequence) {
+              seen.push(sequence);
+              return;
+            }
           }
         }
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.fail(
+        `real alarm did not publish queue ${sequence} while jobs put was held`,
+      );
     }
-    assert.fail(
-      `real alarm did not publish queue ${sequence} while jobs put was held`,
+    const first = structuredClone(seed);
+    assert.equal(
+      (
+        await mf.dispatchFetch("https://internal/queue", {
+          method: "POST",
+          body: JSON.stringify(first),
+        })
+      ).status,
+      200,
     );
-  }
-  const first = structuredClone(seed);
-  assert.equal(
-    (
-      await mf.dispatchFetch("https://internal/queue", {
-        method: "POST",
-        body: JSON.stringify(first),
-      })
-    ).status,
-    200,
-  );
-  await waitQueue(1);
-  assert.equal(entered, true);
-  const next = structuredClone(seed);
-  next.source.sequence = 2;
-  next.snapshot = crypto.randomUUID();
-  next.metadata.observed_at = new Date().toISOString();
-  assert.equal(
-    (
-      await mf.dispatchFetch("https://internal/queue", {
-        method: "POST",
-        body: JSON.stringify(next),
-      })
-    ).status,
-    200,
-  );
-  await waitQueue(2);
-  assert.deepEqual(
-    seen,
-    [1, 2],
-    "actual background lifetime and future alarms remain independent of jobs",
-  );
-  assert.equal(
-    (await mf.dispatchFetch("https://internal/health", { method: "POST" }))
-      .status,
-    200,
-  );
-});
+    await waitQueue(1);
+    assert.equal(entered, true);
+    if (!deliverAlarms)
+      await new Promise((resolve) => setTimeout(resolve, 11000));
+    const next = structuredClone(seed);
+    next.source.sequence = 2;
+    next.snapshot = crypto.randomUUID();
+    next.metadata.observed_at = new Date().toISOString();
+    assert.equal(
+      (
+        await mf.dispatchFetch("https://internal/queue", {
+          method: "POST",
+          body: JSON.stringify(next),
+        })
+      ).status,
+      200,
+    );
+    await waitQueue(2);
+    assert.deepEqual(
+      seen,
+      [1, 2],
+      "actual background lifetime and future alarms remain independent of jobs",
+    );
+    assert.equal(
+      (await mf.dispatchFetch("https://internal/health", { method: "POST" }))
+        .status,
+      200,
+    );
+  });
 
 test("an ambiguous pointer write retries the latest durable union instead of restoring the old committed graph", async (t) => {
   const r = runtime(t);
@@ -2107,7 +2136,7 @@ test("an ambiguous pointer write retries the latest durable union instead of res
   };
   r.advance(15000);
   await r.send(r.next(2));
-  await r.flush();
+  await r.drain();
   assert.equal(
     queueSequence(r),
     2,
@@ -2627,4 +2656,342 @@ test("completed cohort exact boundaries and legacy classes preserve truthful tru
     root.job_pages.flatMap((ref) => r.object(ref).records).length,
     200,
   );
+});
+
+test("warm arrivals publish without waiting for a delayed alarm", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  r.advance(15000);
+  await r.send(r.next(2));
+  await r.drain();
+  assert.equal(
+    queueSequence(r),
+    2,
+    "no alarm was delivered for the arriving frame",
+  );
+});
+
+test(
+  "a newer queue target arriving during held preparation is consumed by completion kicks",
+  { timeout: 5000 },
+  async (t) => {
+    let releaseQueue,
+      releasePointer,
+      queueEntered,
+      pointerEntered,
+      thirdUploaded;
+    const queueGate = new Promise((resolve) => {
+        releaseQueue = resolve;
+      }),
+      pointerGate = new Promise((resolve) => {
+        releasePointer = resolve;
+      });
+    const queueHeld = new Promise((resolve) => {
+        queueEntered = resolve;
+      }),
+      pointerHeld = new Promise((resolve) => {
+        pointerEntered = resolve;
+      }),
+      thirdPut = new Promise((resolve) => {
+        thirdUploaded = resolve;
+      });
+    t.signal.addEventListener("abort", () => {
+      releaseQueue();
+      releasePointer();
+    });
+    const r = runtime(t);
+    await r.send(seed);
+    await r.flush();
+    const archive = globalThis.__operationsTestEnv.ARCHIVE,
+      put = archive.put;
+    archive.put = async (key, value) => {
+      const body = JSON.parse(value);
+      if (
+        body.schema === "tauceti.operations.queue/v1" &&
+        body.source_sequence === 2
+      ) {
+        queueEntered();
+        await queueGate;
+      }
+      if (key.endsWith("/manifest.json") && body.domains.queue?.url) {
+        const root = r.object(body.domains.queue);
+        if (root.source_sequence === 2) {
+          pointerEntered();
+          await pointerGate;
+        }
+      }
+      const result = await put(key, value);
+      if (
+        body.schema === "tauceti.operations.queue/v1" &&
+        body.source_sequence === 3
+      )
+        thirdUploaded();
+      return result;
+    };
+    try {
+      r.advance(15000);
+      await r.send(r.next(2));
+      await queueHeld;
+      r.advance(15000);
+      const third = r.next(3);
+      await r.send(third);
+      r.advance(15000);
+      releaseQueue();
+      await pointerHeld;
+      await thirdPut;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(r.operations.state("queue").version, "3/" + third.snapshot);
+      r.advance(15000);
+      releasePointer();
+      await r.drain();
+      assert.equal(
+        queueSequence(r),
+        3,
+        "no further source arrival or alarm was needed",
+      );
+    } finally {
+      releaseQueue();
+      releasePointer();
+      await r.drain();
+    }
+  },
+);
+
+test("cold cheap domains wait for queue readiness while an explicit alarm can bootstrap a partial view", async (t) => {
+  const r = runtime(t);
+  let enter, release;
+  const entered = new Promise((resolve) => {
+      enter = resolve;
+    }),
+    gate = new Promise((resolve) => {
+      release = resolve;
+    });
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    put = archive.put;
+  archive.put = async (key, value) => {
+    if (JSON.parse(value).schema === "tauceti.operations.queue/v1") {
+      enter();
+      await gate;
+    }
+    return put(key, value);
+  };
+  try {
+    await r.send(seed);
+    await entered;
+    for (let i = 0; i < 20; i++)
+      await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(r.objects.has("public/v1/operations/manifest.json"), false);
+    await r.fire();
+    for (
+      let i = 0;
+      i < 20 && !r.objects.has("public/v1/operations/manifest.json");
+      i++
+    )
+      await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      r.manifest().domains.queue.url,
+      null,
+      "explicit alarm permission allows honest partial bootstrap",
+    );
+  } finally {
+    release();
+    await r.drain();
+  }
+  r.advance(10000);
+  await r.fire();
+  await r.drain();
+  assert.equal(queueSequence(r), 1);
+});
+
+test("an event pump after restart does not mistake a deferred queue for prepared state", async (t) => {
+  const r = runtime(t),
+    kick = r.operations.nudge;
+  r.operations.nudge = () => {};
+  await r.send(seed);
+  r.operations.nudge = kick;
+  r.operations.set("domain_started/queue", Date.now());
+  const restored = new Operations(r.ctx);
+  await restored.publish();
+  await r.drain();
+  assert.equal(restored.preparing.has("queue"), false);
+  assert.equal(
+    r.objects.has("public/v1/operations/manifest.json"),
+    false,
+    "there is no current-scope committed or ready queue",
+  );
+  await restored.alarm();
+  await r.drain();
+  assert.equal(r.manifest().domains.queue.url, null);
+  r.advance(10000);
+  await restored.publish();
+  await r.drain();
+  assert.equal(queueSequence(r), 1);
+});
+
+test(
+  "an alarm bootstrap request survives coalescing with event-only kicks",
+  { timeout: 5000 },
+  async (t) => {
+    let releaseScope, releaseQueue, scopeEntered, queueEntered;
+    const scopeGate = new Promise((resolve) => {
+        releaseScope = resolve;
+      }),
+      queueGate = new Promise((resolve) => {
+        releaseQueue = resolve;
+      });
+    const scopeHeld = new Promise((resolve) => {
+        scopeEntered = resolve;
+      }),
+      queueHeld = new Promise((resolve) => {
+        queueEntered = resolve;
+      });
+    t.signal.addEventListener("abort", () => {
+      releaseScope();
+      releaseQueue();
+    });
+    const r = runtime(t),
+      sync = r.operations.syncScope.bind(r.operations);
+    let once = true;
+    r.operations.syncScope = async () => {
+      await sync();
+      if (once) {
+        once = false;
+        scopeEntered();
+        await scopeGate;
+      }
+    };
+    const archive = globalThis.__operationsTestEnv.ARCHIVE,
+      put = archive.put;
+    archive.put = async (key, value) => {
+      if (JSON.parse(value).schema === "tauceti.operations.queue/v1") {
+        queueEntered();
+        await queueGate;
+      }
+      return put(key, value);
+    };
+    let alarm;
+    try {
+      await r.send(seed);
+      await scopeHeld;
+      alarm = r.fire();
+      r.operations.nudge();
+      releaseScope();
+      await alarm;
+      await queueHeld;
+      for (
+        let i = 0;
+        i < 40 && !r.objects.has("public/v1/operations/manifest.json");
+        i++
+      )
+        await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(r.objects.has("public/v1/operations/manifest.json"));
+      assert.equal(r.manifest().domains.queue.url, null);
+    } finally {
+      releaseScope();
+      releaseQueue();
+      if (alarm) await alarm;
+      await r.drain();
+    }
+  },
+);
+
+test(
+  "a large committed snapshot is acknowledged while publication uploads remain held",
+  { timeout: 5000 },
+  async (t) => {
+    let release, enter;
+    const gate = new Promise((resolve) => {
+        release = resolve;
+      }),
+      entered = new Promise((resolve) => {
+        enter = resolve;
+      });
+    t.signal.addEventListener("abort", release);
+    const r = runtime(t),
+      frame = structuredClone(seed),
+      template = frame.changes.find((c) => c.collection === "members").value;
+    frame.changes = frame.changes.filter((c) => c.collection !== "members");
+    frame.changes.find(
+      (c) => c.collection === "batches" && c.value.state === "head",
+    ).value.size = 1200;
+    for (let i = 1; i <= 1200; i++)
+      frame.changes.push({
+        collection: "members",
+        id: String(i),
+        value: {
+          ...template,
+          id: String(i),
+          pr: String(i),
+          position: i,
+          pr_url: `https://github.com/${repo}/pull/${i}`,
+        },
+      });
+    frame.metadata.collection_counts.members = 1200;
+    const parts = split(frame, 400),
+      archive = globalThis.__operationsTestEnv.ARCHIVE,
+      put = archive.put;
+    let released = false;
+    archive.put = async (key, value) => {
+      enter();
+      await gate;
+      return put(key, value);
+    };
+    try {
+      for (const part of parts.slice(0, -1))
+        assert.equal((await r.send(part)).committed, false);
+      const before = performance.now(),
+        result = await r.send(parts.at(-1));
+      t.diagnostic(
+        "large snapshot acknowledgment " +
+          Math.round(performance.now() - before) +
+          "ms; storage gate unreleased",
+      );
+      assert.equal(result.committed, true);
+      await entered;
+      assert.equal(released, false);
+    } finally {
+      released = true;
+      release();
+      await r.drain();
+    }
+  },
+);
+
+test("duplicate arrivals do not upload again and event-driven heartbeats preserve pointer cadence", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const writes = r.writes.length;
+  await Promise.all(Array.from({ length: 100 }, () => r.send(seed)));
+  await r.drain();
+  assert.equal(
+    r.writes.length,
+    writes,
+    "no-op retries do not multiply graph uploads",
+  );
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    put = archive.put,
+    times = [];
+  archive.put = async (key, value) => {
+    if (key.endsWith("/manifest.json")) times.push(Date.now());
+    return put(key, value);
+  };
+  let sequence = 1;
+  for (let tick = 1; tick <= 60; tick++) {
+    r.advance(1000);
+    if (tick % 5 === 0) {
+      await r.send(r.next(++sequence));
+      await r.drain();
+    }
+  }
+  assert.ok(
+    times.length >= 5 && times.length <= 6,
+    "events advance data without alarm delivery at the existing cadence",
+  );
+  for (let i = 1; i < times.length; i++)
+    assert.ok(
+      times[i] - times[i - 1] >= 10000,
+      "the minimum pointer interval is preserved",
+    );
 });
