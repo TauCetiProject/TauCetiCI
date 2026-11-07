@@ -400,7 +400,7 @@ test("queue snapshots update the existing backlog chart without bors or GitHub r
     return Response.json({ observations: [], truncated: false });
   });
   await r.ingest({ observation: {
-    observed_at: iso(clock - 600), eligible_count: 20, candidate_scan_complete: true,
+    observed_at: iso(clock - 600), eligible_count: 20, candidate_scan_complete: true, reconstructed: true,
   } });
   const frame = JSON.parse(readFileSync("tests/fixtures/operations-queue.frames.json", "utf8"))[0];
   frame.metadata.service.mode = "production";
@@ -420,6 +420,7 @@ test("queue snapshots update the existing backlog chart without bors or GitHub r
   assert.equal(manifest.groups.queue.status, "updated");
   const chart = await (await bucket.get("public" + manifest.assets["ci-queue-size.svg"].url)).text();
   assert.match(chart, /ai-merge-queue accepted PRs/);
+  assert.match(chart, /reconstructed from the recorded event journal/);
   assert.equal((chart.match(/<circle /g) || []).length, 2); // Historical bors point survives, with a gap.
   assert.equal(borsReads, 0);
   assert.equal(r.github(), 0);

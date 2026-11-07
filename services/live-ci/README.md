@@ -141,6 +141,16 @@ removed and withdrawn members. Landed batches and superseded versions do not
 count. Source timestamps are retained: polling cannot make a stopped producer
 look current. Incomplete input/member/batch coverage leaves a gap. This uses the
 existing telemetry store and makes no GitHub requests or queue mutations.
+The chart labels and highlights its latest complete sample so a small current
+backlog stays visible beside a large historical peak. Journal backfills carry
+`reconstructed: true`; the rendered chart labels their cutoff explicitly.
+`scripts/queue_backlog.py` prepares minute samples from a sanitized, complete
+read-only queue snapshot. It uses journal admission times (not inherited
+approval ages), requires every input's approval, and checks the final replay
+against waiting inputs and active membership. Journal order resolves clocks
+recorded before a concurrent operation; minute boundaries inside an ambiguous
+timestamp interval remain incomplete. Import only the period before direct
+telemetry begins through the existing bounded `/admin/import` endpoint.
 Historical bors snapshots remain; installations without a production queue
 continue reading bors. Bors history uses the last completed candidate snapshot while bors
 scans for changes, matching the legacy report. A partial startup scan without a

@@ -417,6 +417,14 @@ export function renderCharts(
     queueTimes.push(queueLabels[i]);
     queuePositions.push(o.at);
   });
+  const latestQueue = observations.filter((o) => o.complete !== false).at(-1);
+  const queueMax = Math.max(1, ...queueValues.map((v) => v || 0)) * 1.1;
+  const latestMarker = latestQueue
+    ? `<g data-queue-latest="true"><text x="64" y="92" style="font-size:17px;font-weight:600">Last complete: ${escape(latestQueue.count)} PRs · ${escape(iso(latestQueue.snapshot_at ?? latestQueue.at).slice(0, 16).replace("T", " "))} UTC</text><ellipse cx="${64 + 864 * (latestQueue.at - queueSince) / (clock - queueSince)}" cy="${380 - 240 * latestQueue.count / queueMax}" rx="6" ry="6" fill="#5eead4" stroke="#fff" stroke-width="2"/></g>`
+    : '<text x="64" y="92" class="muted">No complete backlog observations in this window.</text>';
+  const reconstructedThrough = observations.filter((o) => o.reconstructed === true).at(-1)?.at;
+  const reconstructionNote = reconstructedThrough === undefined ? "" :
+    `<text x="64" y="426" class="muted">Queue history through ${escape(iso(reconstructedThrough).slice(0, 16).replace("T", " "))} UTC reconstructed from the recorded event journal.</text>`;
   render("ci-queue-size.svg", () =>
     frame(
       "Observed ready-to-merge PR backlog",
@@ -425,7 +433,7 @@ export function renderCharts(
         times: queuePositions,
         since: queueSince,
         until: clock,
-      }),
+      }) + latestMarker + reconstructionNote,
     ),
   );
   const recordedStaging = days
