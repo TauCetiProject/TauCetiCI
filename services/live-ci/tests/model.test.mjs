@@ -443,6 +443,23 @@ test("queue history breaks at startup partials and shows isolated observations i
   assert.deepEqual(segments.map((points) => points.length), [40, 1, 77]);
   assert.equal([...svg.matchAll(/<circle /g)].length, 1);
 });
+test("a small fresh backlog stays visible beside a much larger historical peak", async () => {
+  const code = buildSync({ entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false }).outputFiles[0].text;
+  const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+  const observations = [
+    ...Array.from({ length: 120 }, (_, i) => ({ at: t - 4 * m.DAY + i * 60, count: 1252 })),
+    { at: t - 120, count: 17, snapshot_at: t - 180, reconstructed: true },
+    { at: t - 60, count: 19 },
+    { at: t, count: 4, complete: false },
+  ];
+  const svg = renderCharts([{ day: m.day(t), data: { daily: {}, fleet: [], observations } }], t)["ci-queue-size.svg"];
+  assert.match(svg, /Last complete: 19 PRs/);
+  assert.doesNotMatch(svg, /Last complete: 4 PRs/);
+  assert.match(svg, /data-queue-latest="true"/);
+  assert.match(svg, /<ellipse[^>]+rx="6" ry="6"[^>]+stroke="#fff"/);
+  assert.match(svg, /2026-10-18 11:59 UTC/);
+  assert.match(svg, /history through 2026-10-18 11:58 UTC reconstructed from the recorded event journal/);
+});
 test("charts include dedicated work and retain pending staging observations", async () => {
   const code = buildSync({ entryPoints: ["src/charts.ts"], bundle: true, format: "esm", platform: "node", write: false }).outputFiles[0].text;
   const { renderCharts } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));

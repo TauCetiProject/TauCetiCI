@@ -347,6 +347,7 @@ export class Control {
         count,
         complete,
         snapshot_at: snapshotAt,
+        ...(o.reconstructed === true ? { reconstructed: true } : {}),
         day: day(at),
       });
       if (at >= (this.get("bors_observed") || 0)) {
