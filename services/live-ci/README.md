@@ -134,7 +134,15 @@ Inventory coverage, detail completeness and rendering timestamps are distinct.
 An empty observation is not proof of zero activity. The browser labels stale
 coverage, preserves working images after failures and pauses polling when hidden.
 
-Ready-to-merge history uses the last completed candidate snapshot while bors
+Ready-to-merge history samples the committed production ai-merge-queue snapshot
+once a minute when its public telemetry is configured. It counts distinct PRs
+in waiting/reserved inputs or the current version of an open/head batch, excluding
+removed and withdrawn members. Landed batches and superseded versions do not
+count. Source timestamps are retained: polling cannot make a stopped producer
+look current. Incomplete input/member/batch coverage leaves a gap. This uses the
+existing telemetry store and makes no GitHub requests or queue mutations.
+Historical bors snapshots remain; installations without a production queue
+continue reading bors. Bors history uses the last completed candidate snapshot while bors
 scans for changes, matching the legacy report. A partial startup scan without a
 completed snapshot remains a gap. Explicit partial observations break the line,
 as do missing observations more than three minutes apart; isolated valid samples

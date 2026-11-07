@@ -833,6 +833,23 @@ export class Control {
       "SELECT COUNT(*) n FROM repairs WHERE kind='members'",
     ).one().n };
   }
+  async queueObservations() {
+    if (this.env.OPERATIONS) {
+      const { observation } = await call(this.env.OPERATIONS, "operations", "/backlog");
+      if (observation) {
+        await this.ingest({
+          repo: "TauCetiProject/TauCeti",
+          delivery: `ai-merge-queue/${observation.observed_at}`,
+          observation,
+        });
+        this.set("bors_checked", now());
+        this.set("queue_source", "ai-merge-queue");
+        return;
+      }
+    }
+    await this.bors();
+    this.set("queue_source", "bors");
+  }
   async bors() {
     const clock = now(),
       position = this.get("bors_position") || { day: day(clock), cursor: null };
@@ -1307,7 +1324,7 @@ export class Control {
       }
       if (clock - (this.get("bors_checked") || 0) >= 60)
         try {
-          await this.bors();
+          await this.queueObservations();
           this.set("bors_error", null);
         } catch (error) {
           this.set("bors_error", String(error));
@@ -1532,6 +1549,7 @@ export class Control {
         published: this.get("published"),
         repair_error: this.get("repair_error"),
         bors_error: this.get("bors_error"),
+        queue_source: this.get("queue_source"),
         members_error: this.get("members_error"),
         comparison_error: this.get("comparison_error"),
         last_comparison: this.get("compared"),

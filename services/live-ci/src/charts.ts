@@ -420,7 +420,7 @@ export function renderCharts(
   render("ci-queue-size.svg", () =>
     frame(
       "Observed ready-to-merge PR backlog",
-      `Ready-labelled PRs, including staging; recorded since ${iso(queueSince).slice(0, 10)}. Gaps are unavailable snapshots. ${iso(clock)}`,
+      `Bors candidates / ai-merge-queue accepted PRs, including batches; recorded since ${iso(queueSince).slice(0, 10)}. Gaps = missing data.`,
       panel([{ name: "ready PRs", values: queueValues }], queueTimes, {
         times: queuePositions,
         since: queueSince,
