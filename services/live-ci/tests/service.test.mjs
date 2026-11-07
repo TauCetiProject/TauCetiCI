@@ -53,6 +53,7 @@ async function runtime(t, bindings = {}, upstream, borsUpstream) {
       FACTS: { className: "FactPartition", useSQLite: true },
       DAYS: { className: "DayAggregate", useSQLite: true },
       CONTROL: { className: "Control", useSQLite: true },
+      OPERATIONS: { className: "Operations", useSQLite: true },
     },
     r2Buckets: ["ARCHIVE"],
     queueProducers: { EVENTS: "events" },
@@ -390,6 +391,37 @@ test("a queue chart with only partial scans has no complete count", async (t) =>
   const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
   assert.equal(manifest.groups.queue.latest_complete, null);
   assert.equal(manifest.groups.queue.latest_scan_incomplete, true);
+  assert.equal(r.github(), 0);
+});
+test("queue snapshots update the existing backlog chart without bors or GitHub reads", async (t) => {
+  let borsReads = 0;
+  const r = await runtime(t, { OPERATIONS_PUBLIC_REPOSITORIES: JSON.stringify([repo]) }, undefined, () => {
+    borsReads++;
+    return Response.json({ observations: [], truncated: false });
+  });
+  await r.ingest({ observation: {
+    observed_at: iso(clock - 600), eligible_count: 20, candidate_scan_complete: true,
+  } });
+  const frame = JSON.parse(readFileSync("tests/fixtures/operations-queue.frames.json", "utf8"))[0];
+  frame.metadata.service.mode = "production";
+  frame.metadata.observed_at = iso(clock - 300);
+  const ns = await r.mf.getDurableObjectNamespace("OPERATIONS");
+  const response = await ns.get(ns.idFromName("operations")).fetch("https://internal/queue", {
+    method: "POST", body: JSON.stringify(frame),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  await r.post("/tick");
+  await r.post("/refresh-day", { day: date });
+  const bucket = await r.mf.getR2Bucket("ARCHIVE");
+  const manifest = await (await bucket.get("public/v1/ci/manifest.json")).json();
+  assert.equal(manifest.current.ready_to_merge.count, 2);
+  assert.equal(manifest.groups.queue.latest_complete.count, 2);
+  assert.equal(manifest.groups.queue.latest_complete.snapshot_at, iso(clock - 300).replace(".000Z", "Z"));
+  assert.equal(manifest.groups.queue.status, "updated");
+  const chart = await (await bucket.get("public" + manifest.assets["ci-queue-size.svg"].url)).text();
+  assert.match(chart, /ai-merge-queue accepted PRs/);
+  assert.equal((chart.match(/<circle /g) || []).length, 2); // Historical bors point survives, with a gap.
+  assert.equal(borsReads, 0);
   assert.equal(r.github(), 0);
 });
 test("archive sampling survives newer live metadata and retracts prior overlap contributions", async (t) => {

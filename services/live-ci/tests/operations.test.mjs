@@ -201,6 +201,66 @@ function runtime(t) {
   };
 }
 
+test("backlog counts distinct waiting PRs and current active members, including staging", async (t) => {
+  const r = runtime(t);
+  const backlog = async () => (await (await r.request("/backlog")).json()).observation;
+  assert.equal(await backlog(), null);
+  const frame = r.next(1);
+  await r.send(frame);
+  assert.equal(await backlog(), null); // Unknown/shadow queues cannot replace production history.
+  frame.source.sequence = 2;
+  frame.snapshot = crypto.randomUUID();
+  frame.metadata.service.mode = "production";
+  const input = frame.changes.find((c) => c.collection === "inputs").value;
+  for (const [id, pr, state] of [["3", "101", "waiting"], ["4", "103", "reserved"], ["5", "104", "withdrawn"], ["6", "105", "landed"]]) {
+    frame.changes.push({ collection: "inputs", id, value: { ...input, id, pr, state, batch_id: null } });
+  }
+  const member = frame.changes.find((c) => c.collection === "members").value;
+  for (const [id, pr, extra] of [
+    ["3", "106", { batch_version: 1 }],
+    ["4", "107", { removed: true }],
+    ["5", "108", { withdrawn: true }],
+    ["6", "109", { batch_id: "2", batch_version: 0 }],
+  ]) frame.changes.push({ collection: "members", id, value: {
+    ...member, id, pr, pr_url: `https://github.com/${repo}/pull/${pr}`, ...extra,
+  } });
+  await r.send(frame);
+  const observation = await backlog();
+  assert.equal(observation.eligible_count, 4); // 101, 102, 103, and open-batch 109.
+  assert.equal(observation.candidate_scan_complete, true);
+  assert.equal(observation.candidate_snapshot_at, frame.metadata.observed_at);
+  r.advance(300_000);
+  assert.deepEqual(await backlog(), observation); // Polling cannot freshen a stopped producer.
+  const delta = r.next(3);
+  delta.base = { epoch: 1, sequence: 2 };
+  delta.metadata.service.mode = "production";
+  delta.changes = [{ collection: "batches", id: "1", value: {
+    ...frame.changes.find((c) => c.collection === "batches").value, state: "landed",
+  } }];
+  await r.send(delta);
+  assert.equal((await backlog()).eligible_count, 3); // Terminal batch members no longer count.
+  globalThis.__operationsTestEnv.OPERATIONS_PUBLIC_REPOSITORIES = "[]";
+  assert.equal(await backlog(), null);
+});
+
+test("backlog ignores partial uploads and marks incomplete committed collections as gaps", async (t) => {
+  const r = runtime(t);
+  const frame = r.next(1);
+  frame.metadata.service.mode = "production";
+  await r.send(frame);
+  const initial = await (await r.request("/backlog")).json();
+  const next = r.next(2);
+  next.metadata.service.mode = "production";
+  next.metadata.collection_complete.members = false;
+  const parts = split(next);
+  for (const part of parts.slice(0, -1)) await r.send(part);
+  assert.deepEqual(await (await r.request("/backlog")).json(), initial);
+  await r.send(parts.at(-1));
+  const { observation } = await (await r.request("/backlog")).json();
+  assert.equal(observation.candidate_scan_complete, false);
+  assert.equal(observation.candidate_snapshot_at, null);
+});
+
 function split(frame, size = 3) {
   const chunks = [];
   for (let i = 0; i < frame.changes.length; i += size)

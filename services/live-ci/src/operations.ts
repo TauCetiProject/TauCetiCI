@@ -2367,6 +2367,40 @@ export class Operations {
 
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
+    if (path === "/backlog") {
+      const repo = "TauCetiProject/TauCeti";
+      const source = this.source(this.get("queue_source") || "");
+      const metadata = source?.metadata ? JSON.parse(source.metadata) : null;
+      if (!this.repositories().includes(repo) ||
+          !metadata?.scope.repositories.includes(repo) ||
+          metadata.service.mode !== "production") return json({ observation: null });
+      // Read only the last atomically committed generation. Waiting inputs and
+      // current members overlap during insertion and a PR can have older heads.
+      const count = this.sql.exec<{ n: number }>(`
+        SELECT COUNT(*) n FROM (
+          SELECT json_extract(data,'$.pr') pr FROM ops_entities
+          WHERE source=? AND collection='inputs'
+            AND json_extract(data,'$.repository')=?
+            AND json_extract(data,'$.state') IN ('waiting','reserved')
+          UNION
+          SELECT json_extract(m.data,'$.pr') pr FROM ops_entities m
+          JOIN ops_entities b ON b.source=m.source AND b.collection='batches' AND b.id=m.batch
+          WHERE m.source=? AND m.collection='members'
+            AND json_extract(m.data,'$.repository')=?
+            AND json_extract(b.data,'$.state') IN ('head','open')
+            AND json_extract(m.data,'$.batch_version')=json_extract(b.data,'$.version')
+            AND json_extract(m.data,'$.removed')=0
+            AND json_extract(m.data,'$.withdrawn')=0
+        )`, source!.id, repo, source!.id, repo).one().n;
+      const complete = metadata.coverage === "observed" && !metadata.truncated &&
+        ["inputs", "members", "batches"].every((key) => metadata.collection_complete[key]);
+      return json({ observation: {
+        observed_at: metadata.observed_at,
+        eligible_count: count,
+        candidate_scan_complete: complete,
+        candidate_snapshot_at: complete ? metadata.observed_at : null,
+      } });
+    }
     if (path === "/queue") {
       let frame: QueueFrame;
       try {
