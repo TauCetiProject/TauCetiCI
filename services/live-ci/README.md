@@ -338,3 +338,9 @@ from cached minute bins on publisher ticks, without GitHub discovery requests.
 Success, failure (including timeout), cancellation, skip and other outcomes stay
 separate. Counts cover retained observations, not an assertion of full GitHub
 inventory. Raw fact retirement removes the corresponding index records.
+
+Queue batches may include a boolean `sealed` independently of `state`: `open` with
+`sealed: true` denotes the fixed-membership successor being prepared behind the head.
+The optional numeric `settings.sealed_successor_min_members` reports its size threshold
+(100 by default; zero disables future successor sealing). Older publishers may omit
+both fields; ingestion retains strict validation of every supplied field.

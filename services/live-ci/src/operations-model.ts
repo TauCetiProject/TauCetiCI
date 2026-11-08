@@ -74,7 +74,7 @@ const numberFields = new Set([
   "position",
   "run_attempt",
 ]);
-const booleanFields = new Set(["empty", "removed", "no_repair", "withdrawn"]);
+const booleanFields = new Set(["empty", "removed", "no_repair", "withdrawn", "sealed"]);
 
 export function object(
   value: any,
@@ -158,7 +158,8 @@ export function record(
   value: any,
   repositories: string[],
 ) {
-  object(value, fields[collection]);
+  // Optional while older queue publishers still omit the membership seal.
+  object(value, fields[collection] + (collection === "batches" ? " sealed" : ""));
   if (fields[collection].split(" ").some((key) => !Object.hasOwn(value, key)))
     throw new Error("Missing public field");
   identity(value.id);
@@ -376,8 +377,10 @@ export function metadata(value: any, repositories: string[]) {
   }
   object(
     value.settings,
-    "repair_concurrency stall_interval_seconds open_batch_limit prepare_min_members prepare_quiet_seconds prepare_open_batches pre_rebase_enabled prepare_pre_rebased",
+    "repair_concurrency stall_interval_seconds open_batch_limit sealed_successor_min_members prepare_min_members prepare_quiet_seconds prepare_open_batches pre_rebase_enabled prepare_pre_rebased",
   );
+  if (Object.hasOwn(value.settings, "sealed_successor_min_members"))
+    integer(value.settings.sealed_successor_min_members);
   for (const setting of Object.values(value.settings))
     if (typeof setting !== "boolean") integer(setting);
   list(value.claims, 1000);
