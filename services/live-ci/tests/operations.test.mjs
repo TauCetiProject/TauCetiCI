@@ -566,6 +566,45 @@ test("actual Python export is accepted and produces linked, paginated queue and 
   assert.equal(attempts[0].base, head.base);
 });
 
+test("sealed successor flags and threshold survive ingestion and public publication", async (t) => {
+  const r = runtime(t), frame = r.next(1);
+  frame.metadata.settings.sealed_successor_min_members = 100;
+  const batch = frame.changes.find((c) => c.collection === "batches");
+  batch.value.state = "open";
+  batch.value.sealed = true;
+  assert.equal((await r.send(frame)).committed, true);
+  await r.flush();
+  const queue = r.object(r.manifest().domains.queue);
+  const successor = queue.batches.find((b) => b.id === batch.id);
+  assert.equal(successor.state, "open");
+  assert.equal(successor.sealed, true);
+  assert.equal(queue.settings.sealed_successor_min_members, 100);
+  const next = r.next(2);
+  next.base = { epoch: 1, sequence: 1 };
+  // An older publisher remains accepted without either new optional field.
+  assert.equal((await r.send(next)).committed, true);
+  await r.flush();
+  assert.equal(r.object(r.manifest().domains.queue).batches.find((b) => b.id === batch.id).sealed, undefined);
+});
+
+test("sealing fields reject untyped flags and invalid thresholds before committing", async (t) => {
+  const r = runtime(t);
+  for (const sealed of [1, "true", null]) {
+    const frame = r.next(1);
+    frame.changes.find((c) => c.collection === "batches").value.sealed = sealed;
+    await r.send(frame, 400);
+  }
+  for (const minimum of [true, -1, "100", 1.5]) {
+    const frame = r.next(1);
+    frame.metadata.settings.sealed_successor_min_members = minimum;
+    await r.send(frame, 400);
+  }
+  const frame = r.next(1);
+  frame.metadata.settings.sealed_successor_min_members = 0;
+  frame.changes.find((c) => c.collection === "batches").value.sealed = false;
+  assert.equal((await r.send(frame)).committed, true);
+});
+
 test("repair build observations retain numeric progress separately from phase age and reject private log fields", async (t) => {
   const r = runtime(t),
     frame = structuredClone(seed);
