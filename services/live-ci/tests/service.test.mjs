@@ -1435,6 +1435,7 @@ test('workflow-only metadata does not compete with real running jobs for urgent 
   const raw={...run('91001'),status:'in_progress',conclusion:null,updated_at:iso(clock-2000)};
   await r.ingest({run:raw});
   await r.ingest({run:{...raw,id:'91002'},jobs:[{...job('92002','91002'),status:'in_progress',conclusion:null,completed_at:null}]});
+  await r.notify();
   await r.post('/publish');
   const repairs=await r.post('/repairs',{kind:'run'});
   assert.equal(repairs.find(v=>v.args.id==='91001').args.urgent,false);
