@@ -934,6 +934,8 @@ export class Control {
       for (const c of snapshot.counts)
         current[c.state][c.kind] = (current[c.state][c.kind] || 0) + c.count;
       const repo = p.name.split("/").slice(0, 2).join("/");
+      const running = new Set(snapshot.jobs.filter((j: any) => j.status === 'in_progress' && j.assigned)
+        .map((j: any) => `${j.run}/${j.attempt}`));
       for (const r of [
         ...snapshot.runs.map((r: any) => ({
           id: r.id,
@@ -947,14 +949,16 @@ export class Control {
         })),
       ]) {
         const key = `active_checked/${repo}/${r.id}/${r.attempt}`;
+        const urgent = running.has(`${r.id}/${r.attempt}`);
         if (clock - r.updated > 900)
-          // Upgrade an existing repair even while the 15-minute admission
-          // timer is running. Preserve its retry backoff and request count.
+          // Prioritize actual running jobs, not thousands of workflow-only
+          // records. Keep pending inventory ahead of ordinary metadata repair.
+          // Preserve existing retry backoff and request accounting.
           this.sql.exec(
-            `UPDATE repairs SET args=json_set(args,'$.urgent',json('true'))
+            `UPDATE repairs SET args=json_set(args,'$.urgent',json(?))
             WHERE repo=? AND kind='run' AND CAST(json_extract(args,'$.id') AS TEXT)=?
             AND json_extract(args,'$.attempt')=?`,
-            repo,
+            urgent ? 'true' : 'false', repo,
             String(r.id),
             r.attempt,
           );
@@ -962,7 +966,7 @@ export class Control {
           this.enqueue(repo, "run", {
             id: r.id,
             attempt: r.attempt,
-            urgent: true,
+            urgent,
           });
           this.set(key, clock);
         }

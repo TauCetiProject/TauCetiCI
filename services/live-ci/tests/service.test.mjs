@@ -1429,3 +1429,15 @@ test('pending inventory refreshes older workflows, preserves its filter on split
   assert.ok(report.coverage.flatMap(c=>c.intervals).every(i=>i.since>clock-3600),
     'pending-only inventory must not claim complete all-workflow coverage');
 });
+
+test('workflow-only metadata does not compete with real running jobs for urgent reconciliation',async t=>{
+  const r=await runtime(t);
+  const raw={...run('91001'),status:'in_progress',conclusion:null,updated_at:iso(clock-2000)};
+  await r.ingest({run:raw});
+  await r.ingest({run:{...raw,id:'91002'},jobs:[{...job('92002','91002'),status:'in_progress',conclusion:null,completed_at:null}]});
+  await r.post('/publish');
+  const repairs=await r.post('/repairs',{kind:'run'});
+  assert.equal(repairs.find(v=>v.args.id==='91001').args.urgent,false);
+  assert.equal(repairs.find(v=>v.args.id==='91002').args.urgent,true);
+  assert.equal(r.github(),0);
+});
