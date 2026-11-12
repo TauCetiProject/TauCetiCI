@@ -852,16 +852,16 @@ test("publisher read leases share the rolling budget and cannot be multiplied by
       .granted,
     false,
   );
-  // Publisher saturation must leave room for the current inventory and its
+  // Publisher saturation must leave room for current/pending inventories and their
   // installation-token exchange, under the same global ceiling.
   await r.post("/tick");
   health = await r.post("/health");
   assert.equal(health.repair_error, null);
   assert.equal(
     health.requests.reduce((n, x) => n + x.count, 0),
-    362,
+    363,
   );
-  assert.equal(r.github(), 2);
+  assert.equal(r.github(), 3);
 });
 test("quota deferrals retry promptly without accumulating repair failures", async (t) => {
   const key = generateKeyPairSync("rsa", {
@@ -1390,4 +1390,40 @@ test("optional enrichment cannot consume more than sixty requests while core rep
   await r.post('/tick');
   assert.ok(paths.some((path) => path.endsWith('/runs/90001/attempts/1/jobs')));
 
+});
+
+test('pending inventory refreshes older workflows, preserves its filter on splits, and reads short pages',async t=>{
+  const key=generateKeyPairSync('rsa',{modulusLength:2048}).privateKey.export({format:'pem',type:'pkcs8'});
+  const reads=[];
+  const old={...run('88001'),status:'pending',conclusion:null,created_at:iso(clock-7200),updated_at:iso(clock-7100)};
+  const r=await runtime(t,{GITHUB_APP_ID:'1',GITHUB_INSTALLATION_ID:'2',GITHUB_PRIVATE_KEY:key},req=>{
+    const u=new URL(req.url);
+    if(u.pathname.endsWith('/access_tokens'))return Response.json({token:'test',expires_at:iso(clock+3600)});
+    reads.push(u);
+    if(u.pathname.endsWith('/runs')&&u.searchParams.get('status')==='pending'){
+      const [from,to]=u.searchParams.get('created').split('..').map(v=>Date.parse(v)/1000);
+      if(to-from>80000)return Response.json({total_count:1001,workflow_runs:[]});
+      const contains=from<=clock-7200&&to>=clock-7200;
+      return Response.json({total_count:contains?101:0,workflow_runs:contains&&u.searchParams.get('page')==='1'?[old]:[]});
+    }
+    return Response.json({total_count:0,workflow_runs:[],jobs:[]});
+  });
+  for(let i=0;i<3;i++)await r.post('/tick');
+  const filtered=reads.filter(u=>u.searchParams.get('status')==='pending');
+  assert.ok(filtered.length>=4,'root, both split ranges and short-page continuation');
+  assert.ok(filtered.some(u=>u.searchParams.get('page')==='2'));
+  assert.ok(filtered.some(u=>{
+    const [from,to]=u.searchParams.get('created').split('..').map(v=>Date.parse(v)/1000);
+    return to-from===86399;
+  }));
+  const ns=await r.mf.getDurableObjectNamespace('FACTS');
+  const part=repo+'/'+old.created_at.slice(0,10);
+  const observation=await(await ns.get(ns.idFromName(part)).fetch('https://internal/operations',{method:'POST',body:'{}'})).json();
+  assert.equal(observation.backlog.pr_builds.pending,1);
+  assert.equal(reads.some(u=>u.pathname.endsWith('/jobs')),false,'no job-detail enumeration');
+  await r.post('/publish');
+  const bucket=await r.mf.getR2Bucket('ARCHIVE');
+  const report=await(await bucket.get('public/v1/ci/manifest.json')).json();
+  assert.ok(report.coverage.flatMap(c=>c.intervals).every(i=>i.since>clock-3600),
+    'pending-only inventory must not claim complete all-workflow coverage');
 });
