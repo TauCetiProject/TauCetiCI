@@ -23,7 +23,8 @@ export function backlogSnapshot(sql: SqlStorage, clock: number) {
     // No age-only exclusion: require an enumerated empty/terminal attempt and
     // no active jobs, including synthetic placeholders. A live pending job
     // always keeps its place regardless of its age.
-    const settled = row.verified === 'true' && row.active_jobs === 0 &&
+    const settled = !['pending', 'waiting', 'requested'].includes(run.status) &&
+      row.verified === 'true' && row.active_jobs === 0 &&
       clock - Math.max(run.created || 0, run.updated || 0, run.started || 0) >= 5400;
     if (settled) target.stuck++;
     else if (row.running_jobs > 0) target.in_progress++;

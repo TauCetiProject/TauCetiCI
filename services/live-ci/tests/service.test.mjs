@@ -1408,6 +1408,8 @@ test('pending inventory refreshes older workflows, preserves its filter on split
     }
     return Response.json({total_count:0,workflow_runs:[],jobs:[]});
   });
+  await r.ingest({delivery:`repair/run/${old.id}/${old.run_attempt}/${old.updated_at}`,
+    run:{...old,status:'in_progress',updated_at:iso(clock-7150)}});
   for(let i=0;i<3;i++)await r.post('/tick');
   const filtered=reads.filter(u=>u.searchParams.get('status')==='pending');
   assert.ok(filtered.length>=4,'root, both split ranges and short-page continuation');

@@ -43,6 +43,11 @@ test('observed waiting or running jobs take precedence over stale parent workflo
   assert.equal(result.pr_builds.pending,1);assert.equal(result.pr_builds.in_progress,1);
   assert.equal(result.pr_builds.oldest_waiting_at,clock-10000);
 });
+test('a pending workflow keeps its place even after a previously empty enumeration',t=>{
+  const f=fixture(t);f.run(1,'pending');f.verified(1);
+  const result=backlogSnapshot(f.sql,clock);
+  assert.equal(result.pr_builds.pending,1);assert.equal(result.pr_builds.stuck,0);
+});
 test('counts precede run, job and partition display limits; missing sources stay partial',t=>{
   const f=fixture(t);for(let i=1;i<=1201;i++)f.run(i,'pending');
   const backlog=backlogSnapshot(f.sql,clock);assert.equal(backlog.pr_builds.pending,1201);

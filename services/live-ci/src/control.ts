@@ -694,7 +694,7 @@ export class Control {
         for (const run of data.workflow_runs || []) {
           await this.ingest({
             repo: row.repo,
-            delivery: `repair/run/${run.id}/${run.run_attempt}/${run.updated_at}`,
+            delivery: `repair/${args.status === 'pending' ? 'pending' : 'run'}/${run.id}/${run.run_attempt}/${run.updated_at}`,
             run,
           });
           if (run.status === "completed") {

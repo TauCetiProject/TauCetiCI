@@ -15,6 +15,15 @@ const m = await import(
   "data:text/javascript;base64," + Buffer.from(output).toString("base64")
 );
 const t = Date.parse("2026-10-18T12:00:00Z") / 1000;
+test('newer waiting transitions correct active state without regressing terminal or newer facts',()=>{
+  const active={status:'in_progress',updated:100};
+  assert.deepEqual(m.newer(active,{status:'pending',updated:110}),{status:'pending',updated:110});
+  assert.deepEqual(m.newer(active,{status:'waiting',updated:110}),{status:'waiting',updated:110});
+  assert.equal(m.newer(active,{status:'pending',updated:90}),active);
+  assert.equal(m.newer(active,{status:'queued',updated:110}),active);
+  const completed={status:'completed',updated:120};
+  assert.equal(m.newer(completed,{status:'pending',updated:130}),completed);
+});
 const run = {
   repo: "TauCetiProject/TauCeti",
   id: "1",
