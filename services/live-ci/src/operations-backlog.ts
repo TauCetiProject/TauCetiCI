@@ -23,15 +23,17 @@ export function backlogSnapshot(sql: SqlStorage, clock: number) {
     // No age-only exclusion: require an enumerated empty/terminal attempt and
     // no active jobs, including synthetic placeholders. A live pending job
     // always keeps its place regardless of its age.
-    const settled = row.verified === 'true' && row.active_jobs === 0 &&
+    const settled = !['pending', 'waiting', 'requested'].includes(run.status) &&
+      row.verified === 'true' && row.active_jobs === 0 &&
       clock - Math.max(run.created || 0, run.updated || 0, run.started || 0) >= 5400;
     if (settled) target.stuck++;
-    else if (['pending', 'waiting', 'requested'].includes(run.status)) target.pending++;
+    else if (row.running_jobs > 0) target.in_progress++;
+    else if (['pending', 'waiting', 'requested'].includes(run.status) ||
+        run.status === 'in_progress' && row.actual_jobs > 0) target.pending++;
     else if (row.actual_jobs > 0 && run.status === 'queued') target.queued++;
-    else if (row.actual_jobs > 0 && run.status === 'in_progress') target.in_progress++;
     else target.unconfirmed++;
-    if (!settled && (['pending', 'waiting', 'requested'].includes(run.status) ||
-        run.status === 'queued' && row.actual_jobs > 0) && run.created > 0)
+    if (!settled && row.running_jobs === 0 && (['pending', 'waiting', 'requested'].includes(run.status) ||
+        ['queued', 'in_progress'].includes(run.status) && row.actual_jobs > 0) && run.created > 0)
       target.oldest_waiting_at = Math.min(target.oldest_waiting_at ?? run.created, run.created);
   }
   return counts;

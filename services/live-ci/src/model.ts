@@ -205,7 +205,8 @@ export function newer<T extends { status: string; updated: number }>(
   next: T,
 ): T {
   if (!old) return next;
-  if (rank(next.status) < rank(old.status) || next.updated < old.updated)
+  const waitingAgain = old.status === 'in_progress' && ['pending', 'waiting'].includes(next.status);
+  if ((!waitingAgain && rank(next.status) < rank(old.status)) || next.updated < old.updated)
     return old;
   return { ...old, ...next };
 }

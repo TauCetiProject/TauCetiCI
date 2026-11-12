@@ -355,4 +355,10 @@ a run transition. Age alone never removes a pending job. Unknown job inventory
 is reported separately; this summary neither cancels nor dispatches work.
 Counts include only the latest retained attempt, and missing or pending source
 partitions make coverage partial. Existing partition reconciliation refreshes
-quiet cached partitions after an upgrade; no new GitHub discovery is added.
+quiet cached partitions after an upgrade. Summary reads make no GitHub requests.
+Every hour, the existing metadata inventory also reconciles pending
+workflows created in the previous 24 hours. It shares the existing quota and
+retry/splitting machinery, remains below urgent active-run repair in priority,
+and does not enumerate job details. Short filtered pages do not establish the
+end of an inventory. Observed waiting/running jobs take precedence when their
+parent workflow state lags.
