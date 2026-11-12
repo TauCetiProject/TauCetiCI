@@ -344,3 +344,15 @@ Queue batches may include a boolean `sealed` independently of `state`: `open` wi
 The optional numeric `settings.sealed_successor_min_members` reports its size threshold
 (100 by default; zero disables future successor sealing). Older publishers may omit
 both fields; ingestion retains strict validation of every supplied field.
+
+
+The prepared operations jobs object includes a per-repository `backlog` summary
+from retained run and job facts, before run/job/partition detail limits. It
+separates pending and queued workflows from verified stuck records and records
+without confirmed active jobs. A stuck classification requires a verified
+empty/terminal attempt, no active jobs or placeholders, and 90 minutes without
+a run transition. Age alone never removes a pending job. Unknown job inventory
+is reported separately; this summary neither cancels nor dispatches work.
+Counts include only the latest retained attempt, and missing or pending source
+partitions make coverage partial. Existing partition reconciliation refreshes
+quiet cached partitions after an upgrade; no new GitHub discovery is added.

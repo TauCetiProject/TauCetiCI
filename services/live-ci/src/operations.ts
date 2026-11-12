@@ -1,6 +1,7 @@
 /** Prepared operations publication. Public GETs never enter this object. */
 import { historyFrame } from "./operations-history";
 import { mergeActivity } from "./operations-activity";
+import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
@@ -122,7 +123,8 @@ export class Operations {
     // Quiet historical sources will not emit another webhook. Revisit legacy
     // cached partitions through the existing bounded collector to seed activity.
     const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
-      WHERE pending=0 AND data IS NOT NULL AND json_type(data,'$.activity') IS NULL
+      WHERE pending=0 AND data IS NOT NULL AND
+        (json_type(data,'$.activity') IS NULL OR json_type(data,'$.backlog') IS NULL)
       RETURNING name`).toArray();
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
@@ -1705,6 +1707,13 @@ export class Operations {
           "SELECT name,data,pending FROM ops_partitions").toArray()
           .filter(p=>projection.repositories.includes(p.name.split("/").slice(0,2).join("/")));
         return mergeActivity(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),now(),
+          sources.some(p=>p.pending || !p.data));
+      })(),
+      backlog: (() => {
+        const sources = this.sql.exec<{name:string;data:string|null;pending:number}>(
+          "SELECT name,data,pending FROM ops_partitions").toArray()
+          .filter(p=>projection.repositories.includes(p.name.split('/').slice(0,2).join('/')));
+        return mergeBacklogs(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),
           sources.some(p=>p.pending || !p.data));
       })(),
       observer: {

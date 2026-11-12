@@ -777,4 +777,6 @@ test("operations pool activity counts retained facts beyond the public list and 
   const corrected = result.activity.pools.find(p => p.pool === "github");
   assert.equal(corrected.bins.reduce((n,b) => n + b[1],0),1200);
   assert.equal(corrected.builds.running,1);
+  assert.equal(result.backlog.running_jobs,1);
+  assert.equal(result.backlog.pr_builds.in_progress,1);
 });

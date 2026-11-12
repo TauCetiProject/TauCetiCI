@@ -3380,7 +3380,7 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   for(let day=1;day<=3;day++) r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-0'+day,1,clock-86400*day,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date((clock-86400*day)*1000).toISOString()}));
   const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
   let calls=0;
-  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
+  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
   const oldRevision=r.operations.get('jobs_revision')||0;
   new Operations(r.ctx);
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,3);
@@ -3441,4 +3441,22 @@ test("native internal Facts reads may finish after three seconds without a false
   await new Promise(resolve=>setTimeout(resolve,50));
  }
  assert.fail('A valid slow internal source never became visible');
+});
+
+
+test("backlog counts cover all retained partitions and preserve missing-source uncertainty", async t => {
+  const r=runtime(t);await r.send(seed);await r.flush();
+  const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+  const backlog={pr_builds:{...zero,pending:7,oldest_waiting_at:Date.now()/1000-3600},other_workflows:{...zero,stuck:3},waiting_jobs:7,running_jobs:0};
+  for(let n=0;n<205;n++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/'+n,1,Date.now()/1000-n,JSON.stringify({partition:repo+'/'+n,backlog,jobs:[],pending_workflows:[]}));
+  await r.request('/tick');await r.flush();
+  let value=r.object(r.manifest().domains.jobs).backlog;
+  assert.equal(value.repositories[repo].pr_builds.pending,1435);
+  assert.equal(value.repositories[repo].other_workflows.stuck,615);
+  assert.equal(value.coverage,'observed');
+  r.database.prepare('UPDATE ops_partitions SET data=? WHERE name=?').run(JSON.stringify({partition:repo+'/0',jobs:[],pending_workflows:[]}),repo+'/0');
+  r.operations.set('jobs_revision',r.operations.get('jobs_revision')+1);
+  await r.request('/tick');await r.flush();
+  value=r.object(r.manifest().domains.jobs).backlog;
+  assert.equal(value.coverage,'partial');assert.equal(value.repositories[repo].pr_builds.pending,1428);
 });
