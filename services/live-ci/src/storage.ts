@@ -16,6 +16,7 @@ import {
 } from "./model";
 import { call, json, now, type Env } from "./types";
 import { publicJob } from "./operations-jobs";
+import { backlogSnapshot } from "./operations-backlog";
 import { ActivityIndex } from "./operations-activity";
 import { retained } from "./policy";
 const REFRESH_SECONDS = 300;
@@ -508,6 +509,7 @@ export class FactPartition {
       const actualRuns = new Set(jobs.filter(j => j.active).map(j => j.run_id + "/" + j.run_attempt));
       const pendingRuns = runs.filter(r => !actualRuns.has(r.id + "/" + r.attempt));
       return json({ schema: "tauceti.operations.partition/v1", partition: this.meta("partition"), revision: this.meta("operations_revision") || 0,
+        backlog: backlogSnapshot(this.sql, now()),
         received_at: this.meta("operations_received") ? iso(this.meta("operations_received")) : null,
         computed_at: iso(now()), jobs, activity: this.activityIndex().snapshot(now()), pending_workflows_count: pendingRuns.length, pending_workflows: pendingRuns.slice(0, 50).map(r => ({
           repository: r.repo, run_id: r.id, run_attempt: r.attempt, status: r.status, workflow: r.workflow, observed_at: iso(r.updated), url: `https://github.com/${r.repo}/actions/runs/${r.id}` })),
