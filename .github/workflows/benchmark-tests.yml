@@ -8,10 +8,9 @@ permissions:
   contents: read
 jobs:
   harness:
-    # Same complete suite as collector tests. The provisioned Namespace shape
-    # keeps experimental validation independent of the GitHub-hosted queue.
+    # Same complete suite as collector tests on GitHub-hosted capacity.
     # No cache volume, publication secret or status permission is present.
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16-with-features, 'namespace-features:container.privileged=true']
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: TauCetiProject/TauCetiTools
-          ref: 4c7381d3a47fd9b9f7aa786dd2a28c375e36fee6
+          ref: a8b16c3dd0c0730a1963052cb520808e161222ef
           path: .tauceti-tools
           persist-credentials: false
       - name: Use the shared collector
@@ -33,20 +32,5 @@ jobs:
           python -m unittest discover -s tests
       - run: python -m compileall -q collector analysis benchmarks
       - run: bash -n benchmarks/run.sh
-      - uses: actions/checkout@v4
-        with:
-          repository: TauCetiProject/TauCeti
-          ref: 4f1a681d10b8371c56bc49158b0481d18bd949f5
-          path: gate
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: TauCetiProject/TauCeti
-          ref: 4f1a681d10b8371c56bc49158b0481d18bd949f5
-          path: pr
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify complete preparation and sandbox readiness without TauCeti compilation
-        env:
-          HARNESS_SHA: ${{ github.workflow_sha }}
-        run: python3 -m benchmarks.preflight
+      # The Namespace sizing experiment is retired; retain analysis and harness
+      # tests above without provisioning its historical workload on another host.

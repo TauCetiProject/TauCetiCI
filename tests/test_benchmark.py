@@ -79,7 +79,8 @@ class BenchmarkTests(unittest.TestCase):
             summarize(plan(), [{'slot': 'unknown'}])
 
     def test_workflow_has_no_production_writers_and_both_attempt_guards(self):
-        workflow = Path('.github/workflows/runner-benchmark.yml').read_text()
+        self.assertFalse(Path('.github/workflows/runner-benchmark.yml').exists())
+        workflow = Path('benchmarks/runner-benchmark.yml.retired').read_text()
         self.assertNotIn('write', workflow.replace('cache-save or publication authority.', ''))
         self.assertNotIn('secrets.', workflow)
         self.assertNotIn('actions/cache', workflow)

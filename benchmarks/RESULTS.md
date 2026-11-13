@@ -1,3 +1,6 @@
+> The Namespace sizing workflow is retired. Its frozen definition is retained in
+> `runner-benchmark.yml.retired`; the hardware comparison is not rerouted to GitHub hosts.
+
 # Runner experiment 16245
 
 All 18 approved replacement slots are accounted. The earlier unconditional

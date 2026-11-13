@@ -8,9 +8,7 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: services/live-ci
