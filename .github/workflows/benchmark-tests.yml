@@ -8,10 +8,9 @@ permissions:
   contents: read
 jobs:
   harness:
-    # Same complete suite as collector tests. The provisioned Namespace shape
-    # keeps experimental validation independent of the GitHub-hosted queue.
+    # Same complete suite as collector tests on GitHub-hosted capacity.
     # No cache volume, publication secret or status permission is present.
-    runs-on: [nscloud-ubuntu-24.04-amd64-8x16-with-features, 'namespace-features:container.privileged=true']
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
