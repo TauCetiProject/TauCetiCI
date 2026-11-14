@@ -1132,8 +1132,12 @@ export class Operations {
         EXISTS(SELECT 1 FROM ops_job_facts j WHERE j.partition=p.name AND j.active=1))
        ORDER BY COALESCE(json_extract(p.data,'$.computed_at'),''),p.received,p.name LIMIT 2`,
       now(),new Date((now()-86400)*1000).toISOString().slice(0,10)).toArray();
+    // Resolve incomplete workflow accounting before metric-only history.
     const oldest = this.sql.exec<{name:string;revision:number}>(
-      `SELECT p.name,p.revision ${eligible} ORDER BY p.received,p.name LIMIT 3`,now()).toArray();
+      `SELECT p.name,p.revision ${eligible}
+       ORDER BY CASE WHEN COALESCE(json_extract(p.data,'$.backlog.pr_builds.unconfirmed'),0)+
+         COALESCE(json_extract(p.data,'$.backlog.other_workflows.unconfirmed'),0)>0 THEN 0 ELSE 1 END,
+         p.received,p.name LIMIT 3`,now()).toArray();
     const pending = [...hot,...oldest.filter(p=>!hot.some(h=>h.name===p.name))].slice(0,3);
     await Promise.all(
       pending.map(async (p) => {
@@ -1148,9 +1152,12 @@ export class Operations {
           });
           if (!response.ok) throw new Error("Facts unavailable");
           const value: any = await response.json();
+          // Active Facts objects may briefly retain older code during deployment.
+          // Keep the existing source retry until they return current accounting.
           if (
             value.schema !== "tauceti.operations.partition/v1" ||
-            value.partition !== p.name
+            value.partition !== p.name ||
+            (value.backlog && value.backlog.accounting_version !== 2)
           )
             throw new Error("Facts version skew");
           if (

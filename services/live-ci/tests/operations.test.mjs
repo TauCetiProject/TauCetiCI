@@ -3472,3 +3472,24 @@ test('a scheduled refresh does not invalidate already observed backlog facts',as
  assert.equal(value.coverage,'observed');assert.equal(value.repositories[repo].pr_builds.pending,1000);
  assert.equal(value.repositories[repo].waiting_jobs,10);
 });
+
+
+test('quiet unresolved workflows precede metric-only migration and retry older Facts code',async t=>{
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const clock=Date.now()/1000,unknown=repo+'/2026-10-30';
+ const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+ const backlog={accounting_version:2,pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
+ for(let day=1;day<=8;day++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/2026-10-0'+day,1,clock-10000+day,JSON.stringify({backlog}));
+ r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(unknown,1,clock,JSON.stringify({backlog:{...backlog,other_workflows:{...zero,unconfirmed:3}}}));
+ let ready=false;const calls=[];
+ globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{
+  calls.push(partition);return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,jobs:[],pending_workflows:[],backlog:{...backlog,accounting_version:partition===unknown&&!ready?1:2}});
+ }})};
+ await r.operations.collectJobs(r.operations.projection('jobs'));
+ assert.equal(calls[0],unknown,'unresolved workflow accounting comes before older metric-only sources');
+ assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(unknown).pending,1,'an older live object cannot acknowledge an upgraded source');
+ assert.equal(r.database.prepare("SELECT failures FROM ops_failures WHERE id=?").get(unknown).failures,1,'existing source backoff schedules the retry');
+ ready=true;r.advance(11000);await r.operations.collectJobs(r.operations.projection('jobs'));
+ assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(unknown).pending,0,'quiet source finishes without another webhook');
+ assert.equal(r.database.prepare('SELECT count(*) n FROM ops_failures WHERE id=?').get(unknown).n,0);
+});
