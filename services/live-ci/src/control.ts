@@ -235,12 +235,12 @@ export class Control {
             repo, run.id, run.attempt,
           );
       }
-      if (!b.historical && run.status === "completed" && BUILD_WORKFLOWS.has(run.workflow)) {
+      if (!b.historical && (run.status !== "completed" || BUILD_WORKFLOWS.has(run.workflow))) {
         const status = await call(this.env.FACTS, partition, "/status", { id: run.id, attempt: run.attempt });
         const args = { id: run.id, attempt: run.attempt, created: run.created, updated: run.updated };
         if (!repairReason("jobs", status.run, now()) && needsJobs(status))
-          this.enqueue(repo, "jobs", args, now() + 180);
-        if (!repairReason("details", status.run, now()) &&
+          this.enqueue(repo, "jobs", args, now() + (run.status === "completed" ? 180 : 30));
+        if (run.status === "completed" && !repairReason("details", status.run, now()) &&
             !status.run?.telemetry?.coverage && !status.run?.telemetry?.phases?.length)
           this.enqueue(repo, "details", args, now() + 600);
       }
@@ -431,7 +431,7 @@ export class Control {
           n: number;
         }>("SELECT COUNT(*) n FROM attempts WHERE at>?", clock - 3600)
         .one().n;
-    if (used >= Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500))
+    if (used >= Math.min(5000, Number(this.env.GITHUB_HOURLY_BUDGET) || 2000))
       throw new Error("Rolling GitHub request budget exhausted");
     if ((this.get("github_pause") || 0) > clock)
       throw new Error("GitHub quota cooldown");
@@ -443,7 +443,7 @@ export class Control {
       this.set("installation", grant);
       if (
         used + 1 >=
-        Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500)
+        Math.min(5000, Number(this.env.GITHUB_HOURLY_BUDGET) || 2000)
       )
         throw new Error("Rolling GitHub request budget exhausted");
     }
@@ -452,7 +452,7 @@ export class Control {
         .exec<{
           n: number;
         }>("SELECT COUNT(*) n FROM attempts WHERE at>?", now() - 3600)
-        .one().n >= Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500)
+        .one().n >= Math.min(5000, Number(this.env.GITHUB_HOURLY_BUDGET) || 2000)
     )
       throw new Error("Rolling GitHub request budget exhausted");
     if (optional) {
@@ -962,7 +962,7 @@ export class Control {
             String(r.id),
             r.attempt,
           );
-        if (clock - r.updated > 900 && clock - (this.get(key) || 0) > 900) {
+        if (clock - r.updated > 900 && clock - (this.get(key) || 0) > (urgent ? 900 : 3600)) {
           this.enqueue(repo, "run", {
             id: r.id,
             attempt: r.attempt,
@@ -1019,7 +1019,7 @@ export class Control {
             n: number;
           }>("SELECT COUNT(*) n FROM attempts WHERE at>?", now() - 3600)
           .one().n,
-        budget: Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500),
+        budget: Math.min(5000, Number(this.env.GITHUB_HOURLY_BUDGET) || 2000),
         paused_until: this.get("github_pause") || null,
       },
       pending_repairs: this.sql
@@ -1351,11 +1351,12 @@ export class Control {
             WHEN kind='inventory' AND COALESCE(json_extract(args,'$.archival'),0)=0
               AND json_extract(args,'$.status') IS NULL
               AND json_extract(args,'$.until')>=? THEN 0
+            WHEN kind='jobs' THEN 0
             WHEN kind='details' THEN 3
             WHEN COALESCE(json_extract(args,'$.archival'),0)=0 THEN 1 ELSE 2 END,
             CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
             COALESCE(json_extract(args,'$.urgent'),0) DESC,
-            CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 12`,
+            CASE WHEN kind='inventory' THEN -json_extract(args,'$.until') ELSE due END,due LIMIT 40`,
           clock,
           (this.get("detail_requests") || []).filter((at: number) => at > clock - 3600).length < DETAIL_REQUESTS_PER_HOUR ? 1 : 0,
           clock - 1800,
@@ -1639,7 +1640,7 @@ export class Control {
         existing = prior ? JSON.parse(prior.data) : null;
       if (existing) return json(existing);
       const clock = now(),
-        budget = Math.min(500, Number(this.env.GITHUB_HOURLY_BUDGET) || 500),
+        budget = Math.min(5000, Number(this.env.GITHUB_HOURLY_BUDGET) || 2000),
         used = this.sql
           .exec<{
             n: number;

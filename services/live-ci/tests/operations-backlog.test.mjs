@@ -25,7 +25,7 @@ test('pending jobs survive any age; only verified terminal attempts become stuck
   f.run(7,'in_progress');f.job(7,7,'in_progress');
   f.run(8,'queued',{workflow:'.github/workflows/pr-status.yml'});f.verified(8);
   const result=backlogSnapshot(f.sql,clock);
-  assert.deepEqual(result.pr_builds,{pending:1,queued:1,in_progress:1,stuck:2,unconfirmed:2,oldest_waiting_at:clock-10000});
+  assert.deepEqual(result.pr_builds,{pending:1,queued:3,in_progress:1,stuck:2,unconfirmed:0,oldest_waiting_at:clock-10000});
   assert.equal(result.other_workflows.stuck,1);
   assert.equal(result.waiting_jobs,2);assert.equal(result.running_jobs,1);
 });
@@ -33,7 +33,7 @@ test('synthetic placeholders are not real queued jobs; old attempts do not count
   const f=fixture(t);f.run(1);f.job(1,1,'pending',{estimated:true});f.verified(1);
   f.run(2,'pending');f.job(2,2);f.run(2,'completed',{attempt:2});
   const result=backlogSnapshot(f.sql,clock);
-  assert.equal(result.pr_builds.unconfirmed,1);assert.equal(result.pr_builds.stuck,0);assert.equal(result.pr_builds.pending,0);assert.equal(result.waiting_jobs,0);
+  assert.equal(result.pr_builds.unconfirmed,0);assert.equal(result.pr_builds.queued,1);assert.equal(result.pr_builds.stuck,0);assert.equal(result.pr_builds.pending,0);assert.equal(result.waiting_jobs,0);
 });
 test('observed waiting or running jobs take precedence over stale parent workflow state',t=>{
   const f=fixture(t);
@@ -55,4 +55,14 @@ test('counts precede run, job and partition display limits; missing sources stay
   let result=mergeBacklogs(sources,false);assert.equal(result.repositories[repo].pr_builds.pending,1201*205);assert.equal(result.coverage,'observed');
   result=mergeBacklogs([...sources,{partition:repo+'/missing'}],false);assert.equal(result.coverage,'partial');
   assert.equal(mergeBacklogs(sources,true).coverage,'partial');
+});
+
+test('normal GitHub workflow scheduling states are accounted even before jobs exist',t=>{
+ const f=fixture(t);
+ for (const [id,status] of [[1,'queued'],[2,'pending'],[3,'waiting'],[4,'requested'],[5,'in_progress']]) f.run(id,status);
+ const result=backlogSnapshot(f.sql,clock);
+ assert.equal(result.pr_builds.queued,1);assert.equal(result.pr_builds.pending,4);
+ assert.equal(result.pr_builds.unconfirmed,0);assert.equal(result.waiting_jobs,0);
+ assert.equal(result.accounting_version,2);
+ f.run(6,'unknown-status');assert.equal(backlogSnapshot(f.sql,clock).pr_builds.unconfirmed,1);
 });

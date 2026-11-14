@@ -124,7 +124,7 @@ export class Operations {
     // cached partitions through the existing bounded collector to seed activity.
     const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
       WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_type(data,'$.backlog') IS NULL)
+        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2)
       RETURNING name`).toArray();
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
@@ -1674,7 +1674,7 @@ export class Operations {
       computed_at: new Date(now() * 1000).toISOString(),
       received_at: received,
       coverage: facts.length
-        ? partitions.some((p) => p.pending)
+        ? partitions.some((p) => !p.data)
           ? "partial"
           : "observed"
         : "unavailable",
@@ -1714,7 +1714,7 @@ export class Operations {
           "SELECT name,data,pending FROM ops_partitions").toArray()
           .filter(p=>projection.repositories.includes(p.name.split('/').slice(0,2).join('/')));
         return mergeBacklogs(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),
-          sources.some(p=>p.pending || !p.data));
+          sources.some(p=>!p.data));
       })(),
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
@@ -1744,7 +1744,7 @@ export class Operations {
         "tauceti.operations.workflow-page/v1",
         facts.flatMap((p) => p.pending_workflows).slice(0, 1000),
       ),
-      partition_errors: partitions.filter((p) => p.pending).map((p) => p.name),
+      partition_errors: partitions.filter((p) => !p.data).map((p) => p.name),
       github_budget: context?.github_budget || null,
     };
     return {

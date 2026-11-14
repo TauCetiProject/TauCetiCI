@@ -38,6 +38,8 @@ export function compactEvent(event: any): any {
 export function needsJobs(status: any): boolean {
   const run = status.run;
   if (!run) return true;
+  if (run.status !== 'completed')
+    return !status.verified && !status.job_rows.some((j: any) => !j.estimated && j.status !== 'completed');
   if (status.verified || ['skipped', 'cancelled'].includes(run.conclusion)) return false;
   return !status.jobs || status.job_rows.some((j: any) => j.status !== 'completed') ||
     (run.workflow === WORKFLOW && !status.job_rows.some((j: any) => j.name === 'sandboxed-build'));
@@ -47,7 +49,7 @@ export function repairReason(kind: string, run: Run | undefined, clock: number):
   if (!run) return null;
   if (!retained(run, clock)) return 'outside raw fact retention';
   if (kind === 'members') return run.created < clock - 30 * DAY ? 'outside staging chart window' : null;
-  if (kind === 'run') return null;
+  if (kind === 'run' || kind === 'jobs' && run.status !== 'completed') return null;
   if (!BUILD_WORKFLOWS.has(run.workflow)) return 'auxiliary jobs use webhook observations';
   if (run.updated < clock - recoveryLifetime) return 'recovery expired after 24 hours';
   if (kind === 'details') {
