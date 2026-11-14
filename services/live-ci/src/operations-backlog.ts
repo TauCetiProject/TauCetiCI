@@ -30,13 +30,14 @@ export function backlogSnapshot(sql: SqlStorage, clock: number) {
     else if (row.running_jobs > 0) target.in_progress++;
     else if (['pending', 'waiting', 'requested'].includes(run.status) ||
         run.status === 'in_progress' && row.actual_jobs > 0) target.pending++;
-    else if (row.actual_jobs > 0 && run.status === 'queued') target.queued++;
+    else if (run.status === 'queued') target.queued++;
+    else if (run.status === 'in_progress') target.pending++;
     else target.unconfirmed++;
     if (!settled && row.running_jobs === 0 && (['pending', 'waiting', 'requested'].includes(run.status) ||
         ['queued', 'in_progress'].includes(run.status) && row.actual_jobs > 0) && run.created > 0)
       target.oldest_waiting_at = Math.min(target.oldest_waiting_at ?? run.created, run.created);
   }
-  return counts;
+  return { ...counts, accounting_version: 2 };
 }
 
 export function mergeBacklogs(partitions: any[], pending: boolean) {

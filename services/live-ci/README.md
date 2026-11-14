@@ -82,12 +82,14 @@ mappings are pruned after the longest supported raw-fact window. Late events
 outside these windows do not reopen historical collection.
 
 Job webhooks supply the normal freshness path. Inventory discovers missing runs;
-only missing/nonterminal build jobs require enumeration. Auxiliary job history
-is observed through webhooks, with gaps left explicit. Job and optional-detail
-recovery expires 24 hours after the run's last update. Successful PR builds have
+missing jobs for unfinished workflows are enumerated regardless of workflow type
+or age. A verified empty enumeration is invalidated when the workflow changes
+scheduling state. Auxiliary terminal job history remains webhook-only; historical
+build-job and optional-detail enrichment expire 24 hours after the last update. Successful PR builds have
 phase artifacts sampled one in twenty, with means divided by the sampled count; recent failed PR builds can receive log
 classification. Optional enrichment has its own 60-request rolling hourly cap
-within the existing 500-request total. Current state repairs take precedence.
+within the dedicated monitor App's 2,000-request rolling hourly allowance. Unchanged waiting-workflow metadata
+is rechecked hourly; running-job metadata retains its fifteen-minute backstop. Current state repairs take precedence.
 Unresolved parent attempts expire after 24 hours from admission; retries and
 re-enqueueing cannot renew that lifetime. Protected health reports this admission
 time separately from retry deadlines. Satisfied and retired repair entries are
@@ -311,7 +313,7 @@ the browser keeps the site's complete static charts until bootstrap sends its
 completion checkpoint. Import prioritizes recent runs and overlaps four event
 deliveries at a time; it consumes no GitHub quota. Current inventory and missing
 run metadata take priority over older job and detail repairs within the same
-500-request rolling budget.
+2,000-request rolling budget.
 Current inventory and stale active runs also precede old inventory pages, so
 initial catch-up cannot starve activity reconciliation.
 

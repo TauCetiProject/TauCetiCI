@@ -652,6 +652,8 @@ export class FactPartition {
             run.members = old.members;
           if (b.telemetry && validTelemetry(b.telemetry))
             run.telemetry = b.telemetry;
+          if (old && old.status !== run.status && run.status !== 'completed')
+            this.sql.exec("DELETE FROM meta WHERE key=?", `verified/${run.id}/${run.attempt}`);
           if (b.verified_jobs)
             this.set(`verified/${run.id}/${run.attempt}`, true);
           if (JSON.stringify(run) !== previous) {

@@ -1442,3 +1442,26 @@ test('workflow-only metadata does not compete with real running jobs for urgent 
   assert.equal(repairs.find(v=>v.args.id==='91002').args.urgent,true);
   assert.equal(r.github(),0);
 });
+
+
+test('unfinished auxiliary workflows receive job recovery even after historical enrichment expires',async t=>{
+ const key=generateKeyPairSync('rsa',{modulusLength:2048}).privateKey.export({format:'pem',type:'pkcs8'});
+ const reads=[];
+ const active={...run('94001'),path:'.github/workflows/labels-from-comments.yml',status:'queued',conclusion:null,
+   created_at:iso(clock-3*86400),updated_at:iso(clock-3*86400)};
+ const r=await runtime(t,{GITHUB_APP_ID:'1',GITHUB_INSTALLATION_ID:'2',GITHUB_PRIVATE_KEY:key},req=>{
+  const u=new URL(req.url);if(u.pathname.endsWith('/access_tokens'))return Response.json({token:'test',expires_at:iso(clock+3600)});
+  reads.push(u.pathname);
+  if(u.pathname.endsWith('/attempts/1/jobs'))return Response.json({total_count:1,jobs:[{...job('95001','94001'),name:'label',status:'queued',conclusion:null,started_at:null,completed_at:null,runner_id:null}]});
+  return Response.json({total_count:0,workflow_runs:[]});
+ });
+ await r.ingest({run:active});
+ const queued=await r.post('/repairs',{kind:'jobs'});assert.equal(queued.length,1);
+ const factNs=await r.mf.getDurableObjectNamespace('FACTS');
+ const fact=factNs.get(factNs.idFromName(repo+'/'+active.created_at.slice(0,10)));
+ await r.post('/repair',{repo,kind:'jobs',args:{id:'94001',attempt:1}});
+ await r.post('/tick');
+ const current=await(await fact.fetch('https://internal/status',{method:'POST',body:JSON.stringify({id:'94001',attempt:1})})).json();
+ assert.equal(current.job_rows.length,1);assert.equal(current.job_rows[0].name,'label');
+ assert.ok(reads.some(p=>p.endsWith('/attempts/1/jobs')));
+});

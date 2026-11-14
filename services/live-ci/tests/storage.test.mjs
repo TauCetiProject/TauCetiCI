@@ -780,3 +780,12 @@ test("operations pool activity counts retained facts beyond the public list and 
   assert.equal(result.backlog.running_jobs,1);
   assert.equal(result.backlog.pr_builds.in_progress,1);
 });
+
+test('an empty job enumeration is invalidated when a live workflow advances',async t=>{
+ const f=fixture(t,0);
+ assert.equal((await post(f.fact,'/verified',{id:'100',attempt:1})).verified,true);
+ assert.equal((await post(f.fact,'/status',{id:'100',attempt:1})).verified,true);
+ await post(f.fact,'/event',{repo:f.run.repo,partition:f.fact.meta('partition'),delivery:'pending-next-job',
+  run:rawRun(f.run,{status:'pending',updated_at:new Date((f.run.updated+1)*1000).toISOString()})});
+ assert.equal((await post(f.fact,'/status',{id:'100',attempt:1})).verified,false);
+});

@@ -17,7 +17,7 @@ class SetupTests(unittest.TestCase):
         config = json.loads((SERVICE / "wrangler.json").read_text())
         self.assertEqual(config["account_id"], setup.ACCOUNT)
         self.assertEqual(config["vars"]["PUBLICATION_MODE"], "shadow")
-        self.assertEqual(config["vars"]["GITHUB_HOURLY_BUDGET"], "500")
+        self.assertEqual(config["vars"]["GITHUB_HOURLY_BUDGET"], "2000")
 
     def test_prepare_preserves_credentials_and_uses_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

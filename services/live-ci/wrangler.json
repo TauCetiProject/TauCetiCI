@@ -13,7 +13,7 @@
   "vars": {
     "PUBLIC_ORIGIN": "https://taucetiproject.org",
     "PUBLICATION_MODE": "shadow",
-    "GITHUB_HOURLY_BUDGET": "500",
+    "GITHUB_HOURLY_BUDGET": "2000",
     "ALLOWED_REPOSITORIES": "[]",
     "OPERATIONS_PUBLIC_REPOSITORIES": "[]"
   },

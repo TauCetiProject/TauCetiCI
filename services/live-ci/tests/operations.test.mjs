@@ -3380,7 +3380,7 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   for(let day=1;day<=3;day++) r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-0'+day,1,clock-86400*day,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date((clock-86400*day)*1000).toISOString()}));
   const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
   let calls=0;
-  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
+  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:2,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
   const oldRevision=r.operations.get('jobs_revision')||0;
   new Operations(r.ctx);
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,3);
@@ -3459,4 +3459,16 @@ test("backlog counts cover all retained partitions and preserve missing-source u
   await r.request('/tick');await r.flush();
   value=r.object(r.manifest().domains.jobs).backlog;
   assert.equal(value.coverage,'partial');assert.equal(value.repositories[repo].pr_builds.pending,1428);
+});
+
+
+test('a scheduled refresh does not invalidate already observed backlog facts',async t=>{
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+ const backlog={accounting_version:2,pr_builds:{...zero,pending:1000},other_workflows:zero,waiting_jobs:10,running_jobs:2};
+ r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/fresh',1,Date.now()/1000,
+  JSON.stringify({partition:repo+'/fresh',backlog,jobs:[],pending_workflows:[]}));
+ const value=r.object(await r.operations.jobsView(r.operations.projection('jobs'))).backlog;
+ assert.equal(value.coverage,'observed');assert.equal(value.repositories[repo].pr_builds.pending,1000);
+ assert.equal(value.repositories[repo].waiting_jobs,10);
 });
