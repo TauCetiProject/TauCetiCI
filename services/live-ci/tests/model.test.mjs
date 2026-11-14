@@ -87,8 +87,10 @@ test("fleet reporting aliases retain identity and contribute separate totals", (
   const cases = [
     ["eastanglia", ["self-hosted", "fleet-4fab2fed9a5145f894d066c7bb28ace4"]],
     ["leanfro", ["self-hosted", "fleet-11e2756fc11042d798f759410573a935"]],
+    ["leanfro", ["self-hosted", "fleet-74773fc7f54d4877add11d80113fe340"]],
     ["eastanglia", ["self-hosted", "fleet-host-chris-server"]],
     ["leanfro", ["self-hosted", "fleet-host-tauchonki"]],
+    ["leanfro", ["self-hosted", "fleet-host-tauchonki2"]],
     ["self-hosted", ["self-hosted", "fleet-unknown"]],
     ["self-hosted", ["self-hosted", "fleet-host-chris-server", "fleet-host-tauchonki"]],
   ];
@@ -105,6 +107,7 @@ test("fleet reporting aliases retain identity and contribute separate totals", (
     assert.equal(summary.fleet[0].running[alias], 0.4);
   }
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-11e2756fc110-0123456789abcdef" }).kind, "leanfro");
+  assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-74773fc7f54d-0123456789abcdef" }).kind, "leanfro");
   for (const label of ["fleet-constructor", "fleet-host-__proto__", "fleet-host-toString"])
     assert.equal(m.reportingKind("self-hosted", [label]), "self-hosted");
 });

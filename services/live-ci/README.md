@@ -179,7 +179,7 @@ Pass its returned `cursor` until null; retries cannot duplicate totals. These
 authenticated maintenance operations do not read GitHub. After a historical
 repair, a bootstrap completion checkpoint requests a fresh chart generation.
 
-Fleet hosts are reported as `eastanglia` (Chris) and `leanfro` (tauchonki).
+Fleet hosts are reported as `eastanglia` (Chris) and `leanfro` (tauchonki and tauchonki2).
 Aliases come from permanent machine labels, broker host labels, or the runner
 name; they do not change dispatch names or policy. Unidentified self-hosted jobs
 remain in `self-hosted`. Older stored jobs without retained identity evidence
