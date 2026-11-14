@@ -1351,7 +1351,7 @@ export class Control {
             WHEN kind='inventory' AND COALESCE(json_extract(args,'$.archival'),0)=0
               AND json_extract(args,'$.status') IS NULL
               AND json_extract(args,'$.until')>=? THEN 0
-            WHEN kind='jobs' THEN 1
+            WHEN kind='jobs' THEN 0
             WHEN kind='details' THEN 3
             WHEN COALESCE(json_extract(args,'$.archival'),0)=0 THEN 1 ELSE 2 END,
             CASE kind WHEN 'inventory' THEN 0 WHEN 'run' THEN 1 WHEN 'jobs' THEN 2 ELSE 3 END,
