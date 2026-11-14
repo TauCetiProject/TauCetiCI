@@ -79,7 +79,8 @@ export const rank = (status: string) =>
   status === "completed" ? 3 : status === "in_progress" ? 2 : 1;
 // Public report aliases only; fleet credentials, admission and dispatch keep
 // their permanent identities and operator names. Unknown hosts stay separate.
-const fleetNames: Record<string, string> = Object.fromEntries(RUNNER_HOSTS.map(h => [h.machine_id, h.alias]));
+const fleetNames: Record<string, string> = Object.fromEntries(RUNNER_HOSTS.flatMap(h =>
+  [h.machine_id, ...(h.additional_machine_ids || [])].map(id => [id, h.alias])));
 const hostNames: Record<string, string> = Object.fromEntries(RUNNER_HOSTS.flatMap(h => h.aliases.map(a => [a, h.alias])));
 export const RUNNERS = ["github", "namespace", ...RUNNER_HOSTS.map(h => h.alias), "self-hosted"];
 export const runnerLabel = (kind: string) => ({

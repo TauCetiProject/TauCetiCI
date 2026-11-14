@@ -9,9 +9,10 @@ export const RUNNER_HOSTS = [
   },
   {
     machine_id: "11e2756fc11042d798f759410573a935",
+    additional_machine_ids: ["74773fc7f54d4877add11d80113fe340"],
     alias: "leanfro",
     label: "Tauchonki / leanfro",
-    aliases: ["tauchonki"],
+    aliases: ["tauchonki", "tauchonki2"],
   },
   {
     machine_id: "a26dbb02840844f1a72450e8cc29ea28",
