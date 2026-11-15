@@ -35,6 +35,10 @@ export async function verifyProgress(token: string, env: Env): Promise<any> {
       c.repository_visibility === "public" &&
       (c.workflow_ref ===
         `${c.repository}/.github/workflows/pr-build.yml@refs/heads/main` ||
+        (c.event_name === "repository_dispatch" &&
+          c.ref === "refs/heads/main" &&
+          c.workflow_ref ===
+            `${c.repository}/.github/workflows/source-candidate.yml@refs/heads/main`) ||
         (c.event_name === "merge_group" &&
           typeof c.ref === "string" &&
           /^refs\/heads\/gh-readonly-queue\/main\/[A-Za-z0-9_./-]{1,200}$/.test(

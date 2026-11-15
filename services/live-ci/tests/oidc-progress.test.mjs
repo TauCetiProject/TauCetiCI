@@ -98,3 +98,23 @@ test("native merge-group progress is restricted to its signed main-queue ref", a
     ),
   );
 });
+
+test("source-candidate progress accepts only the protected main dispatch workflow", async () => {
+  const claims = {
+    ...base,
+    event_name: "repository_dispatch",
+    ref: "refs/heads/main",
+    workflow_ref: repo + "/.github/workflows/source-candidate.yml@refs/heads/main",
+  };
+  assert.equal((await verifyProgress(token(claims), env)).check_run_id, "555");
+  for (const patch of [
+    { event_name: "pull_request_target" },
+    { event_name: "workflow_dispatch" },
+    { ref: "refs/heads/untrusted" },
+    { workflow_ref: repo + "/.github/workflows/source-candidate.yml@refs/heads/untrusted" },
+    { repository: "Other/Repo" },
+    { check_run_id: undefined },
+  ]) {
+    await assert.rejects(verifyProgress(token({ ...claims, ...patch }), env));
+  }
+});
