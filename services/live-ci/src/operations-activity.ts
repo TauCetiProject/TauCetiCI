@@ -5,11 +5,17 @@ const BACKFILL_PAGE = 100;
 const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
-  running: 0, waiting: 0,
+  running: 0, waiting: 0, stale_waiting: 0,
   latest_completion: null as any,
   oldest_running: null as any,
   oldest_waiting: null as any,
+  oldest_stale_waiting: null as any,
 });
+/** A live job does not stay queued for 24 hours: GitHub cancels self-hosted
+ * jobs queued that long. An unassigned job older than this is a GitHub-side
+ * record that will never start (a known "zombie"). It is counted separately so
+ * that it does not read as live demand. */
+export const STALE_WAITING_SECONDS = 86400;
 const earlier = (a: any, b: any, field: string) => {
   if (!a || !Number.isFinite(Date.parse(b[field]))) return b;
   if (!Number.isFinite(Date.parse(a[field]))) return a;
@@ -83,21 +89,25 @@ export class ActivityIndex {
       pool: r.pool, all: activityScope(), builds: activityScope(), bins: [] as number[][],
     }));
     const byPool = new Map(pools.map(p => [p.pool, p]));
-    const active = this.sql.exec<any>(`SELECT pool,build,running,COUNT(*) n FROM ops_activity
-      WHERE active=1 GROUP BY pool,build,running`).toArray();
+    const staleBefore = clock - STALE_WAITING_SECONDS;
+    const active = this.sql.exec<any>(`SELECT pool,build,running,
+      CASE WHEN running=0 AND created<? THEN 1 ELSE 0 END stale,COUNT(*) n FROM ops_activity
+      WHERE active=1 GROUP BY pool,build,running,stale`, staleBefore).toArray();
     for (const row of active) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
-        scope[row.running ? "running" : "waiting"] += row.n;
+        scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
     for (const pool of pools) for (const [scope, build] of [[pool.all, false], [pool.builds, true]] as const) {
       const extra = build ? " AND build=1" : "";
       for (const [field, condition, order] of [
         ["oldest_running", "active=1 AND running=1", "started ASC,created ASC"],
-        ["oldest_waiting", "active=1 AND running=0", "created ASC"],
+        ["oldest_waiting", "active=1 AND running=0 AND (created IS NULL OR created>=?)", "created ASC"],
+        ["oldest_stale_waiting", "active=1 AND running=0 AND created<?", "created ASC"],
       ]) {
+        const bound = condition.includes("?") ? [staleBefore] : [];
         const row = this.sql.exec<any>(`SELECT ref FROM ops_activity WHERE pool=?${extra} AND ${condition} ORDER BY ${order},id LIMIT 1`,
-          pool.pool).toArray()[0];
+          pool.pool, ...bound).toArray()[0];
         (scope as any)[field] = row ? JSON.parse(row.ref) : null;
       }
       for (const kind of build ? [1] : [0, 1]) {
@@ -129,9 +139,12 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
     for (const name of ["all", "builds"]) {
       const scope = pool[name], incoming = row[name];
       scope.running += incoming.running; scope.waiting += incoming.waiting;
+      scope.stale_waiting += incoming.stale_waiting || 0;
       if (incoming.latest_completion) scope.latest_completion = later(scope.latest_completion, incoming.latest_completion, "completed_at");
       if (incoming.oldest_running) scope.oldest_running = earlier(scope.oldest_running, incoming.oldest_running, "started_at");
       if (incoming.oldest_waiting) scope.oldest_waiting = earlier(scope.oldest_waiting, incoming.oldest_waiting, "created_at");
+      if (incoming.oldest_stale_waiting)
+        scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_stale_waiting, "created_at");
       scope.windows ||= WINDOWS.map(seconds => ({ seconds, finished: 0, success: 0, failure: 0, cancelled: 0, skipped: 0, other: 0 }));
       for (const bin of row.bins) for (const window of scope.windows) {
         if (bin[0] < through - window.seconds || bin[0] >= through) continue;
