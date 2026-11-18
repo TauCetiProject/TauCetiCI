@@ -55,6 +55,18 @@ const fields: Record<Collection, string> = {
     "id kind batch_id batch_version state resolution ci_attempt_id created_at resolved_at progress",
   events: "id at kind batch_id",
 };
+// Optional while older queue publishers still omit them; every supplied field is still validated.
+const optionalFields: Record<Collection, string> = {
+  batches: "sealed",
+  inputs: "",
+  members: "",
+  attempts:
+    "sent_at dispatch_retry_at request_id dispatch_state dispatch_error dispatch_retryable",
+  tasks: "task_binding identity_coverage",
+  events: "",
+};
+const hex32 = /^[0-9a-f]{32}$/;
+const hex64 = /^[0-9a-f]{64}$/;
 const idFields = new Set(["id", "pr", "batch_id", "run_id", "ci_attempt_id"]);
 const shaFields = new Set([
   "base",
@@ -74,7 +86,14 @@ const numberFields = new Set([
   "position",
   "run_attempt",
 ]);
-const booleanFields = new Set(["empty", "removed", "no_repair", "withdrawn", "sealed"]);
+const booleanFields = new Set([
+  "empty",
+  "removed",
+  "no_repair",
+  "withdrawn",
+  "sealed",
+  "dispatch_retryable",
+]);
 
 export function object(
   value: any,
@@ -153,13 +172,44 @@ function link(value: any, repositories: string[]) {
   )
     throw new Error("Invalid public link identity");
 }
+/** A qualified repository identity as `tauceti_tools.ci_candidate.RepositoryIdentity.record()`. */
+function repositoryIdentity(value: any) {
+  object(value, "forge id name");
+  object(value.forge, "kind url");
+  if (!["github", "forgejo"].includes(value.forge.kind))
+    throw new Error("Invalid forge");
+  string(value.forge.url, 200);
+  const url = new URL(value.forge.url);
+  if (url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username || url.password)
+    throw new Error("Invalid forge origin");
+  integer(value.id, 1);
+  string(value.name, 200);
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.name))
+    throw new Error("Invalid repository name");
+}
+/** A task's qualified source/execution binding (`tauceti_queue.task_identity.TaskBinding.record()`). */
+function taskBinding(value: any) {
+  if (value === null) return;
+  object(value, "schema source execution policy_digest queue_epoch");
+  for (const key of ["schema", "source", "execution", "policy_digest", "queue_epoch"])
+    if (!Object.hasOwn(value, key)) throw new Error("Missing task binding field");
+  if (value.schema !== "tauceti-queue.task-binding/v1")
+    throw new Error("Invalid task binding schema");
+  repositoryIdentity(value.source);
+  repositoryIdentity(value.execution);
+  if (value.source.forge.kind !== "forgejo" || value.execution.forge.kind !== "github")
+    throw new Error("Invalid task binding forges");
+  if (typeof value.policy_digest !== "string" || !hex64.test(value.policy_digest))
+    throw new Error("Invalid task binding policy");
+  if (typeof value.queue_epoch !== "string" || !hex32.test(value.queue_epoch))
+    throw new Error("Invalid task binding epoch");
+}
 export function record(
   collection: Collection,
   value: any,
   repositories: string[],
 ) {
-  // Optional while older queue publishers still omit the membership seal.
-  object(value, fields[collection] + (collection === "batches" ? " sealed" : ""));
+  object(value, fields[collection] + " " + optionalFields[collection]);
   if (fields[collection].split(" ").some((key) => !Object.hasOwn(value, key)))
     throw new Error("Missing public field");
   identity(value.id);
@@ -247,7 +297,15 @@ export function record(
           if (!Number.isFinite(item.cost[k]) || item.cost[k] < 0)
             throw new Error("Invalid recorded cost");
       }
-    } else if (key.endsWith("_at") || key === "at") stamp(item);
+    } else if (key === "task_binding") taskBinding(item);
+    else if (key === "identity_coverage") {
+      // The publisher reports a binding it could not parse instead of guessing at one.
+      if (item !== "invalid" || value.task_binding !== null)
+        throw new Error("Invalid task identity coverage");
+    } else if (key === "request_id") string(item, 64);
+    else if (key === "dispatch_state") string(item, 32);
+    else if (key === "dispatch_error") string(item, 100);
+    else if (key.endsWith("_at") || key === "at") stamp(item);
     else if (key === "repository") repository(item, repositories);
     else if (key.endsWith("_url") || key === "url") link(item, repositories);
     else if (key === "labels") {
