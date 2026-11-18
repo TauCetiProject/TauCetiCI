@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { createHmac, generateKeyPairSync } from "node:crypto";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { build } from "esbuild";
-import { includeDedicatedFleet } from "./dedicated-reference.mjs";
+import { atRecentDay, includeDedicatedFleet } from "./dedicated-reference.mjs";
 const repo = "TauCetiProject/TauCeti";
 const clock = Math.floor(Date.now() / 1000),
   date = new Date((clock - 300) * 1000).toISOString().slice(0, 10);
@@ -1303,7 +1303,7 @@ test("orphaned inbox writes recover and duplicate queue messages find the archiv
 });
 test("SQL projections match archived production metrics and timeline bins", async (t) => {
   const r = await runtime(t),
-    f = includeDedicatedFleet(JSON.parse(readFileSync("tests/reference.json", "utf8")));
+    f = atRecentDay(includeDedicatedFleet(JSON.parse(readFileSync("tests/reference.json", "utf8"))));
   for (const [i, event] of f.events.entries())
     await r.ingest({ ...event, delivery: "fixture/" + i });
   const ns = await r.mf.getDurableObjectNamespace("DAYS"),
