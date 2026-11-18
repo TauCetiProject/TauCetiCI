@@ -364,3 +364,10 @@ retry/splitting machinery, remains below urgent active-run repair in priority,
 and does not enumerate job details. Short filtered pages do not establish the
 end of an inventory. Observed waiting/running jobs take precedence when their
 parent workflow state lags.
+
+Queue attempts may include the controller's dispatch metadata (`sent_at`, `dispatch_retry_at`,
+`request_id`, `dispatch_state`, `dispatch_error`, `dispatch_retryable`), and tasks a qualified
+`task_binding` (`tauceti-queue.task-binding/v1`: Forgejo source, GitHub execution, policy digest
+and queue epoch). A publisher that cannot parse a task's stored binding sends `task_binding: null`
+with `identity_coverage: "invalid"`. Older publishers may omit all of these fields; ingestion
+retains strict validation of every supplied field.

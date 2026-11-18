@@ -605,6 +605,78 @@ test("sealing fields reject untyped flags and invalid thresholds before committi
   assert.equal((await r.send(frame)).committed, true);
 });
 
+const boundTask = (extra = {}) => ({
+  collection: "tasks",
+  id: "7",
+  value: {
+    id: "7",
+    kind: "repair",
+    batch_id: "1",
+    batch_version: 1,
+    state: "open",
+    resolution: "",
+    ci_attempt_id: null,
+    created_at: "2026-11-18T00:00:00Z",
+    resolved_at: null,
+    progress: { coverage: "unavailable", observed_at: null },
+    ...extra,
+  },
+});
+const binding = {
+  schema: "tauceti-queue.task-binding/v1",
+  source: { forge: { kind: "forgejo", url: "https://git.example" }, id: 1, name: repo },
+  execution: { forge: { kind: "github", url: "https://github.com" }, id: 2, name: repo },
+  policy_digest: "8".repeat(64),
+  queue_epoch: "d".repeat(32),
+};
+const dispatch = {
+  sent_at: "2026-11-18T00:13:29Z",
+  dispatch_retry_at: null,
+  request_id: "88b273176cd110dc98057acb395109af",
+  dispatch_state: "accepted",
+  dispatch_error: "",
+  dispatch_retryable: true,
+};
+
+test("dispatch metadata and qualified task bindings from current publishers are accepted", async (t) => {
+  const r = runtime(t), frame = r.next(1);
+  Object.assign(frame.changes.find((c) => c.collection === "attempts").value, dispatch);
+  frame.changes.push(boundTask({ task_binding: binding }));
+  frame.changes.push({ ...boundTask({ task_binding: null, identity_coverage: "invalid" }), id: "8" });
+  frame.changes.at(-1).value.id = "8";
+  assert.equal((await r.send(frame)).committed, true);
+  const next = r.next(2);
+  next.base = { epoch: 1, sequence: 1 };
+  // An older publisher remains accepted without the new optional fields.
+  assert.equal((await r.send(next)).committed, true);
+});
+
+test("dispatch metadata and task bindings reject untyped or unqualified values before committing", async (t) => {
+  const r = runtime(t);
+  for (const [key, value] of [
+    ["dispatch_retryable", "true"],
+    ["request_id", "x".repeat(65)],
+    ["dispatch_state", 3],
+    ["sent_at", "yesterday"],
+  ]) {
+    const frame = r.next(1);
+    Object.assign(frame.changes.find((c) => c.collection === "attempts").value, dispatch, { [key]: value });
+    await r.send(frame, 400);
+  }
+  for (const extra of [
+    { task_binding: { ...binding, secret: "x" } },
+    { task_binding: { ...binding, source: binding.execution, execution: binding.source } },
+    { task_binding: { ...binding, policy_digest: "nothex" } },
+    { task_binding: binding, identity_coverage: "invalid" },
+    { task_binding: null, identity_coverage: "observed" },
+    { task_binding: "binding" },
+  ]) {
+    const frame = r.next(1);
+    frame.changes.push(boundTask(extra));
+    await r.send(frame, 400);
+  }
+});
+
 test("repair build observations retain numeric progress separately from phase age and reject private log fields", async (t) => {
   const r = runtime(t),
     frame = structuredClone(seed);
