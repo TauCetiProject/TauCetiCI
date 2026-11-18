@@ -47,6 +47,18 @@ test('oldest running uses actual starts, waiting uses creation, and references l
  const p=pool(merged(r));assert.equal(p.builds.running,2);assert.equal(p.builds.waiting,1);assert.equal(p.builds.oldest_running.id,'102');assert.equal(p.builds.oldest_waiting.id,'100');
  assert.equal(p.builds.oldest_running.url,'https://github.com/TauCetiProject/TauCeti/actions/runs/100/job/102');
 });
+test('jobs queued longer than GitHub keeps them are counted as stale, not as waiting demand',t=>{
+ const a=runtime(t),b=runtime(t);a.ready();b.ready();
+ a.index.record(run,job(100,{status:'queued',assigned:false,created:clock-7*86400,started:clock-7*86400,completed:null}),1);
+ a.index.record(run,job(101,{status:'queued',assigned:false,created:clock-3600,started:clock-3600,completed:null}),1);
+ b.index.record(run,job(102,{status:'queued',assigned:false,created:clock-2*86400,started:clock-2*86400,completed:null}),1);
+ b.index.record(run,job(103,{status:'in_progress',created:clock-3*86400,started:clock-60,completed:null}),1);
+ const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock,false));
+ assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,2);assert.equal(p.builds.running,1);
+ assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
+ const legacy=pool(mergeActivity([{activity:{...a.snapshot(),pools:a.snapshot().pools.map(q=>({...q,builds:{...q.builds,stale_waiting:undefined},all:{...q.all,stale_waiting:undefined}}))}}],clock,false));
+ assert.equal(legacy.builds.stale_waiting,0);assert.equal(legacy.builds.waiting,1);
+});
 test('backfill is bounded, restartable and partial until every retained fact is indexed',t=>{
  const r=runtime(t);for(let i=0;i<1201;i++){const j=job(10000+i);r.sql.exec('INSERT INTO jobs VALUES (?,?,?,?,?)',j.id,j.run,1,0,JSON.stringify(j));}
  r.index.backfill(()=>run);assert.equal(r.sql.exec('SELECT count(*) n FROM ops_activity').one().n,100);assert.equal(merged(r).coverage,'partial');
