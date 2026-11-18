@@ -109,6 +109,8 @@ test("fleet reporting aliases retain identity and contribute separate totals", (
     assert.equal(summary.fleet[0].running[alias], 0.4);
   }
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-11e2756fc110-0123456789abcdef" }).kind, "leanfro");
+  assert.equal(m.normalizeJob({ name: "pr-build / sandboxed-build" }).name, m.BUILD);
+  assert.equal(m.normalizeJob({ name: "candidate / sandboxed-build" }).name, "candidate / sandboxed-build");
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-74773fc7f54d-0123456789abcdef" }).kind, "leanfro");
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-4a6a55361a14-0123456789abcdef" }).kind, "leanfro");
   assert.equal(m.normalizeJob({ labels: ["self-hosted"], runner_name: "fleet-deba2307649d-0123456789abcdef" }).kind, "leanfro");

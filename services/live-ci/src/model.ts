@@ -173,7 +173,9 @@ export function normalizeJob(j: any): Job {
     id: String(j.id ?? j.job_id),
     run: String(j.run_id),
     attempt: Number(j.run_attempt || 1),
-    name: String(j.name || ""),
+    // TauCeti's pr-build.yml calls TauCetiTools' reusable pr-build from a job named
+    // `pr-build`, so GitHub reports its jobs as `pr-build / <job>`. Keep the job names.
+    name: String(j.name || "").replace(/^pr-build \/ /, ""),
     status: j.status || (j.conclusion ? "completed" : "queued"),
     conclusion: j.conclusion || null,
     created: time(j.created_at),
