@@ -28,3 +28,30 @@ export function includeDedicatedFleet(fixture) {
   fixture.fleet.queued["self-hosted"] = queued;
   return fixture;
 }
+
+/**
+ * The same fixture moved forward by whole days so its day is two days ago. Ingestion drops jobs
+ * from partitions more than 30 days old, so replaying the archived day unshifted stops exercising
+ * the projections once it ages past that window. Whole-day shifts keep every bin and total.
+ */
+export function atRecentDay(fixture, now = Date.now()) {
+  const DAY = 86400;
+  const target = Math.floor(now / 1000 / DAY) * DAY - 2 * DAY;
+  const offset = target - Date.parse(fixture.day + "T00:00:00Z") / 1000;
+  const iso = /^\d{4}-\d\d-\d\dT[\d:.]+Z$/;
+  const shift = (value, key) => {
+    if (Array.isArray(value)) return value.map((v) => shift(v, key));
+    if (value && typeof value === "object")
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, shift(v, k)]));
+    if (typeof value === "string" && iso.test(value))
+      return new Date(Date.parse(value) + offset * 1000).toISOString().replace(".000Z", "Z");
+    if (key === "start" && typeof value === "number") return value + offset;
+    return value;
+  };
+  return {
+    ...fixture,
+    day: new Date(target * 1000).toISOString().slice(0, 10),
+    events: shift(fixture.events),
+    fleet: { ...fixture.fleet, since: fixture.fleet.since + offset },
+  };
+}
