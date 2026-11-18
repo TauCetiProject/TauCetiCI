@@ -16,8 +16,22 @@ class SetupTests(unittest.TestCase):
     def test_config_is_parseable_and_resources_use_the_tauceti_account(self):
         config = json.loads((SERVICE / "wrangler.json").read_text())
         self.assertEqual(config["account_id"], setup.ACCOUNT)
-        self.assertEqual(config["vars"]["PUBLICATION_MODE"], "shadow")
         self.assertEqual(config["vars"]["GITHUB_HOURLY_BUDGET"], "2000")
+
+    def test_plain_deploy_cannot_reset_production_scope_or_mode(self):
+        # `wrangler deploy` replaces every variable this file names and, with keep_vars, keeps the
+        # rest. Naming a production-scoped variable here would reset it on every plain deploy.
+        config = json.loads((SERVICE / "wrangler.json").read_text())
+        self.assertIs(config["keep_vars"], True)
+        for name in (
+            "PUBLICATION_MODE",
+            "ALLOWED_REPOSITORIES",
+            "OPERATIONS_PUBLIC_REPOSITORIES",
+            "OPERATIONS_PUBLIC_HOSTS",
+            "GITHUB_APP_ID",
+            "GITHUB_INSTALLATION_ID",
+        ):
+            self.assertNotIn(name, config["vars"])
 
     def test_prepare_preserves_credentials_and_uses_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

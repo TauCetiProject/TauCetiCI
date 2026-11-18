@@ -17,9 +17,9 @@ export interface Env {
   GITHUB_INSTALLATION_ID?: string;
   GITHUB_PRIVATE_KEY?: string;
   GITHUB_HOURLY_BUDGET: string;
-  ALLOWED_REPOSITORIES: string;
+  ALLOWED_REPOSITORIES?: string;
   PUBLIC_ORIGIN: string;
-  PUBLICATION_MODE: string;
+  PUBLICATION_MODE?: string;
   CF_VERSION?: { id: string };
 }
 export const stub = (ns: DurableObjectNamespace, name: string) =>
