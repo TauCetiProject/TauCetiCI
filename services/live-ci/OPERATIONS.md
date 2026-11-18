@@ -16,8 +16,13 @@ its tested candidate. Telemetry cannot change statuses, admission or promotion.
 ## Activation
 
 Deploy this reader before starting any producer. The new SQLite Durable Object
-binding/migration is in `wrangler.json`; ordinary `wrangler deploy` uses empty
-public repository/host scopes. Explicit scope is mandatory.
+binding/migration is in `wrangler.json`. `wrangler.json` never names the
+production-scoped variables (`PUBLICATION_MODE`, `ALLOWED_REPOSITORIES`, the
+`OPERATIONS_PUBLIC_*` scopes, the GitHub App identifiers) and sets `keep_vars`, so an
+ordinary `wrangler deploy` (`npm run deploy`) of new code keeps the deployed values. A
+first deployment has none of them and starts in shadow mode with empty public
+repository/host scopes; `scripts/setup.py deploy` sets them explicitly. Explicit scope
+is mandatory.
 
 The existing private setup directory is `~/.config/tauceti-live-ci` (see
 `scripts/setup.py` for the authoritative location). Configure:

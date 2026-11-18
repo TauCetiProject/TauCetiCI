@@ -12,10 +12,7 @@
   "version_metadata": { "binding": "CF_VERSION" },
   "vars": {
     "PUBLIC_ORIGIN": "https://taucetiproject.org",
-    "PUBLICATION_MODE": "shadow",
-    "GITHUB_HOURLY_BUDGET": "2000",
-    "ALLOWED_REPOSITORIES": "[]",
-    "OPERATIONS_PUBLIC_REPOSITORIES": "[]"
+    "GITHUB_HOURLY_BUDGET": "2000"
   },
   "durable_objects": {
     "bindings": [

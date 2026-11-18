@@ -172,6 +172,9 @@ def deploy():
             )
         )
     operations_config(config)
+    # Production scope and mode are never in wrangler.json (keep_vars preserves the deployed values
+    # on a plain `wrangler deploy`); this explicit deploy sets them from the private directory.
+    config["vars"].setdefault("PUBLICATION_MODE", "shadow")
     if (DIRECTORY / "publication-mode").exists():
         config["vars"]["PUBLICATION_MODE"] = (
             (DIRECTORY / "publication-mode").read_text().strip()
