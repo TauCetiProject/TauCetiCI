@@ -368,6 +368,7 @@ parent workflow state lags.
 Queue attempts may include the controller's dispatch metadata (`sent_at`, `dispatch_retry_at`,
 `request_id`, `dispatch_state`, `dispatch_error`, `dispatch_retryable`), and tasks a qualified
 `task_binding` (`tauceti-queue.task-binding/v1`: Forgejo source, GitHub execution, policy digest
-and queue epoch). A publisher that cannot parse a task's stored binding sends `task_binding: null`
+and queue epoch, or `tauceti-queue.mixed-task/v1` for a GitHub-retained task whose members may
+come from either forge: GitHub and Forgejo identities, policy digest and epoch). A publisher that cannot parse a task's stored binding sends `task_binding: null`
 with `identity_coverage: "invalid"`. Older publishers may omit all of these fields; ingestion
 retains strict validation of every supplied field.

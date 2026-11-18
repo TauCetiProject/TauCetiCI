@@ -187,9 +187,15 @@ function repositoryIdentity(value: any) {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.name))
     throw new Error("Invalid repository name");
 }
-/** A task's qualified source/execution binding (`tauceti_queue.task_identity.TaskBinding.record()`). */
+/**
+ * A task's qualified binding: a native task's source/execution binding
+ * (`tauceti_queue.task_identity.TaskBinding.record()`), or a mixed task's GitHub-retained binding
+ * whose members may come from either forge (`tauceti_queue.mixed_tasks.binding()`).
+ */
 function taskBinding(value: any) {
   if (value === null) return;
+  if (value && typeof value === "object" && value.schema === "tauceti-queue.mixed-task/v1")
+    return mixedTaskBinding(value);
   object(value, "schema source execution policy_digest queue_epoch");
   for (const key of ["schema", "source", "execution", "policy_digest", "queue_epoch"])
     if (!Object.hasOwn(value, key)) throw new Error("Missing task binding field");
@@ -202,6 +208,19 @@ function taskBinding(value: any) {
   if (typeof value.policy_digest !== "string" || !hex64.test(value.policy_digest))
     throw new Error("Invalid task binding policy");
   if (typeof value.queue_epoch !== "string" || !hex32.test(value.queue_epoch))
+    throw new Error("Invalid task binding epoch");
+}
+function mixedTaskBinding(value: any) {
+  object(value, "schema github forgejo policy_digest epoch");
+  for (const key of ["schema", "github", "forgejo", "policy_digest", "epoch"])
+    if (!Object.hasOwn(value, key)) throw new Error("Missing task binding field");
+  repositoryIdentity(value.github);
+  repositoryIdentity(value.forgejo);
+  if (value.github.forge.kind !== "github" || value.forgejo.forge.kind !== "forgejo")
+    throw new Error("Invalid task binding forges");
+  if (typeof value.policy_digest !== "string" || !hex64.test(value.policy_digest))
+    throw new Error("Invalid task binding policy");
+  if (typeof value.epoch !== "string" || !hex32.test(value.epoch))
     throw new Error("Invalid task binding epoch");
 }
 export function record(

@@ -629,6 +629,13 @@ const binding = {
   policy_digest: "8".repeat(64),
   queue_epoch: "d".repeat(32),
 };
+const mixedBinding = {
+  schema: "tauceti-queue.mixed-task/v1",
+  github: binding.execution,
+  forgejo: binding.source,
+  policy_digest: "8".repeat(64),
+  epoch: "d".repeat(32),
+};
 const dispatch = {
   sent_at: "2026-11-18T00:13:29Z",
   dispatch_retry_at: null,
@@ -644,6 +651,8 @@ test("dispatch metadata and qualified task bindings from current publishers are 
   frame.changes.push(boundTask({ task_binding: binding }));
   frame.changes.push({ ...boundTask({ task_binding: null, identity_coverage: "invalid" }), id: "8" });
   frame.changes.at(-1).value.id = "8";
+  frame.changes.push({ ...boundTask({ task_binding: mixedBinding }), id: "9" });
+  frame.changes.at(-1).value.id = "9";
   assert.equal((await r.send(frame)).committed, true);
   const next = r.next(2);
   next.base = { epoch: 1, sequence: 1 };
@@ -670,6 +679,9 @@ test("dispatch metadata and task bindings reject untyped or unqualified values b
     { task_binding: binding, identity_coverage: "invalid" },
     { task_binding: null, identity_coverage: "observed" },
     { task_binding: "binding" },
+    { task_binding: { ...mixedBinding, github: mixedBinding.forgejo, forgejo: mixedBinding.github } },
+    { task_binding: { ...mixedBinding, queue_epoch: mixedBinding.epoch } },
+    { task_binding: { ...mixedBinding, epoch: "short" } },
   ]) {
     const frame = r.next(1);
     frame.changes.push(boundTask(extra));
