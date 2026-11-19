@@ -62,8 +62,10 @@ OIDC tokens with audience `tauceti-operations-progress`. The main-branch trusted
 `pr-build.yml` workflow must grant `id-token: write` to its build job. The signed
 repository/run/attempt/check-run identity determines the join. Caller-supplied
 job IDs cannot broaden the grant. The wrapper stays outside bwrap; candidate
-phase/module records are untrusted counters and never verdicts. No continuously
-retrieved logs or new GitHub collector are involved.
+phase/module records are untrusted counters and never verdicts. Frames may also
+carry Lake's own job counter (`completed_tasks` of `total_tasks`) and its recent
+`tasks_per_minute`, all nullable and bounded; older reporters omit them. No
+continuously retrieved logs or new GitHub collector are involved.
 
 ## Publication and recovery
 
