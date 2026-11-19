@@ -11,6 +11,8 @@ import {
   QUEUE_SCHEMA,
   queueFrame,
   progressFrame,
+  lakeJobEstimates,
+  withLakeEstimate,
   type QueueFrame,
 } from "./operations-model";
 
@@ -1660,7 +1662,7 @@ export class Operations {
         r,
       ]),
     );
-    const jobs = rawJobs
+    const projected = rawJobs
       .map((j) => {
         const candidateHost = hostsByRunner.get(j.runner_id);
         const host =
@@ -1724,6 +1726,37 @@ export class Operations {
           Number(b.active) - Number(a.active) ||
           (b.observed_at || "").localeCompare(a.observed_at || ""),
       );
+    const classByJob = new Map(
+      projected.map((j) => [
+        j.repository + "/" + j.run_id + "/" + j.run_attempt + "/" + j.check_run_id,
+        j.job_class || null,
+      ]),
+    );
+    const previousEstimates = this.get("lake_job_estimates");
+    const estimates = lakeJobEstimates(
+      reporters.map((r) => {
+        let frame = null;
+        try {
+          frame = JSON.parse(r.data);
+        } catch {
+          /* An unreadable row is no estimate. */
+        }
+        return {
+          repository: r.repository,
+          run_id: r.run,
+          job_class:
+            classByJob.get(
+              r.repository + "/" + r.run + "/" + r.attempt + "/" + r.check_run,
+            ) ?? null,
+          frame,
+        };
+      }),
+      previousEstimates,
+      publicRepositories,
+    );
+    if (JSON.stringify(estimates) !== JSON.stringify(previousEstimates || {}))
+      this.set("lake_job_estimates", estimates);
+    const jobs = projected.map((j) => withLakeEstimate(j, estimates));
     const active = jobs.filter((j) => j.active),
       completedBuilds = jobs.filter(
         (j) => !j.active && BUILD_CLASSES.includes(j.job_class),

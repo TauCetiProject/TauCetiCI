@@ -606,3 +606,112 @@ export function progressFrame(value: any) {
     throw new Error("Invalid progress revision");
   return value;
 }
+
+/** Reporter phases after Lake's build: a frame in one with done == total is a finished build. */
+const POST_BUILD_PHASES = [
+  "audit-setup",
+  "audit-import",
+  "audit-duplicates",
+  "audit-axioms",
+  "audit-module-system",
+  "lint-env",
+  "lint-style",
+  "declaration-names",
+  "stage-cache",
+  "end",
+];
+
+export type LakeEstimate = {
+  total_tasks: number;
+  run_id: string;
+  job_class: string | null;
+  observed_at: string;
+};
+/** The latest finished build's final Lake job count, per public repository. */
+export type LakeEstimates = Record<string, LakeEstimate>;
+export type FinishedCandidate = {
+  repository: string;
+  run_id: string;
+  job_class: string | null;
+  frame: any;
+};
+
+function finishedTotal(frame: any): number | null {
+  if (
+    !frame ||
+    !POST_BUILD_PHASES.includes(frame.phase) ||
+    !Number.isSafeInteger(frame.total_tasks) ||
+    frame.total_tasks <= 0 ||
+    frame.completed_tasks !== frame.total_tasks ||
+    typeof frame.observed_at !== "string" ||
+    !Number.isFinite(Date.parse(frame.observed_at))
+  )
+    return null;
+  return frame.total_tasks;
+}
+
+/**
+ * Lake counts its jobs as it discovers them, so a running build's total keeps growing. The final
+ * total of the latest finished build is a stable estimate: PR and staging builds build the same
+ * targets, and the latest finished build is usually closest to the current base (a staging build
+ * then adds its batch's modules, about 1.5% for a 384-PR batch on 2026-11-19). Candidates are every
+ * retained progress report, not only displayed jobs; the estimate outlives them, a newer finished
+ * build replaces it, and a repository leaving the public scope loses its estimate.
+ */
+export function lakeJobEstimates(
+  candidates: FinishedCandidate[],
+  previous: LakeEstimates | undefined,
+  repositories: string[],
+): LakeEstimates {
+  const result: LakeEstimates = {};
+  for (const repository of repositories)
+    if (previous?.[repository]) result[repository] = previous[repository];
+  for (const c of candidates) {
+    const total = finishedTotal(c.frame);
+    if (total === null || !repositories.includes(c.repository)) continue;
+    const old = result[c.repository];
+    if (old && Date.parse(c.frame.observed_at) <= Date.parse(old.observed_at))
+      continue;
+    result[c.repository] = {
+      total_tasks: total,
+      run_id: String(c.run_id),
+      job_class: c.job_class,
+      observed_at: c.frame.observed_at,
+    };
+  }
+  return result;
+}
+
+/**
+ * Adds the estimated final job count to an active job's Lake build progress while it exceeds
+ * Lake's own count so far; other jobs are unchanged.
+ */
+export function withLakeEstimate(job: any, estimates: LakeEstimates) {
+  const p = job?.progress;
+  if (
+    !job?.active ||
+    !p ||
+    p.coverage !== "untrusted_counters_trusted_reporter" ||
+    p.phase !== "build" ||
+    !Number.isSafeInteger(p.completed_tasks)
+  )
+    return job;
+  const estimate = estimates[job.repository];
+  // A rerun of the estimate's own run has no independent estimate, and a build Lake already
+  // counts as larger has outgrown it.
+  if (
+    !estimate ||
+    estimate.run_id === String(job.run_id) ||
+    estimate.total_tasks <= p.completed_tasks ||
+    (Number.isSafeInteger(p.total_tasks) && estimate.total_tasks <= p.total_tasks)
+  )
+    return job;
+  return {
+    ...job,
+    progress: {
+      ...p,
+      estimated_total_tasks: estimate.total_tasks,
+      estimate_source: { ...estimate },
+    },
+  };
+}
