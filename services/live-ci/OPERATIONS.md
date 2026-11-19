@@ -64,7 +64,14 @@ repository/run/attempt/check-run identity determines the join. Caller-supplied
 job IDs cannot broaden the grant. The wrapper stays outside bwrap; candidate
 phase/module records are untrusted counters and never verdicts. Frames may also
 carry Lake's own job counter (`completed_tasks` of `total_tasks`) and its recent
-`tasks_per_minute`, all nullable and bounded; older reporters omit them. No
+`tasks_per_minute`, all nullable and bounded; older reporters omit them. Lake counts
+jobs as it discovers them, so a running build's `total_tasks` keeps growing. While
+an active job's reporter is in the `build` phase, its published progress therefore
+also carries `estimated_total_tasks`: the final job count of its repository's
+latest finished build, learned from every retained progress report, with its
+`estimate_source` run, class, count and time. The estimate is omitted once Lake's
+own count reaches it. The receiver keeps each public repository's latest estimate
+beyond the report window and drops it when the repository leaves the scope. No
 continuously retrieved logs or new GitHub collector are involved.
 
 ## Publication and recovery

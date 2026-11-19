@@ -8,7 +8,7 @@ const code = buildSync({
   format: "esm",
   write: false,
 }).outputFiles[0].text;
-const { progressFrame } = await import(
+const { progressFrame, lakeJobEstimates, withLakeEstimate } = await import(
   "data:text/javascript;base64," + Buffer.from(code).toString("base64")
 );
 
@@ -65,4 +65,66 @@ test("invalid task counters and rates are rejected", () => {
     { log_tail: "[1/2] Built" },
   ])
     assert.throws(() => progressFrame({ ...frame, ...patch }));
+});
+
+const repo = "TauCetiProject/TauCeti";
+const finished = (run_id, total, observed_at, extra = {}) => ({
+  repository: repo,
+  run_id,
+  job_class: "pr_build",
+  frame: { phase: "lint-env", completed_tasks: total, total_tasks: total, observed_at, ...extra },
+});
+const running = (run_id, progress, extra = {}) => ({
+  repository: repo,
+  run_id,
+  active: true,
+  job_class: "staging_build",
+  progress: { coverage: "untrusted_counters_trusted_reporter", phase: "build", ...progress },
+  ...extra,
+});
+
+test("an active build's estimate is its repository's latest finished build's final job count", () => {
+  const estimates = lakeJobEstimates(
+    [
+      finished("1", 83094, "2026-11-19T07:57:00Z"),
+      { ...finished("2", 81818, "2026-11-19T05:00:00Z"), job_class: null },
+      // Not finished: still building, or a later phase that never reached Lake's total.
+      finished("4", 99999, "2026-11-19T08:00:00Z", { phase: "build" }),
+      finished("5", 99999, "2026-11-19T08:00:00Z", { completed_tasks: 7 }),
+      { ...finished("6", 1, "2026-11-19T09:00:00Z"), frame: null },
+      { ...finished("7", 5, "2026-11-19T09:00:00Z"), repository: "Private/Hidden" },
+    ],
+    undefined,
+    [repo],
+  );
+  assert.deepEqual(estimates, {
+    [repo]: { total_tasks: 83094, run_id: "1", job_class: "pr_build", observed_at: "2026-11-19T07:57:00Z" },
+  });
+  const staging = withLakeEstimate(running("8", { completed_tasks: 13529, total_tasks: 15021 }), estimates);
+  assert.equal(staging.progress.estimated_total_tasks, 83094);
+  assert.equal(staging.progress.estimate_source.run_id, "1");
+});
+
+test("no estimate for builds that outgrew it, inactive or finished jobs, or the estimate's own run", () => {
+  const estimates = lakeJobEstimates([finished("1", 83094, "2026-11-19T07:57:00Z")], undefined, [repo]);
+  for (const job of [
+    running("9", { completed_tasks: 85000, total_tasks: 86000 }),
+    running("9", { completed_tasks: 83094, total_tasks: 83094 }),
+    running("9", { completed_tasks: 100, total_tasks: 200 }, { active: false }),
+    running("9", { phase: "lint-env", completed_tasks: 80000, total_tasks: 80000 }),
+    running("1", { completed_tasks: 100, total_tasks: 200 }),
+    running("9", { completed_tasks: 100, total_tasks: 200 }, { repository: "Other/Repo" }),
+    { ...running("9", {}), progress: { coverage: "steps_only" } },
+  ])
+    assert.equal(withLakeEstimate(job, estimates), job);
+});
+
+test("the estimate outlives the reports and leaves with its repository's public scope", () => {
+  const previous = lakeJobEstimates([finished("2", 81818, "2026-11-19T05:00:00Z")], undefined, [repo]);
+  assert.equal(lakeJobEstimates([], previous, [repo])[repo].total_tasks, 81818);
+  assert.equal(
+    lakeJobEstimates([finished("1", 70000, "2026-11-18T05:00:00Z")], previous, [repo])[repo].total_tasks,
+    81818,
+  );
+  assert.deepEqual(lakeJobEstimates([], previous, ["Other/Repo"]), {});
 });
