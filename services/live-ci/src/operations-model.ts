@@ -531,7 +531,7 @@ export function queueFrame(value: any, repositories: string[]): QueueFrame {
 export function progressFrame(value: any) {
   object(
     value,
-    "schema session sequence observed_at phase completed_modules failed_modules last_module last_progress_at active_compilers cpu_seconds source_revision",
+    "schema session sequence observed_at phase completed_modules failed_modules last_module last_progress_at active_compilers cpu_seconds source_revision completed_tasks total_tasks tasks_per_minute",
   );
   if (
     value.schema !== "tauceti.operations.progress/v1" ||
@@ -544,8 +544,12 @@ export function progressFrame(value: any) {
   if (
     ![
       "starting",
+      "cache-unpack",
       "build",
       "audit-setup",
+      "audit-import",
+      "audit-duplicates",
+      "audit-axioms",
       "audit-module-system",
       "lint-env",
       "lint-style",
@@ -558,6 +562,25 @@ export function progressFrame(value: any) {
     throw new Error("Invalid phase");
   for (const k of ["completed_modules", "failed_modules", "active_compilers"])
     if (value[k] !== null) integer(value[k], 0, 10000000);
+  // Lake's own [done/total] job counter and its recent rate. Older reporters omit all three.
+  for (const k of ["completed_tasks", "total_tasks"])
+    if (value[k] !== undefined && value[k] !== null)
+      integer(value[k], 0, 10000000);
+  if (
+    (value.completed_tasks ?? null) !== null &&
+    ((value.total_tasks ?? null) === null ||
+      value.completed_tasks > value.total_tasks)
+  )
+    throw new Error("Invalid task counter");
+  if (
+    value.tasks_per_minute !== undefined &&
+    value.tasks_per_minute !== null &&
+    (typeof value.tasks_per_minute !== "number" ||
+      !Number.isFinite(value.tasks_per_minute) ||
+      value.tasks_per_minute < 0 ||
+      value.tasks_per_minute > 10000000)
+  )
+    throw new Error("Invalid task rate");
   if (
     value.cpu_seconds !== null &&
     (!Number.isFinite(value.cpu_seconds) ||
