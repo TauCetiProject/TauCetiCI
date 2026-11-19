@@ -103,7 +103,7 @@ export class Operations {
         data TEXT,PRIMARY KEY(source,collection,id));
       CREATE INDEX IF NOT EXISTS ops_entities_batch ON ops_entities(source,collection,batch,id);
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
-      CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,PRIMARY KEY(source,collection,id));
+      CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,terminal INTEGER,PRIMARY KEY(source,collection,id));
       CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
       CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
@@ -132,6 +132,13 @@ export class Operations {
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
       this.set("revision", (this.get("revision") || 0) + 1);
+    }
+    // Records evicted before ops_evicted existed are unknown: the producer
+    // resends everything once, so later evictions are all recorded.
+    if (this.get("eviction_tracking") === undefined) {
+      if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
+        this.set("queue_resync", true);
+      this.set("eviction_tracking", 1);
     }
   }
   private get(key: string): any {
@@ -568,7 +575,16 @@ export class Operations {
         frame.snapshot,
       );
     this.sql.exec(
-      "DELETE FROM ops_evicted WHERE source=? AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
+      "DELETE FROM ops_evicted WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
+      id,
+      id,
+    );
+    this.sql.exec(
+      `DELETE FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1 AND id IN (SELECT id FROM
+      (SELECT id FROM ops_entities WHERE source=? AND collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved')
+      UNION SELECT id FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1)
+      ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET 5000)`,
+      id,
       id,
       id,
     );
@@ -603,7 +619,8 @@ export class Operations {
       // generations cannot count as current.
       const expendable = this.sql
         .exec<any>(
-          `SELECT collection,id,batch,pr_bucket,length(CAST(data AS BLOB)) bytes FROM ops_entities
+          `SELECT collection,id,batch,pr_bucket,length(CAST(data AS BLOB)) bytes,
+        collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved') terminal FROM ops_entities
         WHERE source=? AND collection!='batches' ORDER BY CASE WHEN collection='events' THEN 0 WHEN collection='tasks' THEN 1
         WHEN batch IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches' AND json_extract(data,'$.state')='head') THEN 3 ELSE 2 END,
         CAST(id AS INTEGER)`,
@@ -621,11 +638,12 @@ export class Operations {
           row.id,
         );
         this.sql.exec(
-          "INSERT OR REPLACE INTO ops_evicted VALUES (?,?,?,?)",
+          "INSERT OR REPLACE INTO ops_evicted VALUES (?,?,?,?,?)",
           id,
           row.collection,
           row.id,
           row.batch,
+          row.terminal,
         );
         retainedBytes -= row.bytes;
       }

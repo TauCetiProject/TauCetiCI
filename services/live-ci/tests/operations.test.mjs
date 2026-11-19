@@ -1377,6 +1377,48 @@ test("budget evictions stay named in coverage until the producer resends them", 
   assert.equal(stored().coverage, "observed");
 });
 
+test("an evicted input outlives its batch, and an upgrade resends evictions it cannot know", async (t) => {
+  const r = runtime(t);
+  const stored = () =>
+    JSON.parse(r.database.prepare("SELECT metadata FROM ops_sources").get().metadata);
+  const bytes = (where = "") =>
+    r.database.prepare("SELECT SUM(length(CAST(data AS BLOB))) n FROM ops_entities " + where).get().n;
+  const first = r.next(1);
+  const input = first.changes.find((c) => c.collection === "inputs").value;
+  first.changes.push({ collection: "inputs", id: "3", value: { ...input, id: "3", pr: "103", batch_id: "2" } });
+  await r.send(first);
+  // Every event goes first, then the open batch's input.
+  r.operations.retainedBudget = bytes() - bytes("WHERE collection='events'") - 1;
+  const second = r.next(2);
+  second.base = { epoch: 1, sequence: 1 };
+  second.changes = [];
+  await r.send(second);
+  assert.deepEqual(stored().receiver_evicted, { events: 6, inputs: 1 });
+  r.operations.retainedBudget = 15_000_000;
+  const third = r.next(3);
+  third.base = { epoch: 1, sequence: 2 };
+  third.changes = [{ collection: "batches", id: "2", value: {
+    ...first.changes.find((c) => c.collection === "batches" && c.id === "2").value, state: "landed",
+  } }];
+  third.metadata.retained_batch_ids = ["1"];
+  third.metadata.active_batch_ids = ["1"];
+  await r.send(third);
+  // The landed batch's event is retired with it; the input keeps its own window.
+  assert.deepEqual(stored().receiver_evicted, { events: 5, inputs: 1 });
+  assert.equal(stored().collection_complete.inputs, false);
+  // A receiver that predates eviction tracking asks for everything once.
+  r.database.prepare("DELETE FROM ops_meta WHERE key='eviction_tracking'").run();
+  const upgraded = new r.operations.constructor(r.ctx);
+  const fourth = r.next(4);
+  fourth.base = { epoch: 1, sequence: 3 };
+  fourth.changes = [];
+  fourth.metadata.retained_batch_ids = ["1"];
+  fourth.metadata.active_batch_ids = ["1"];
+  const response = await upgraded.fetch(new Request("https://internal/queue", { method: "POST", body: JSON.stringify(fourth) }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "resync");
+});
+
 test("removed members are retained as evidence without corrupting active membership completeness", async (t) => {
   const r = runtime(t),
     value = structuredClone(seed);
