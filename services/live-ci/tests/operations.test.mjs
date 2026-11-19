@@ -1323,6 +1323,102 @@ test("a missing delta base requests resync and deleted dispatch attempts disappe
   );
 });
 
+test("budget evictions stay named in coverage until the producer resends them", async (t) => {
+  const r = runtime(t);
+  const stored = () =>
+    JSON.parse(r.database.prepare("SELECT metadata FROM ops_sources").get().metadata);
+  const bytes = () =>
+    r.database.prepare("SELECT SUM(length(CAST(data AS BLOB))) n FROM ops_entities").get().n;
+  const first = r.next(1);
+  await r.send(first);
+  assert.deepEqual(stored().receiver_evicted, {});
+  assert.equal(stored().coverage, "observed");
+  // One byte over budget retires only the oldest event.
+  r.operations.retainedBudget = bytes() - 1;
+  const second = r.next(2);
+  second.base = { epoch: 1, sequence: 1 };
+  second.changes = [];
+  await r.send(second);
+  let metadata = stored();
+  assert.deepEqual(metadata.receiver_evicted, { events: 1 });
+  assert.equal(metadata.collection_complete.events, false);
+  assert.equal(metadata.collection_complete.tasks, true);
+  assert.equal(metadata.coverage, "partial");
+  assert.equal(metadata.truncated, true);
+  await r.flush();
+  assert.deepEqual(r.object(r.manifest().domains.queue).receiver_evicted, { events: 1 });
+  // Back within budget, the unchanged event is still missing: it is never re-sent.
+  r.operations.retainedBudget = 15_000_000;
+  const third = r.next(3);
+  third.base = { epoch: 1, sequence: 2 };
+  third.changes = [];
+  await r.send(third);
+  assert.deepEqual(stored().receiver_evicted, { events: 1 });
+  assert.equal(stored().coverage, "partial");
+  // Re-sent, it is current again.
+  const fourth = r.next(4);
+  fourth.base = { epoch: 1, sequence: 3 };
+  fourth.changes = first.changes.filter((c) => c.collection === "events" && c.id === "5");
+  await r.send(fourth);
+  metadata = stored();
+  assert.deepEqual(metadata.receiver_evicted, {});
+  assert.equal(metadata.coverage, "observed");
+  assert.equal(metadata.collection_complete.events, true);
+  // A full resync replaces everything the producer still holds.
+  r.operations.retainedBudget = bytes() - 1;
+  const fifth = r.next(5);
+  fifth.base = { epoch: 1, sequence: 4 };
+  fifth.changes = [];
+  await r.send(fifth);
+  assert.deepEqual(stored().receiver_evicted, { events: 1 });
+  r.operations.retainedBudget = 15_000_000;
+  await r.send(r.next(6));
+  assert.deepEqual(stored().receiver_evicted, {});
+  assert.equal(stored().coverage, "observed");
+});
+
+test("an evicted input outlives its batch, and an upgrade resends evictions it cannot know", async (t) => {
+  const r = runtime(t);
+  const stored = () =>
+    JSON.parse(r.database.prepare("SELECT metadata FROM ops_sources").get().metadata);
+  const bytes = (where = "") =>
+    r.database.prepare("SELECT SUM(length(CAST(data AS BLOB))) n FROM ops_entities " + where).get().n;
+  const first = r.next(1);
+  const input = first.changes.find((c) => c.collection === "inputs").value;
+  first.changes.push({ collection: "inputs", id: "3", value: { ...input, id: "3", pr: "103", batch_id: "2" } });
+  await r.send(first);
+  // Every event goes first, then the open batch's input.
+  r.operations.retainedBudget = bytes() - bytes("WHERE collection='events'") - 1;
+  const second = r.next(2);
+  second.base = { epoch: 1, sequence: 1 };
+  second.changes = [];
+  await r.send(second);
+  assert.deepEqual(stored().receiver_evicted, { events: 6, inputs: 1 });
+  r.operations.retainedBudget = 15_000_000;
+  const third = r.next(3);
+  third.base = { epoch: 1, sequence: 2 };
+  third.changes = [{ collection: "batches", id: "2", value: {
+    ...first.changes.find((c) => c.collection === "batches" && c.id === "2").value, state: "landed",
+  } }];
+  third.metadata.retained_batch_ids = ["1"];
+  third.metadata.active_batch_ids = ["1"];
+  await r.send(third);
+  // The landed batch's event is retired with it; the input keeps its own window.
+  assert.deepEqual(stored().receiver_evicted, { events: 5, inputs: 1 });
+  assert.equal(stored().collection_complete.inputs, false);
+  // A receiver that predates eviction tracking asks for everything once.
+  r.database.prepare("DELETE FROM ops_meta WHERE key='eviction_tracking'").run();
+  const upgraded = new r.operations.constructor(r.ctx);
+  const fourth = r.next(4);
+  fourth.base = { epoch: 1, sequence: 3 };
+  fourth.changes = [];
+  fourth.metadata.retained_batch_ids = ["1"];
+  fourth.metadata.active_batch_ids = ["1"];
+  const response = await upgraded.fetch(new Request("https://internal/queue", { method: "POST", body: JSON.stringify(fourth) }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "resync");
+});
+
 test("removed members are retained as evidence without corrupting active membership completeness", async (t) => {
   const r = runtime(t),
     value = structuredClone(seed);

@@ -79,6 +79,8 @@ export class Operations {
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
   private activeUploads = 0;
+  // Serialized bytes of retained queue records before detail is evicted.
+  private retainedBudget = 15_000_000;
   private uploadWaiters: { lane: string; resolve: () => void }[] = [];
   private lastUploadLane?: string;
   private get env(): Env {
@@ -101,6 +103,7 @@ export class Operations {
         data TEXT,PRIMARY KEY(source,collection,id));
       CREATE INDEX IF NOT EXISTS ops_entities_batch ON ops_entities(source,collection,batch,id);
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
+      CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,terminal INTEGER,PRIMARY KEY(source,collection,id));
       CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
       CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
@@ -129,6 +132,13 @@ export class Operations {
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
       this.set("revision", (this.get("revision") || 0) + 1);
+    }
+    // Records evicted before ops_evicted existed are unknown: the producer
+    // resends everything once, so later evictions are all recorded.
+    if (this.get("eviction_tracking") === undefined) {
+      if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
+        this.set("queue_resync", true);
+      this.set("eviction_tracking", 1);
     }
   }
   private get(key: string): any {
@@ -553,26 +563,73 @@ export class Operations {
         row.id,
       );
     }
+    // A record evicted for the byte budget stays missing until the producer
+    // sends it again, deletes it or retires its batch: an unchanged record is
+    // never re-sent, so later commits within budget still lack it.
+    if (frame.base === null)
+      this.sql.exec("DELETE FROM ops_evicted WHERE source=?", id);
+    else
+      this.sql.exec(
+        "DELETE FROM ops_evicted WHERE source=? AND (collection,id) IN (SELECT collection,id FROM ops_changes WHERE snapshot=?)",
+        id,
+        frame.snapshot,
+      );
+    this.sql.exec(
+      "DELETE FROM ops_evicted WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
+      id,
+      id,
+    );
+    this.sql.exec(
+      `DELETE FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1 AND id IN (SELECT id FROM
+      (SELECT id FROM ops_entities WHERE source=? AND collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved')
+      UNION SELECT id FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1)
+      ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET 5000)`,
+      id,
+      id,
+      id,
+    );
+    // Count caps would have retired these anyway; they are no longer missing.
+    for (const [collection, limit] of [
+      ["events", 3000],
+      ["tasks", 20000],
+      ["attempts", 20000],
+    ] as const)
+      this.sql.exec(
+        `DELETE FROM ops_evicted WHERE source=? AND collection=? AND id IN (SELECT id FROM
+        (SELECT id FROM ops_entities WHERE source=? AND collection=? UNION SELECT id FROM ops_evicted WHERE source=? AND collection=?)
+        ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET ?)`,
+        id,
+        collection,
+        id,
+        collection,
+        id,
+        collection,
+        limit,
+      );
     let retainedBytes = this.sql
       .exec<{
         bytes: number;
       }>(
-        "SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) bytes FROM ops_entities",
+        "SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) bytes FROM ops_entities WHERE source=?",
+        id,
       )
       .one().bytes;
-    if (retainedBytes > 15_000_000) {
-      // Retire detail, never a live batch identity or a queue state. Coverage is
-      // explicitly partial and old member generations cannot count as current.
+    if (retainedBytes > this.retainedBudget) {
+      // Retire detail, never a live batch identity or a queue state. Old member
+      // generations cannot count as current.
       const expendable = this.sql
         .exec<any>(
-          `SELECT collection,id,batch,pr_bucket,length(CAST(data AS BLOB)) bytes FROM ops_entities
-        WHERE collection!='batches' ORDER BY CASE WHEN collection='events' THEN 0 WHEN collection='tasks' THEN 1
-        WHEN batch IN (SELECT id FROM ops_entities WHERE collection='batches' AND json_extract(data,'$.state')='head') THEN 3 ELSE 2 END,
+          `SELECT collection,id,batch,pr_bucket,length(CAST(data AS BLOB)) bytes,
+        collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved') terminal FROM ops_entities
+        WHERE source=? AND collection!='batches' ORDER BY CASE WHEN collection='events' THEN 0 WHEN collection='tasks' THEN 1
+        WHEN batch IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches' AND json_extract(data,'$.state')='head') THEN 3 ELSE 2 END,
         CAST(id AS INTEGER)`,
+          id,
+          id,
         )
         .toArray();
       for (const row of expendable) {
-        if (retainedBytes <= 15_000_000) break;
+        if (retainedBytes <= this.retainedBudget) break;
         mark(row);
         this.sql.exec(
           "DELETE FROM ops_entities WHERE source=? AND collection=? AND id=?",
@@ -580,8 +637,30 @@ export class Operations {
           row.collection,
           row.id,
         );
+        this.sql.exec(
+          "INSERT OR REPLACE INTO ops_evicted VALUES (?,?,?,?,?)",
+          id,
+          row.collection,
+          row.id,
+          row.batch,
+          row.terminal,
+        );
         retainedBytes -= row.bytes;
       }
+    }
+    // Name what the budget dropped, so partial coverage says which detail is
+    // missing; the collections themselves are no longer complete.
+    metadata.receiver_evicted = Object.fromEntries(
+      this.sql
+        .exec<{ collection: string; count: number }>(
+          "SELECT collection,COUNT(*) count FROM ops_evicted WHERE source=? GROUP BY collection ORDER BY collection",
+          id,
+        )
+        .toArray()
+        .map((r) => [r.collection, r.count]),
+    );
+    for (const collection of Object.keys(metadata.receiver_evicted)) {
+      metadata.collection_complete[collection] = false;
       metadata.truncated = true;
       metadata.coverage = "partial";
     }
