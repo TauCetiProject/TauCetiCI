@@ -1323,6 +1323,60 @@ test("a missing delta base requests resync and deleted dispatch attempts disappe
   );
 });
 
+test("budget evictions stay named in coverage until the producer resends them", async (t) => {
+  const r = runtime(t);
+  const stored = () =>
+    JSON.parse(r.database.prepare("SELECT metadata FROM ops_sources").get().metadata);
+  const bytes = () =>
+    r.database.prepare("SELECT SUM(length(CAST(data AS BLOB))) n FROM ops_entities").get().n;
+  const first = r.next(1);
+  await r.send(first);
+  assert.deepEqual(stored().receiver_evicted, {});
+  assert.equal(stored().coverage, "observed");
+  // One byte over budget retires only the oldest event.
+  r.operations.retainedBudget = bytes() - 1;
+  const second = r.next(2);
+  second.base = { epoch: 1, sequence: 1 };
+  second.changes = [];
+  await r.send(second);
+  let metadata = stored();
+  assert.deepEqual(metadata.receiver_evicted, { events: 1 });
+  assert.equal(metadata.collection_complete.events, false);
+  assert.equal(metadata.collection_complete.tasks, true);
+  assert.equal(metadata.coverage, "partial");
+  assert.equal(metadata.truncated, true);
+  await r.flush();
+  assert.deepEqual(r.object(r.manifest().domains.queue).receiver_evicted, { events: 1 });
+  // Back within budget, the unchanged event is still missing: it is never re-sent.
+  r.operations.retainedBudget = 15_000_000;
+  const third = r.next(3);
+  third.base = { epoch: 1, sequence: 2 };
+  third.changes = [];
+  await r.send(third);
+  assert.deepEqual(stored().receiver_evicted, { events: 1 });
+  assert.equal(stored().coverage, "partial");
+  // Re-sent, it is current again.
+  const fourth = r.next(4);
+  fourth.base = { epoch: 1, sequence: 3 };
+  fourth.changes = first.changes.filter((c) => c.collection === "events" && c.id === "5");
+  await r.send(fourth);
+  metadata = stored();
+  assert.deepEqual(metadata.receiver_evicted, {});
+  assert.equal(metadata.coverage, "observed");
+  assert.equal(metadata.collection_complete.events, true);
+  // A full resync replaces everything the producer still holds.
+  r.operations.retainedBudget = bytes() - 1;
+  const fifth = r.next(5);
+  fifth.base = { epoch: 1, sequence: 4 };
+  fifth.changes = [];
+  await r.send(fifth);
+  assert.deepEqual(stored().receiver_evicted, { events: 1 });
+  r.operations.retainedBudget = 15_000_000;
+  await r.send(r.next(6));
+  assert.deepEqual(stored().receiver_evicted, {});
+  assert.equal(stored().coverage, "observed");
+});
+
 test("removed members are retained as evidence without corrupting active membership completeness", async (t) => {
   const r = runtime(t),
     value = structuredClone(seed);
