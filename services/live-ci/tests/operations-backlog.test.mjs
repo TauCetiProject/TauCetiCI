@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { build } from 'esbuild';
 const bundled = await build({entryPoints:['src/operations-backlog.ts'],bundle:true,platform:'node',format:'esm',write:false});
-const {backlogSnapshot, mergeBacklogs} = await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].text).toString('base64'));
+const {backlogSnapshot, mergeBacklogs, queuedHours} = await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].text).toString('base64'));
 const repo='TauCetiProject/TauCeti', clock=1000000;
 // Published counts: a snapshot classifies zombies only when merged by a clock.
 const summary=(f,at=clock)=>mergeBacklogs([{partition:repo+'/p',backlog:backlogSnapshot(f.sql,at)}],false,at).repositories[repo];
@@ -93,4 +93,14 @@ test('known GitHub zombies leave waiting counts and the oldest wait once a day o
   assert.deepEqual([merge(clock).pr_builds.queued,merge(clock).pr_builds.stale,merge(clock).waiting_jobs,merge(clock).pr_builds.oldest_waiting_at],[2,0,1,young]);
   const later=merge(clock+day);
   assert.deepEqual([later.pr_builds.queued,later.pr_builds.stale,later.waiting_jobs,later.stale_waiting_jobs,later.pr_builds.oldest_waiting_at],[0,2,0,1,null]);
+});
+
+test('a fresh re-run of an old workflow is live; older snapshots stay out of published counts',t=>{
+  const f=fixture(t), old=clock-2*86400;
+  f.run(1,'queued',{attempt:2,created:old,updated:clock-60,started:clock-60});
+  let result=summary(f);assert.equal(result.pr_builds.queued,1);assert.equal(result.pr_builds.stale,0);
+  const merged=mergeBacklogs([{partition:repo+'/p',backlog:{...backlogSnapshot(f.sql,clock),accounting_version:2}}],false,clock);
+  assert.equal(merged.coverage,'partial');assert.equal(merged.repositories[repo],undefined);
+  assert.deepEqual(queuedHours([{status:'queued',created:old,started:old},{status:'pending',created:old},{status:'queued',created:old,started:clock-60}]),
+    [[Math.floor(old/3600)*3600,1],[Math.floor((clock-60)/3600)*3600,1]]);
 });

@@ -20,6 +20,24 @@ const bin = (bins: [number, number][], hour: number, n: number) => {
   if (found) found[1] += n; else bins.push([hour, n]);
 };
 
+/** When the current attempt of a workflow began waiting: a re-run keeps the
+ * workflow's creation time, so its own start counts instead. Null if unknown. */
+export const queuedSince = (run: any) => {
+  const since = Math.max(run.created || 0, run.started || 0);
+  return since > 0 ? since : null;
+};
+
+/** Queued workflows awaiting jobs, as [hour their attempt began waiting, count],
+ * so a publication can leave out known zombies by its own clock. */
+export const queuedHours = (runs: any[]) => {
+  const bins: [number, number][] = [];
+  for (const run of runs) {
+    const since = run.status === 'queued' ? queuedSince(run) : null;
+    if (since !== null) bin(bins, Math.floor(since / HOUR) * HOUR, 1);
+  }
+  return bins;
+};
+
 export function backlogSnapshot(sql: SqlStorage, clock: number) {
   const counts = backlogCounts();
   const rows = sql.exec<any>(`SELECT r.data, m.value verified,
@@ -63,7 +81,7 @@ export function backlogSnapshot(sql: SqlStorage, clock: number) {
     // Pending, waiting and requested workflows keep their place at any age.
     let since: number | null = null;
     if (run.status === 'queued' && row.actual_jobs === 0 && (state === 'queued' || state === 'stuck'))
-      since = run.created > 0 ? run.created : null;
+      since = queuedSince(run);
     else if (['queued', 'in_progress'].includes(run.status) && row.running_jobs === 0 && row.actual_jobs > 0 &&
         created.length === row.actual_jobs && created.every(c => c > 0))
       since = Math.max(...created);
@@ -96,7 +114,8 @@ export function mergeBacklogs(partitions: any[], pending: boolean, clock: number
   let partial = pending;
   for (const partition of partitions) {
     const repo = partition.partition?.split('/').slice(0, 2).join('/');
-    if (!repo || !partition.backlog) { partial = true; continue; }
+    // Older snapshots cannot classify zombies: leave them out until recomputed.
+    if (!repo || partition.backlog?.accounting_version !== 3) { partial = true; continue; }
     const source = partition.backlog, target = repositories[repo] ||= backlogCounts();
     for (const category of ['pr_builds', 'other_workflows'] as const) {
       const from = source[category], into = target[category];

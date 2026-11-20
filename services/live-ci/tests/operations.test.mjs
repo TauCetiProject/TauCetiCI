@@ -1460,11 +1460,15 @@ test("1000 jobs use existing facts and paginated operations views with distinct 
             active: true,
             status: i < 600 ? "in_progress" : "queued",
             assigned: i < 600,
+            // Known GitHub zombies: queued for two days.
+            ...(i >= 990 ? { created_at: new Date(Date.now() - 2 * 86400000).toISOString() } : {}),
             observed_at: new Date(Date.now()).toISOString(),
           })),
           pending_workflows: [
             { repository: repo, run_id: "101", run_attempt: 1 },
+            { repository: repo, run_id: "102", run_attempt: 1 },
           ],
+          pending_workflows_created: [[Math.floor(Date.now() / 3600000 - 48) * 3600, 1]],
         });
       },
     }),
@@ -1477,8 +1481,10 @@ test("1000 jobs use existing facts and paginated operations views with distinct 
   assert.equal(jobs.job_pages.length, 10);
   assert.deepEqual(jobs.counts, {
     running: 600,
-    queued_jobs: 400,
+    queued_jobs: 390,
+    stale_queued_jobs: 10,
     pending_workflows: 1,
+    stale_pending_workflows: 1,
     active: 1000,
   });
   assert.equal(reads, 1);
@@ -3647,7 +3653,7 @@ test("native internal Facts reads may finish after three seconds without a false
 test("backlog counts cover all retained partitions and preserve missing-source uncertainty", async t => {
   const r=runtime(t);await r.send(seed);await r.flush();
   const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
-  const backlog={pr_builds:{...zero,pending:7,oldest_waiting_at:Date.now()/1000-3600},other_workflows:{...zero,stuck:3},waiting_jobs:7,running_jobs:0};
+  const backlog={accounting_version:3,pr_builds:{...zero,pending:7,oldest_waiting_at:Date.now()/1000-3600},other_workflows:{...zero,stuck:3},waiting_jobs:7,running_jobs:0};
   for(let n=0;n<205;n++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/'+n,1,Date.now()/1000-n,JSON.stringify({partition:repo+'/'+n,backlog,jobs:[],pending_workflows:[]}));
   await r.request('/tick');await r.flush();
   let value=r.object(r.manifest().domains.jobs).backlog;

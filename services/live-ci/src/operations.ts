@@ -1,6 +1,6 @@
 /** Prepared operations publication. Public GETs never enter this object. */
 import { historyFrame } from "./operations-history";
-import { mergeActivity } from "./operations-activity";
+import { mergeActivity, staleAt, STALE_WAITING_SECONDS } from "./operations-activity";
 import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import { PUBLIC_POOLS } from "./runner-registry";
@@ -1762,6 +1762,13 @@ export class Operations {
     if (JSON.stringify(estimates) !== JSON.stringify(previousEstimates || {}))
       this.set("lake_job_estimates", estimates);
     const jobs = projected.map((j) => withLakeEstimate(j, estimates));
+    const staleBefore = now() - STALE_WAITING_SECONDS;
+    const staleJob = (j: any) => {
+      const created = Date.parse(j.created_at);
+      return Number.isFinite(created) && staleAt(created / 1000, staleBefore);
+    };
+    const stalePending = (p: any) => (p.pending_workflows_created || [])
+      .reduce((n: number, [hour, count]: [number, number]) => n + (staleAt(hour, staleBefore) ? count : 0), 0);
     const active = jobs.filter((j) => j.active),
       completedBuilds = jobs.filter(
         (j) => !j.active && BUILD_CLASSES.includes(j.job_class),
@@ -1850,14 +1857,19 @@ export class Operations {
       counts: {
         running: active.filter((j) => j.status === "in_progress" && j.assigned)
           .length,
+        // Known GitHub zombies (STALE_WAITING_SECONDS) are counted apart, never as waiting.
         queued_jobs: active.filter(
-          (j) => j.status !== "in_progress" || !j.assigned,
+          (j) => (j.status !== "in_progress" || !j.assigned) && !staleJob(j),
+        ).length,
+        stale_queued_jobs: active.filter(
+          (j) => (j.status !== "in_progress" || !j.assigned) && staleJob(j),
         ).length,
         pending_workflows: facts.reduce(
           (n, p) =>
-            n + (p.pending_workflows_count ?? p.pending_workflows.length),
+            n + (p.pending_workflows_count ?? p.pending_workflows.length) - stalePending(p),
           0,
         ),
+        stale_pending_workflows: facts.reduce((n, p) => n + stalePending(p), 0),
         active: active.length,
       },
       job_pages: await pages("tauceti.operations.job-page/v1", [
