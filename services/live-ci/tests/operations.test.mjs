@@ -1469,6 +1469,7 @@ test("1000 jobs use existing facts and paginated operations views with distinct 
             { repository: repo, run_id: "102", run_attempt: 1 },
           ],
           pending_workflows_created: [[Math.floor(Date.now() / 3600000 - 48) * 3600, 1]],
+          backlog: { accounting_version: 3, pr_builds: {}, other_workflows: {}, waiting_jobs: 0, running_jobs: 0 },
         });
       },
     }),
@@ -3706,6 +3707,7 @@ test('legacy snapshots without workflow ages stay out of pending workflow counts
  const backlog={pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
  const insert=(name,data)=>r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/'+name,1,Date.now()/1000,JSON.stringify({partition:repo+'/'+name,jobs:[],...data}));
  insert('old',{backlog:{...backlog,accounting_version:2},pending_workflows:[],pending_workflows_count:5});
+ insert('older',{pending_workflows:[],pending_workflows_count:7}); // before backlog accounting
  insert('new',{backlog:{...backlog,accounting_version:3},pending_workflows:[],pending_workflows_count:2,pending_workflows_created:[[Math.floor(Date.now()/3600000-48)*3600,1]]});
  const value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.counts.pending_workflows,1);assert.equal(value.counts.stale_pending_workflows,1);

@@ -1769,7 +1769,7 @@ export class Operations {
     };
     // Snapshots before accounting version 3 carry no workflow ages: leave
     // their pending workflows out, with partial coverage, until recomputed.
-    const legacy = (p: any) => !!p.backlog && p.backlog.accounting_version !== 3;
+    const legacy = (p: any) => p.backlog?.accounting_version !== 3;
     const stalePending = (p: any) => (p.pending_workflows_created || [])
       .reduce((n: number, [hour, count]: [number, number]) => n + (staleAt(hour, staleBefore) ? count : 0), 0);
     const active = jobs.filter((j) => j.active),
