@@ -28,7 +28,7 @@ export const WAITING_REFERENCES = 20;
 const HOUR = 3600;
 /** Whether a queued job created at `created` (null if unknown) is stale at `staleBefore`,
  * judged by its whole creation hour so that counts and references agree. */
-const staleAt = (created: number | null, staleBefore: number) =>
+export const staleAt = (created: number | null, staleBefore: number) =>
   created !== null && Math.floor(created / HOUR) * HOUR + HOUR <= staleBefore;
 const earlier = (a: any, b: any, field: string) => {
   if (!a || !Number.isFinite(Date.parse(b[field]))) return b;

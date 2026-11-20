@@ -130,7 +130,7 @@ export class Operations {
     // (and, for activity cached before waiting_created, its queued jobs' ages).
     const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
       WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2
+        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
           OR (json_array_length(data,'$.activity.pools') > 0
             AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
       RETURNING name`).toArray();
@@ -1241,7 +1241,7 @@ export class Operations {
           if (
             value.schema !== "tauceti.operations.partition/v1" ||
             value.partition !== p.name ||
-            (value.backlog && value.backlog.accounting_version !== 2) ||
+            (value.backlog && value.backlog.accounting_version !== 3) ||
             (value.activity && (!Array.isArray(value.activity.pools) || value.activity.pools.some((pool: any) => [pool.all, pool.builds].some((scope: any) =>
               !Array.isArray(scope?.waiting_created) || !Array.isArray(scope?.waiting_references)))))
           )
@@ -1838,7 +1838,7 @@ export class Operations {
           "SELECT name,data,pending FROM ops_partitions").toArray()
           .filter(p=>projection.repositories.includes(p.name.split('/').slice(0,2).join('/')));
         return mergeBacklogs(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),
-          sources.some(p=>!p.data));
+          sources.some(p=>!p.data), now());
       })(),
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
