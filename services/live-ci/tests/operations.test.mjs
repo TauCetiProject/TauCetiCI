@@ -3619,7 +3619,7 @@ test("historical activity migration leaves two live source lanes and still advan
 test("pool activity includes cached source metadata beyond the 200-partition job display limit", async t => {
  const r=runtime(t);await r.send(seed);await r.flush();
  const clock=Date.now()/1000, minute=Math.floor(clock/60)*60;
- const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
+ const scope={running:0,waiting:0,waiting_created:[],waiting_references:[],latest_completion:null,oldest_running:null,oldest_waiting:null};
  for(let n=0;n<205;n++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/'+new Date((clock-n*86400)*1000).toISOString().slice(0,10),1,clock-n,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date(Date.now()).toISOString(),activity:{complete:true,pools:[{pool:'github',all:scope,builds:scope,bins:[[minute-120,1,0,0,0,0,1,0,0,0,0]]}]}}));
  r.operations.set('jobs_revision',99);await r.request('/tick');await r.flush();
  const value=r.object(r.manifest().domains.jobs);
@@ -3712,6 +3712,7 @@ test('legacy snapshots without workflow ages stay out of pending workflow counts
  const value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.counts.pending_workflows,1);assert.equal(value.counts.stale_pending_workflows,1);
  assert.equal(value.coverage,'partial');
+});
 
 test("pool activity stays observed while a partition awaits collection, partial once its refresh fails", async t => {
  const r=runtime(t);await r.send(seed);await r.flush();
@@ -3722,6 +3723,11 @@ test("pool activity stays observed while a partition awaits collection, partial 
  let value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.pool_activity.coverage,'retained_observations');
  r.database.prepare("INSERT INTO ops_failures VALUES ('partition',?,1,?,?)").run(name,Math.floor(clock)+60,'Facts unavailable');
+ value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
+ assert.equal(value.pool_activity.coverage,'partial');
+ // Cached activity without creation times stays partial until recollected, even before a failure.
+ r.database.prepare('DELETE FROM ops_failures').run();
+ r.database.prepare('UPDATE ops_partitions SET data=? WHERE name=?').run(JSON.stringify({jobs:[],pending_workflows:[],activity:{complete:true,pools:[{pool:'github',all:{running:0,waiting:1},builds:{running:0,waiting:1},bins:[]}]}}),name);
  value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.pool_activity.coverage,'partial');
 });

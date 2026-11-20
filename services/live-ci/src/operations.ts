@@ -1844,8 +1844,13 @@ export class Operations {
           `SELECT p.name,p.data,p.pending,CASE WHEN f.failures>0 THEN 1 ELSE 0 END failing FROM ops_partitions p
            LEFT JOIN ops_failures f ON f.kind='partition' AND f.id=p.name`).toArray()
           .filter(p=>projection.repositories.includes(p.name.split("/").slice(0,2).join("/")));
-        return mergeActivity(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),now(),
-          sources.some(p=>!p.data || (p.pending && p.failing)));
+        const facts = sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]);
+        // Cached activity from before queued jobs' creation times cannot be
+        // classified by this clock: partial until its partition is recollected.
+        const legacy = (f: any) => Array.isArray(f.activity?.pools) && f.activity.pools.some((pool: any) =>
+          [pool.all, pool.builds].some((scope: any) => !Array.isArray(scope?.waiting_created) || !Array.isArray(scope?.waiting_references)));
+        return mergeActivity(facts,now(),
+          sources.some(p=>!p.data || (p.pending && p.failing)) || facts.some(legacy));
       })(),
       backlog: (() => {
         const sources = this.sql.exec<{name:string;data:string|null;pending:number}>(
