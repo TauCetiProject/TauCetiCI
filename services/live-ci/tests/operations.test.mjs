@@ -3712,4 +3712,16 @@ test('legacy snapshots without workflow ages stay out of pending workflow counts
  const value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.counts.pending_workflows,1);assert.equal(value.counts.stale_pending_workflows,1);
  assert.equal(value.coverage,'partial');
+
+test("pool activity stays observed while a partition awaits collection, partial once its refresh fails", async t => {
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const clock=Date.now()/1000;
+ const scope={running:0,waiting:0,waiting_created:[],waiting_references:[],latest_completion:null,oldest_running:null,oldest_waiting:null};
+ const name=repo+'/'+new Date(clock*1000).toISOString().slice(0,10);
+ r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(name,1,clock,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date().toISOString(),activity:{complete:true,pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}}));
+ let value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
+ assert.equal(value.pool_activity.coverage,'retained_observations');
+ r.database.prepare("INSERT INTO ops_failures VALUES ('partition',?,1,?,?)").run(name,Math.floor(clock)+60,'Facts unavailable');
+ value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
+ assert.equal(value.pool_activity.coverage,'partial');
 });
