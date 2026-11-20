@@ -6,6 +6,10 @@ const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
   running: 0, waiting: 0, stale_waiting: 0,
+  /** Creation times ([created, count], created null if unknown) of every queued job,
+   * so a merge classifies staleness by its own clock: a partition's cached snapshot
+   * is only recomputed when that partition changes. */
+  waiting_created: [] as [number | null, number][],
   latest_completion: null as any,
   oldest_running: null as any,
   oldest_waiting: null as any,
@@ -98,6 +102,14 @@ export class ActivityIndex {
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
         scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
+    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n
+      FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,created`).toArray()) {
+      const pool = byPool.get(row.pool)!;
+      for (const scope of row.build ? [pool.all, pool.builds] : [pool.all]) {
+        const bin = scope.waiting_created.find(b => b[0] === row.created);
+        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n]);
+      }
+    }
     for (const pool of pools) for (const [scope, build] of [[pool.all, false], [pool.builds, true]] as const) {
       const extra = build ? " AND build=1" : "";
       for (const [field, condition, order] of [
@@ -132,17 +144,27 @@ export class ActivityIndex {
 
 export function mergeActivity(facts: any[], clock: number, missing: boolean) {
   const through = Math.floor(clock / 60) * 60;
+  const staleBefore = clock - STALE_WAITING_SECONDS;
+  const isStale = (job: any) => Date.parse(job?.created_at) / 1000 < staleBefore;
   const pools = new Map<string, any>();
   for (const fact of facts) for (const row of fact.activity?.pools || []) {
     let pool = pools.get(row.pool);
     if (!pool) { pool = { pool: row.pool, all: activityScope(), builds: activityScope() }; pools.set(row.pool, pool); }
     for (const name of ["all", "builds"]) {
       const scope = pool[name], incoming = row[name];
-      scope.running += incoming.running; scope.waiting += incoming.waiting;
-      scope.stale_waiting += incoming.stale_waiting || 0;
+      scope.running += incoming.running;
+      if (Array.isArray(incoming.waiting_created)) {
+        for (const [created, n] of incoming.waiting_created)
+          if (created !== null && created < staleBefore) scope.stale_waiting += n; else scope.waiting += n;
+      } else {
+        scope.waiting += incoming.waiting; scope.stale_waiting += incoming.stale_waiting || 0;
+      }
       if (incoming.latest_completion) scope.latest_completion = later(scope.latest_completion, incoming.latest_completion, "completed_at");
       if (incoming.oldest_running) scope.oldest_running = earlier(scope.oldest_running, incoming.oldest_running, "started_at");
-      if (incoming.oldest_waiting) scope.oldest_waiting = earlier(scope.oldest_waiting, incoming.oldest_waiting, "created_at");
+      // A cached snapshot's oldest waiting job may have gone stale since it was computed.
+      if (incoming.oldest_waiting && isStale(incoming.oldest_waiting))
+        scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_waiting, "created_at");
+      else if (incoming.oldest_waiting) scope.oldest_waiting = earlier(scope.oldest_waiting, incoming.oldest_waiting, "created_at");
       if (incoming.oldest_stale_waiting)
         scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_stale_waiting, "created_at");
       scope.windows ||= WINDOWS.map(seconds => ({ seconds, finished: 0, success: 0, failure: 0, cancelled: 0, skipped: 0, other: 0 }));
@@ -152,6 +174,7 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
       }
     }
   }
+  for (const pool of pools.values()) { delete pool.all.waiting_created; delete pool.builds.waiting_created; }
   return { coverage: !facts.length ? "unavailable" : missing || facts.some(f => !f.activity?.complete) ? "partial" : "retained_observations",
     through: new Date(through * 1000).toISOString(), interval: "minute_aligned",
     pools: [...pools.values()].sort((a,b) => a.pool.localeCompare(b.pool)) };

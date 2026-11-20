@@ -56,8 +56,22 @@ test('jobs queued longer than GitHub keeps them are counted as stale, not as wai
  const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock,false));
  assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,2);assert.equal(p.builds.running,1);
  assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
- const legacy=pool(mergeActivity([{activity:{...a.snapshot(),pools:a.snapshot().pools.map(q=>({...q,builds:{...q.builds,stale_waiting:undefined},all:{...q.all,stale_waiting:undefined}}))}}],clock,false));
+ const legacy=pool(mergeActivity([{activity:{...a.snapshot(),pools:a.snapshot().pools.map(q=>({...q,builds:{...q.builds,stale_waiting:undefined,waiting_created:undefined},all:{...q.all,stale_waiting:undefined,waiting_created:undefined}}))}}],clock,false));
  assert.equal(legacy.builds.stale_waiting,0);assert.equal(legacy.builds.waiting,1);
+});
+test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the snapshot clock',t=>{
+ const r=runtime(t);r.ready();
+ r.index.record(run,job(100,{status:'queued',assigned:false,created:clock-3600,started:clock-3600,completed:null}),1);
+ r.index.record(run,job(101,{status:'queued',assigned:false,created:clock-60,started:clock-60,completed:null}),1);
+ const cached=[{activity:r.snapshot()}];
+ let p=pool(mergeActivity(cached,clock,false));
+ assert.equal(p.builds.waiting,2);assert.equal(p.builds.stale_waiting,0);assert.equal(p.builds.oldest_waiting.id,'100');
+ p=pool(mergeActivity(cached,clock+86400-120,false));
+ assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,1);
+ assert.equal(p.builds.oldest_waiting,null);assert.equal(p.builds.oldest_stale_waiting.id,'100');
+ p=pool(mergeActivity(cached,clock+2*86400,false));
+ assert.equal(p.builds.waiting,0);assert.equal(p.builds.stale_waiting,2);assert.equal(p.all.stale_waiting,2);
+ assert.equal('waiting_created' in p.builds,false);
 });
 test('backfill is bounded, restartable and partial until every retained fact is indexed',t=>{
  const r=runtime(t);for(let i=0;i<1201;i++){const j=job(10000+i);r.sql.exec('INSERT INTO jobs VALUES (?,?,?,?,?)',j.id,j.run,1,0,JSON.stringify(j));}
