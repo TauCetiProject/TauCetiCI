@@ -104,3 +104,13 @@ test('a fresh re-run of an old workflow is live; older snapshots stay out of pub
   assert.deepEqual(queuedHours([{status:'queued',created:old,started:old},{status:'pending',created:old},{status:'queued',created:old,started:clock-60}]),
     [[Math.floor(old/3600)*3600,1],[Math.floor((clock-60)/3600)*3600,1]]);
 });
+
+test('an empty snapshot from older accounting counts as observed; a nonempty one stays out',t=>{
+  const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+  const empty={accounting_version:2,pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
+  let result=mergeBacklogs([{partition:repo+'/a',backlog:empty}],false,clock);
+  assert.equal(result.coverage,'observed');assert.equal(result.repositories[repo].waiting_jobs,0);
+  result=mergeBacklogs([{partition:repo+'/a',backlog:empty},{partition:repo+'/b',backlog:{...empty,other_workflows:{...zero,queued:3}}}],false,clock);
+  assert.equal(result.coverage,'partial');assert.equal(result.repositories[repo].other_workflows.queued,0);
+  assert.equal(mergeBacklogs([{partition:repo+'/c',backlog:{accounting_version:2}}],false,clock).coverage,'partial');
+});

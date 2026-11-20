@@ -104,6 +104,13 @@ export function backlogSnapshot(sql: SqlStorage, clock: number) {
   return { ...counts, accounting_version: 3 };
 }
 
+/** Whether a snapshot of any accounting version counts no workflow or job. */
+export const emptyBacklog = (backlog: any) => !!backlog && !backlog.waiting_jobs && !backlog.running_jobs &&
+  !backlog.waiting_created?.length &&
+  ['pr_builds', 'other_workflows'].every(category => backlog[category] &&
+    STATES.every(state => !backlog[category][state]) && backlog[category].oldest_waiting_at == null &&
+    !backlog[category].aging?.length && !backlog[category].waiting_runs?.length);
+
 /** Merges partition snapshots, classifying known GitHub zombies by `clock`:
  * jobs queued and workflows queued without jobs for over STALE_WAITING_SECONDS
  * are counted separately (`stale_waiting_jobs`, `stale`) and never in waiting
@@ -114,8 +121,9 @@ export function mergeBacklogs(partitions: any[], pending: boolean, clock: number
   let partial = pending;
   for (const partition of partitions) {
     const repo = partition.partition?.split('/').slice(0, 2).join('/');
-    // Older snapshots cannot classify zombies: leave them out until recomputed.
-    if (!repo || partition.backlog?.accounting_version !== 3) { partial = true; continue; }
+    // Older snapshots cannot classify zombies: leave them out until recomputed,
+    // unless they hold nothing to classify (most historical partitions).
+    if (!repo || partition.backlog?.accounting_version !== 3 && !emptyBacklog(partition.backlog)) { partial = true; continue; }
     const source = partition.backlog, target = repositories[repo] ||= backlogCounts();
     for (const category of ['pr_builds', 'other_workflows'] as const) {
       const from = source[category], into = target[category];
