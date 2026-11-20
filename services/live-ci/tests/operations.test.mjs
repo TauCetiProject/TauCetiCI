@@ -1460,11 +1460,16 @@ test("1000 jobs use existing facts and paginated operations views with distinct 
             active: true,
             status: i < 600 ? "in_progress" : "queued",
             assigned: i < 600,
+            // Known GitHub zombies: queued for two days.
+            ...(i >= 990 ? { created_at: new Date(Date.now() - 2 * 86400000).toISOString() } : {}),
             observed_at: new Date(Date.now()).toISOString(),
           })),
           pending_workflows: [
             { repository: repo, run_id: "101", run_attempt: 1 },
+            { repository: repo, run_id: "102", run_attempt: 1 },
           ],
+          pending_workflows_created: [[Math.floor(Date.now() / 3600000 - 48) * 3600, 1]],
+          backlog: { accounting_version: 3, pr_builds: {}, other_workflows: {}, waiting_jobs: 0, running_jobs: 0 },
         });
       },
     }),
@@ -1477,8 +1482,10 @@ test("1000 jobs use existing facts and paginated operations views with distinct 
   assert.equal(jobs.job_pages.length, 10);
   assert.deepEqual(jobs.counts, {
     running: 600,
-    queued_jobs: 400,
+    queued_jobs: 390,
+    stale_queued_jobs: 10,
     pending_workflows: 1,
+    stale_pending_workflows: 1,
     active: 1000,
   });
   assert.equal(reads, 1);
@@ -3560,7 +3567,7 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   for(let day=1;day<=3;day++) r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-0'+day,1,clock-86400*day,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date((clock-86400*day)*1000).toISOString()}));
   const scope={running:0,waiting:0,waiting_created:[],waiting_references:[],latest_completion:null,oldest_running:null,oldest_waiting:null};
   let calls=0;
-  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:2,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
+  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:3,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
   const oldRevision=r.operations.get('jobs_revision')||0;
   new Operations(r.ctx);
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,3);
@@ -3578,7 +3585,7 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
 test("upgrade revisits cached activity that predates queued jobs' creation times", async t => {
   const r=runtime(t);await r.send(seed);await r.flush();
   const clock=Date.now()/1000, insert=r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)');
-  const fact=all=>JSON.stringify({jobs:[],pending_workflows:[],backlog:{accounting_version:2},activity:{complete:true,pools:[{pool:'github',all,builds:all,bins:[]}]}});
+  const fact=all=>JSON.stringify({jobs:[],pending_workflows:[],backlog:{accounting_version:3},activity:{complete:true,pools:[{pool:'github',all,builds:all,bins:[]}]}});
   insert.run(repo+'/2026-11-01',1,clock,fact({running:0,waiting:1}));
   insert.run(repo+'/2026-11-02',1,clock,fact({running:0,waiting:0,waiting_created:[],waiting_references:[]}));
   new Operations(r.ctx);
@@ -3590,7 +3597,7 @@ test("a Facts response without queued jobs' creation times is retried as version
   const clock=Date.now()/1000;
   r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/2026-11-01',1,clock,JSON.stringify({jobs:[],pending_workflows:[]}));
   const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
-  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date().toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:2,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date().toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}})})};
+  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date().toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:3,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date().toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}})})};
   await r.request('/tick');await r.flush();
   assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(repo+'/2026-11-01').pending,1);
 });
@@ -3647,7 +3654,7 @@ test("native internal Facts reads may finish after three seconds without a false
 test("backlog counts cover all retained partitions and preserve missing-source uncertainty", async t => {
   const r=runtime(t);await r.send(seed);await r.flush();
   const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
-  const backlog={pr_builds:{...zero,pending:7,oldest_waiting_at:Date.now()/1000-3600},other_workflows:{...zero,stuck:3},waiting_jobs:7,running_jobs:0};
+  const backlog={accounting_version:3,pr_builds:{...zero,pending:7,oldest_waiting_at:Date.now()/1000-3600},other_workflows:{...zero,stuck:3},waiting_jobs:7,running_jobs:0};
   for(let n=0;n<205;n++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/'+n,1,Date.now()/1000-n,JSON.stringify({partition:repo+'/'+n,backlog,jobs:[],pending_workflows:[]}));
   await r.request('/tick');await r.flush();
   let value=r.object(r.manifest().domains.jobs).backlog;
@@ -3665,7 +3672,7 @@ test("backlog counts cover all retained partitions and preserve missing-source u
 test('a scheduled refresh does not invalidate already observed backlog facts',async t=>{
  const r=runtime(t);await r.send(seed);await r.flush();
  const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
- const backlog={accounting_version:2,pr_builds:{...zero,pending:1000},other_workflows:zero,waiting_jobs:10,running_jobs:2};
+ const backlog={accounting_version:3,pr_builds:{...zero,pending:1000},other_workflows:zero,waiting_jobs:10,running_jobs:2};
  r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/fresh',1,Date.now()/1000,
   JSON.stringify({partition:repo+'/fresh',backlog,jobs:[],pending_workflows:[]}));
  const value=r.object(await r.operations.jobsView(r.operations.projection('jobs'))).backlog;
@@ -3678,12 +3685,12 @@ test('quiet unresolved workflows precede metric-only migration and retry older F
  const r=runtime(t);await r.send(seed);await r.flush();
  const clock=Date.now()/1000,unknown=repo+'/2026-10-30';
  const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
- const backlog={accounting_version:2,pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
+ const backlog={accounting_version:3,pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
  for(let day=1;day<=8;day++)r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/2026-10-0'+day,1,clock-10000+day,JSON.stringify({backlog}));
  r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(unknown,1,clock,JSON.stringify({backlog:{...backlog,other_workflows:{...zero,unconfirmed:3}}}));
  let ready=false;const calls=[];
  globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{
-  calls.push(partition);return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,jobs:[],pending_workflows:[],backlog:{...backlog,accounting_version:partition===unknown&&!ready?1:2}});
+  calls.push(partition);return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,jobs:[],pending_workflows:[],backlog:{...backlog,accounting_version:partition===unknown&&!ready?2:3}});
  }})};
  await r.operations.collectJobs(r.operations.projection('jobs'));
  assert.equal(calls[0],unknown,'unresolved workflow accounting comes before older metric-only sources');
@@ -3692,4 +3699,17 @@ test('quiet unresolved workflows precede metric-only migration and retry older F
  ready=true;r.advance(11000);await r.operations.collectJobs(r.operations.projection('jobs'));
  assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(unknown).pending,0,'quiet source finishes without another webhook');
  assert.equal(r.database.prepare('SELECT count(*) n FROM ops_failures WHERE id=?').get(unknown).n,0);
+});
+
+test('legacy snapshots without workflow ages stay out of pending workflow counts',async t=>{
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+ const backlog={pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
+ const insert=(name,data)=>r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/'+name,1,Date.now()/1000,JSON.stringify({partition:repo+'/'+name,jobs:[],...data}));
+ insert('old',{backlog:{...backlog,accounting_version:2},pending_workflows:[],pending_workflows_count:5});
+ insert('older',{pending_workflows:[],pending_workflows_count:7}); // before backlog accounting
+ insert('new',{backlog:{...backlog,accounting_version:3},pending_workflows:[],pending_workflows_count:2,pending_workflows_created:[[Math.floor(Date.now()/3600000-48)*3600,1]]});
+ const value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
+ assert.equal(value.counts.pending_workflows,1);assert.equal(value.counts.stale_pending_workflows,1);
+ assert.equal(value.coverage,'partial');
 });

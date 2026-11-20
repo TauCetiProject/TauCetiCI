@@ -1,6 +1,6 @@
 /** Prepared operations publication. Public GETs never enter this object. */
 import { historyFrame } from "./operations-history";
-import { mergeActivity } from "./operations-activity";
+import { mergeActivity, staleAt, STALE_WAITING_SECONDS } from "./operations-activity";
 import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import { PUBLIC_POOLS } from "./runner-registry";
@@ -130,7 +130,7 @@ export class Operations {
     // (and, for activity cached before waiting_created, its queued jobs' ages).
     const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
       WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2
+        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
           OR (json_array_length(data,'$.activity.pools') > 0
             AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
       RETURNING name`).toArray();
@@ -1241,7 +1241,7 @@ export class Operations {
           if (
             value.schema !== "tauceti.operations.partition/v1" ||
             value.partition !== p.name ||
-            (value.backlog && value.backlog.accounting_version !== 2) ||
+            (value.backlog && value.backlog.accounting_version !== 3) ||
             (value.activity && (!Array.isArray(value.activity.pools) || value.activity.pools.some((pool: any) => [pool.all, pool.builds].some((scope: any) =>
               !Array.isArray(scope?.waiting_created) || !Array.isArray(scope?.waiting_references)))))
           )
@@ -1762,6 +1762,16 @@ export class Operations {
     if (JSON.stringify(estimates) !== JSON.stringify(previousEstimates || {}))
       this.set("lake_job_estimates", estimates);
     const jobs = projected.map((j) => withLakeEstimate(j, estimates));
+    const staleBefore = now() - STALE_WAITING_SECONDS;
+    const staleJob = (j: any) => {
+      const created = Date.parse(j.created_at);
+      return Number.isFinite(created) && staleAt(created / 1000, staleBefore);
+    };
+    // Snapshots before accounting version 3 carry no workflow ages: leave
+    // their pending workflows out, with partial coverage, until recomputed.
+    const legacy = (p: any) => p.backlog?.accounting_version !== 3;
+    const stalePending = (p: any) => (p.pending_workflows_created || [])
+      .reduce((n: number, [hour, count]: [number, number]) => n + (staleAt(hour, staleBefore) ? count : 0), 0);
     const active = jobs.filter((j) => j.active),
       completedBuilds = jobs.filter(
         (j) => !j.active && BUILD_CLASSES.includes(j.job_class),
@@ -1798,7 +1808,7 @@ export class Operations {
       computed_at: new Date(now() * 1000).toISOString(),
       received_at: received,
       coverage: facts.length
-        ? partitions.some((p) => !p.data)
+        ? partitions.some((p) => !p.data) || facts.some(legacy)
           ? "partial"
           : "observed"
         : "unavailable",
@@ -1838,7 +1848,7 @@ export class Operations {
           "SELECT name,data,pending FROM ops_partitions").toArray()
           .filter(p=>projection.repositories.includes(p.name.split('/').slice(0,2).join('/')));
         return mergeBacklogs(sources.flatMap(p=>p.data?[JSON.parse(p.data)]:[]),
-          sources.some(p=>!p.data));
+          sources.some(p=>!p.data), now());
       })(),
       observer: {
         publication_at: new Date(now() * 1000).toISOString(),
@@ -1850,14 +1860,19 @@ export class Operations {
       counts: {
         running: active.filter((j) => j.status === "in_progress" && j.assigned)
           .length,
+        // Known GitHub zombies (STALE_WAITING_SECONDS) are counted apart, never as waiting.
         queued_jobs: active.filter(
-          (j) => j.status !== "in_progress" || !j.assigned,
+          (j) => (j.status !== "in_progress" || !j.assigned) && !staleJob(j),
+        ).length,
+        stale_queued_jobs: active.filter(
+          (j) => (j.status !== "in_progress" || !j.assigned) && staleJob(j),
         ).length,
         pending_workflows: facts.reduce(
-          (n, p) =>
-            n + (p.pending_workflows_count ?? p.pending_workflows.length),
+          (n, p) => legacy(p) ? n :
+            n + (p.pending_workflows_count ?? p.pending_workflows.length) - stalePending(p),
           0,
         ),
+        stale_pending_workflows: facts.reduce((n, p) => legacy(p) ? n : n + stalePending(p), 0),
         active: active.length,
       },
       job_pages: await pages("tauceti.operations.job-page/v1", [

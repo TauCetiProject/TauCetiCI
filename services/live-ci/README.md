@@ -353,8 +353,21 @@ from retained run and job facts, before run/job/partition detail limits. It
 separates pending and queued workflows from verified stuck records and records
 without confirmed active jobs. A stuck classification requires a verified
 empty/terminal attempt, no active jobs or placeholders, and 90 minutes without
-a run transition. Age alone never removes a pending job. Unknown job inventory
-is reported separately; this summary neither cancels nor dispatches work.
+a run transition. Age alone never removes a pending, waiting or requested
+workflow. Unknown job inventory is reported separately; this summary neither
+cancels nor dispatches work.
+
+Known GitHub zombies are left out of every waiting figure. A job not running
+24 hours after it was created, a workflow queued with no jobs 24 hours after it
+was created, and a queued or in-progress workflow whose remaining jobs are all
+such jobs, are counted only in `stale_waiting_jobs` and the per-category `stale`
+count. They are never in `waiting_jobs`, `queued`, `stuck` or
+`oldest_waiting_at`. GitHub cancels self-hosted jobs queued that long, so such
+records never start and hold no runner; some are completions the service
+missed. Facts snapshots carry creation hours, and the publication classifies
+them by its own clock, so a quiet partition's records still age out. We never
+file GitHub support requests about zombie runs; see TauCetiWorker
+`docs/queue/github-zombie-runs.md`.
 Counts include only the latest retained attempt, and missing or pending source
 partitions make coverage partial. Existing partition reconciliation refreshes
 quiet cached partitions after an upgrade. Summary reads make no GitHub requests.
