@@ -6,10 +6,11 @@ const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
   running: 0, waiting: 0, stale_waiting: 0,
-  /** Creation times ([created, count], created null if unknown) of every queued job,
-   * so a merge classifies staleness by its own clock: a partition's cached snapshot
-   * is only recomputed when that partition changes. */
-  waiting_created: [] as [number | null, number][],
+  /** Queued jobs grouped by creation time ([created, count, one job's reference],
+   * created null if unknown), so a merge classifies staleness and picks the oldest
+   * jobs by its own clock: a partition's cached snapshot is only recomputed when that
+   * partition changes. */
+  waiting_created: [] as [number | null, number, any][],
   latest_completion: null as any,
   oldest_running: null as any,
   oldest_waiting: null as any,
@@ -102,12 +103,13 @@ export class ActivityIndex {
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
         scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
-    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n
+    // SQLite takes the bare `ref` from the row that supplies MIN(id).
+    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n,MIN(id) first,ref
       FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,created`).toArray()) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all]) {
         const bin = scope.waiting_created.find(b => b[0] === row.created);
-        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n]);
+        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n, JSON.parse(row.ref)]);
       }
     }
     for (const pool of pools) for (const [scope, build] of [[pool.all, false], [pool.builds, true]] as const) {
@@ -145,7 +147,6 @@ export class ActivityIndex {
 export function mergeActivity(facts: any[], clock: number, missing: boolean) {
   const through = Math.floor(clock / 60) * 60;
   const staleBefore = clock - STALE_WAITING_SECONDS;
-  const isStale = (job: any) => Date.parse(job?.created_at) / 1000 < staleBefore;
   const pools = new Map<string, any>();
   for (const fact of facts) for (const row of fact.activity?.pools || []) {
     let pool = pools.get(row.pool);
@@ -153,20 +154,21 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
     for (const name of ["all", "builds"]) {
       const scope = pool[name], incoming = row[name];
       scope.running += incoming.running;
-      if (Array.isArray(incoming.waiting_created)) {
-        for (const [created, n] of incoming.waiting_created)
-          if (created !== null && created < staleBefore) scope.stale_waiting += n; else scope.waiting += n;
-      } else {
-        scope.waiting += incoming.waiting; scope.stale_waiting += incoming.stale_waiting || 0;
-      }
       if (incoming.latest_completion) scope.latest_completion = later(scope.latest_completion, incoming.latest_completion, "completed_at");
       if (incoming.oldest_running) scope.oldest_running = earlier(scope.oldest_running, incoming.oldest_running, "started_at");
-      // A cached snapshot's oldest waiting job may have gone stale since it was computed.
-      if (incoming.oldest_waiting && isStale(incoming.oldest_waiting))
-        scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_waiting, "created_at");
-      else if (incoming.oldest_waiting) scope.oldest_waiting = earlier(scope.oldest_waiting, incoming.oldest_waiting, "created_at");
-      if (incoming.oldest_stale_waiting)
-        scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_stale_waiting, "created_at");
+      if (Array.isArray(incoming.waiting_created)) {
+        for (const [created, n, job] of incoming.waiting_created) {
+          const stale = created !== null && created < staleBefore;
+          if (stale) { scope.stale_waiting += n; scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, job, "created_at"); }
+          else { scope.waiting += n; scope.oldest_waiting = earlier(scope.oldest_waiting, job, "created_at"); }
+        }
+      } else {
+        // Snapshots from before waiting_created: classified when they were computed.
+        scope.waiting += incoming.waiting; scope.stale_waiting += incoming.stale_waiting || 0;
+        if (incoming.oldest_waiting) scope.oldest_waiting = earlier(scope.oldest_waiting, incoming.oldest_waiting, "created_at");
+        if (incoming.oldest_stale_waiting)
+          scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, incoming.oldest_stale_waiting, "created_at");
+      }
       scope.windows ||= WINDOWS.map(seconds => ({ seconds, finished: 0, success: 0, failure: 0, cancelled: 0, skipped: 0, other: 0 }));
       for (const bin of row.bins) for (const window of scope.windows) {
         if (bin[0] < through - window.seconds || bin[0] >= through) continue;

@@ -126,10 +126,13 @@ export class Operations {
       CREATE INDEX IF NOT EXISTS ops_host_samples_age ON ops_host_samples(resolution,bucket);
     `);
     // Quiet historical sources will not emit another webhook. Revisit legacy
-    // cached partitions through the existing bounded collector to seed activity.
+    // cached partitions through the existing bounded collector to seed activity
+    // (and, for activity cached before waiting_created, its queued jobs' ages).
     const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
       WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2)
+        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2
+          OR (json_array_length(data,'$.activity.pools') > 0
+            AND json_type(data,'$.activity.pools[0].all.waiting_created') IS NULL))
       RETURNING name`).toArray();
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);

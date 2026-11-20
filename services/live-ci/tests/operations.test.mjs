@@ -3558,7 +3558,7 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   const r=runtime(t);await r.send(seed);await r.flush();
   const clock=Date.now()/1000;
   for(let day=1;day<=3;day++) r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)').run(repo+'/2026-11-0'+day,1,clock-86400*day,JSON.stringify({jobs:[],pending_workflows:[],received_at:new Date((clock-86400*day)*1000).toISOString()}));
-  const scope={running:0,waiting:0,latest_completion:null,oldest_running:null,oldest_waiting:null};
+  const scope={running:0,waiting:0,waiting_created:[],latest_completion:null,oldest_running:null,oldest_waiting:null};
   let calls=0;
   globalThis.__operationsTestEnv.FACTS={idFromName:id=>id,get:partition=>({fetch:async()=>{calls++;return Response.json({schema:'tauceti.operations.partition/v1',partition,revision:1,received_at:new Date(Date.now()).toISOString(),jobs:[],pending_workflows:[],backlog:{accounting_version:2,pr_builds:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},other_workflows:{pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null},waiting_jobs:0,running_jobs:0},activity:{complete:true,computed_at:new Date(Date.now()).toISOString(),pools:[{pool:'github',all:scope,builds:scope,bins:[]}]}});}})};
   const oldRevision=r.operations.get('jobs_revision')||0;
@@ -3573,6 +3573,16 @@ test("upgrade schedules quiet legacy Facts partitions without another GitHub eve
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,0);
   new Operations(r.ctx);
   assert.equal(r.database.prepare('SELECT count(*) n FROM ops_partitions WHERE pending=1').get().n,0,'upgraded cached facts stay quiet');
+});
+
+test("upgrade revisits cached activity that predates queued jobs' creation times", async t => {
+  const r=runtime(t);await r.send(seed);await r.flush();
+  const clock=Date.now()/1000, insert=r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)');
+  const fact=all=>JSON.stringify({jobs:[],pending_workflows:[],backlog:{accounting_version:2},activity:{complete:true,pools:[{pool:'github',all,builds:all,bins:[]}]}});
+  insert.run(repo+'/2026-11-01',1,clock,fact({running:0,waiting:1}));
+  insert.run(repo+'/2026-11-02',1,clock,fact({running:0,waiting:0,waiting_created:[]}));
+  new Operations(r.ctx);
+  assert.deepEqual(r.database.prepare('SELECT name FROM ops_partitions WHERE pending=1').all().map(row=>row.name),[repo+'/2026-11-01']);
 });
 
 test("historical activity migration leaves two live source lanes and still advances old work", async t => {

@@ -68,10 +68,19 @@ test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the s
  assert.equal(p.builds.waiting,2);assert.equal(p.builds.stale_waiting,0);assert.equal(p.builds.oldest_waiting.id,'100');
  p=pool(mergeActivity(cached,clock+86400-120,false));
  assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,1);
- assert.equal(p.builds.oldest_waiting,null);assert.equal(p.builds.oldest_stale_waiting.id,'100');
+ assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
  p=pool(mergeActivity(cached,clock+2*86400,false));
  assert.equal(p.builds.waiting,0);assert.equal(p.builds.stale_waiting,2);assert.equal(p.all.stale_waiting,2);
  assert.equal('waiting_created' in p.builds,false);
+});
+test('the oldest live waiting job survives an older job in the same partition going stale',t=>{
+ const a=runtime(t),b=runtime(t);a.ready();b.ready();
+ a.index.record(run,job(100,{status:'queued',assigned:false,created:clock-3600,started:clock-3600,completed:null}),1);
+ a.index.record(run,job(101,{status:'queued',assigned:false,created:clock-1800,started:clock-1800,completed:null}),1);
+ b.index.record(run,job(102,{status:'queued',assigned:false,created:clock-60,started:clock-60,completed:null}),1);
+ const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock+86400-2700,false));
+ assert.equal(p.builds.waiting,2);assert.equal(p.builds.stale_waiting,1);
+ assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
 });
 test('backfill is bounded, restartable and partial until every retained fact is indexed',t=>{
  const r=runtime(t);for(let i=0;i<1201;i++){const j=job(10000+i);r.sql.exec('INSERT INTO jobs VALUES (?,?,?,?,?)',j.id,j.run,1,0,JSON.stringify(j));}
