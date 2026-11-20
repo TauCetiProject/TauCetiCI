@@ -3580,7 +3580,7 @@ test("upgrade revisits cached activity that predates queued jobs' creation times
   const clock=Date.now()/1000, insert=r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,0,?,?)');
   const fact=all=>JSON.stringify({jobs:[],pending_workflows:[],backlog:{accounting_version:2},activity:{complete:true,pools:[{pool:'github',all,builds:all,bins:[]}]}});
   insert.run(repo+'/2026-11-01',1,clock,fact({running:0,waiting:1}));
-  insert.run(repo+'/2026-11-02',1,clock,fact({running:0,waiting:0,waiting_created:[]}));
+  insert.run(repo+'/2026-11-02',1,clock,fact({running:0,waiting:0,waiting_created:[],waiting_references:[]}));
   new Operations(r.ctx);
   assert.deepEqual(r.database.prepare('SELECT name FROM ops_partitions WHERE pending=1').all().map(row=>row.name),[repo+'/2026-11-01']);
 });

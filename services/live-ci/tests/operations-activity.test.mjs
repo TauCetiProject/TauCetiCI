@@ -61,12 +61,12 @@ test('jobs queued longer than GitHub keeps them are counted as stale, not as wai
 });
 test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the snapshot clock',t=>{
  const r=runtime(t);r.ready();
- r.index.record(run,job(100,{status:'queued',assigned:false,created:clock-3600,started:clock-3600,completed:null}),1);
- r.index.record(run,job(101,{status:'queued',assigned:false,created:clock-60,started:clock-60,completed:null}),1);
+ r.index.record(run,job(100,{status:'queued',assigned:false,created:clock-7200,started:null,completed:null}),1);
+ r.index.record(run,job(101,{status:'queued',assigned:false,created:clock-10,started:null,completed:null}),1);
  const cached=[{activity:r.snapshot()}];
  let p=pool(mergeActivity(cached,clock,false));
  assert.equal(p.builds.waiting,2);assert.equal(p.builds.stale_waiting,0);assert.equal(p.builds.oldest_waiting.id,'100');
- p=pool(mergeActivity(cached,clock+86400-120,false));
+ p=pool(mergeActivity(cached,clock+86400-1800,false));
  assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,1);
  assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
  p=pool(mergeActivity(cached,clock+2*86400,false));
@@ -76,8 +76,8 @@ test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the s
 test('past the reference bound, a partition whose referenced jobs all went stale reports its oldest live job as unknown',async t=>{
  const {WAITING_REFERENCES}=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
  const r=runtime(t);r.ready();
- for(let i=0;i<WAITING_REFERENCES;i++)r.index.record(run,job(100+i,{status:'queued',assigned:false,created:clock-3600-i,started:null,completed:null}),1);
- r.index.record(run,job(500,{status:'queued',assigned:false,created:clock-60,started:null,completed:null}),1);
+ for(let i=0;i<WAITING_REFERENCES;i++)r.index.record(run,job(100+i,{status:'queued',assigned:false,created:clock-7200-i,started:null,completed:null}),1);
+ r.index.record(run,job(500,{status:'queued',assigned:false,created:clock-10,started:null,completed:null}),1);
  const snapshot=r.snapshot();assert.equal(pool(snapshot).builds.waiting_references.length,WAITING_REFERENCES);
  const p=pool(mergeActivity([{activity:snapshot}],clock+86400-1800,false));
  assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,WAITING_REFERENCES);
@@ -85,12 +85,20 @@ test('past the reference bound, a partition whose referenced jobs all went stale
 });
 test('the oldest live waiting job survives an older job in the same partition going stale',t=>{
  const a=runtime(t),b=runtime(t);a.ready();b.ready();
- a.index.record(run,job(100,{status:'queued',assigned:false,created:clock-3600,started:clock-3600,completed:null}),1);
- a.index.record(run,job(101,{status:'queued',assigned:false,created:clock-1800,started:clock-1800,completed:null}),1);
- b.index.record(run,job(102,{status:'queued',assigned:false,created:clock-60,started:clock-60,completed:null}),1);
- const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock+86400-2700,false));
+ a.index.record(run,job(100,{status:'queued',assigned:false,created:clock-7200,started:null,completed:null}),1);
+ a.index.record(run,job(101,{status:'queued',assigned:false,created:clock-10,started:null,completed:null}),1);
+ b.index.record(run,job(102,{status:'queued',assigned:false,created:clock-5,started:null,completed:null}),1);
+ const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock+86400-1800,false));
  assert.equal(p.builds.waiting,2);assert.equal(p.builds.stale_waiting,1);
  assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
+});
+test('a missing creation time is classified the same way in counts and references',t=>{
+ const r=runtime(t);r.ready();
+ r.index.record(run,job(100,{status:'queued',assigned:false,created:0,started:null,completed:null}),1);
+ const p=pool(mergeActivity([{activity:r.snapshot()}],clock,false));
+ assert.equal(p.builds.waiting+p.builds.stale_waiting,1);
+ assert.equal(p.builds.stale_waiting===1,p.builds.oldest_stale_waiting?.id==='100');
+ assert.equal(p.builds.waiting===1,p.builds.oldest_waiting?.id==='100');
 });
 test('backfill is bounded, restartable and partial until every retained fact is indexed',t=>{
  const r=runtime(t);for(let i=0;i<1201;i++){const j=job(10000+i);r.sql.exec('INSERT INTO jobs VALUES (?,?,?,?,?)',j.id,j.run,1,0,JSON.stringify(j));}

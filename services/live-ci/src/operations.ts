@@ -132,7 +132,7 @@ export class Operations {
       WHERE pending=0 AND data IS NOT NULL AND
         (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 2
           OR (json_array_length(data,'$.activity.pools') > 0
-            AND json_type(data,'$.activity.pools[0].all.waiting_created') IS NULL))
+            AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
       RETURNING name`).toArray();
     if (legacy.length) {
       this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
@@ -1242,8 +1242,8 @@ export class Operations {
             value.schema !== "tauceti.operations.partition/v1" ||
             value.partition !== p.name ||
             (value.backlog && value.backlog.accounting_version !== 2) ||
-            (value.activity?.pools?.length &&
-              !Array.isArray(value.activity.pools[0].all?.waiting_created))
+            (value.activity && (!Array.isArray(value.activity.pools) || value.activity.pools.some((pool: any) => [pool.all, pool.builds].some((scope: any) =>
+              !Array.isArray(scope?.waiting_created) || !Array.isArray(scope?.waiting_references)))))
           )
             throw new Error("Facts version skew");
           if (

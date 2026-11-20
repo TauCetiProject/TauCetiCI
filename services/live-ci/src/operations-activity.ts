@@ -6,12 +6,13 @@ const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
   running: 0, waiting: 0, stale_waiting: 0,
-  /** Queued jobs counted by creation time ([created, count], created null if
-   * unknown), plus references to the oldest WAITING_REFERENCES of them, so a merge
+  /** Queued jobs counted by creation hour ([hour, count], hour null if unknown),
+   * plus the oldest WAITING_REFERENCES of them ([created, reference]), so a merge
    * classifies staleness and picks the oldest jobs by its own clock: a partition's
-   * cached snapshot is only recomputed when that partition changes. */
+   * cached snapshot is only recomputed when that partition changes. Hours bound the
+   * snapshot's size; a job counts as stale once its whole hour is. */
   waiting_created: [] as [number | null, number][],
-  waiting_references: [] as any[],
+  waiting_references: [] as [number | null, any][],
   latest_completion: null as any,
   oldest_running: null as any,
   oldest_waiting: null as any,
@@ -24,6 +25,11 @@ export const activityScope = () => ({
 export const STALE_WAITING_SECONDS = 86400;
 /** Bounds snapshot size; past it, a merge reports the oldest live job as unknown. */
 export const WAITING_REFERENCES = 20;
+const HOUR = 3600;
+/** Whether a queued job created at `created` (null if unknown) is stale at `staleBefore`,
+ * judged by its whole creation hour so that counts and references agree. */
+const staleAt = (created: number | null, staleBefore: number) =>
+  created !== null && Math.floor(created / HOUR) * HOUR + HOUR <= staleBefore;
 const earlier = (a: any, b: any, field: string) => {
   if (!a || !Number.isFinite(Date.parse(b[field]))) return b;
   if (!Number.isFinite(Date.parse(a[field]))) return a;
@@ -106,12 +112,12 @@ export class ActivityIndex {
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
         scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
-    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n
-      FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,created`).toArray()) {
+    for (const row of this.sql.exec<any>(`SELECT pool,build,CAST(created/${HOUR} AS INTEGER)*${HOUR} hour,COUNT(*) n
+      FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,hour`).toArray()) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all]) {
-        const bin = scope.waiting_created.find(b => b[0] === row.created);
-        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n]);
+        const bin = scope.waiting_created.find(b => b[0] === row.hour);
+        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.hour, row.n]);
       }
     }
     for (const pool of pools) for (const [scope, build] of [[pool.all, false], [pool.builds, true]] as const) {
@@ -127,9 +133,9 @@ export class ActivityIndex {
         (scope as any)[field] = row ? JSON.parse(row.ref) : null;
       }
       // Unknown creation times sort first, as in earlier().
-      scope.waiting_references = this.sql.exec<any>(`SELECT ref FROM ops_activity WHERE pool=?${extra}
+      scope.waiting_references = this.sql.exec<any>(`SELECT created,ref FROM ops_activity WHERE pool=?${extra}
         AND active=1 AND running=0 ORDER BY created IS NOT NULL,created ASC,id LIMIT ${WAITING_REFERENCES}`,
-        pool.pool).toArray().map(r => JSON.parse(r.ref));
+        pool.pool).toArray().map(r => [r.created, JSON.parse(r.ref)]);
       for (const kind of build ? [1] : [0, 1]) {
         const row = this.sql.exec<any>("SELECT ref FROM ops_activity WHERE pool=? AND build=? AND completed IS NOT NULL AND completed<=? ORDER BY completed DESC,id LIMIT 1", pool.pool, kind, clock).toArray()[0];
         if (row) scope.latest_completion = later(scope.latest_completion, JSON.parse(row.ref), "completed_at");
@@ -163,15 +169,13 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
       if (incoming.latest_completion) scope.latest_completion = later(scope.latest_completion, incoming.latest_completion, "completed_at");
       if (incoming.oldest_running) scope.oldest_running = earlier(scope.oldest_running, incoming.oldest_running, "started_at");
       if (Array.isArray(incoming.waiting_created) && Array.isArray(incoming.waiting_references)) {
-        const stale = (created: number | null) => created !== null && created < staleBefore;
         let live = 0;
-        for (const [created, n] of incoming.waiting_created)
-          if (stale(created)) scope.stale_waiting += n; else live += n;
+        for (const [hour, n] of incoming.waiting_created)
+          if (staleAt(hour, staleBefore)) scope.stale_waiting += n; else live += n;
         scope.waiting += live;
         let liveReference = null;
-        for (const job of incoming.waiting_references) {
-          const created = job.created_at === null ? null : Date.parse(job.created_at) / 1000;
-          if (stale(created)) scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, job, "created_at");
+        for (const [created, job] of incoming.waiting_references) {
+          if (staleAt(created, staleBefore)) scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, job, "created_at");
           else if (!liveReference) liveReference = job;
         }
         // Every referenced job went stale but live ones remain: their oldest is unknown.
