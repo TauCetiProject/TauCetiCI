@@ -1767,6 +1767,9 @@ export class Operations {
       const created = Date.parse(j.created_at);
       return Number.isFinite(created) && staleAt(created / 1000, staleBefore);
     };
+    // Snapshots before accounting version 3 carry no workflow ages: leave
+    // their pending workflows out, with partial coverage, until recomputed.
+    const legacy = (p: any) => !!p.backlog && p.backlog.accounting_version !== 3;
     const stalePending = (p: any) => (p.pending_workflows_created || [])
       .reduce((n: number, [hour, count]: [number, number]) => n + (staleAt(hour, staleBefore) ? count : 0), 0);
     const active = jobs.filter((j) => j.active),
@@ -1805,7 +1808,7 @@ export class Operations {
       computed_at: new Date(now() * 1000).toISOString(),
       received_at: received,
       coverage: facts.length
-        ? partitions.some((p) => !p.data)
+        ? partitions.some((p) => !p.data) || facts.some(legacy)
           ? "partial"
           : "observed"
         : "unavailable",
@@ -1865,11 +1868,11 @@ export class Operations {
           (j) => (j.status !== "in_progress" || !j.assigned) && staleJob(j),
         ).length,
         pending_workflows: facts.reduce(
-          (n, p) =>
+          (n, p) => legacy(p) ? n :
             n + (p.pending_workflows_count ?? p.pending_workflows.length) - stalePending(p),
           0,
         ),
-        stale_pending_workflows: facts.reduce((n, p) => n + stalePending(p), 0),
+        stale_pending_workflows: facts.reduce((n, p) => legacy(p) ? n : n + stalePending(p), 0),
         active: active.length,
       },
       job_pages: await pages("tauceti.operations.job-page/v1", [

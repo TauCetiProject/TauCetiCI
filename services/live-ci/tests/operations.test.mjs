@@ -3699,3 +3699,15 @@ test('quiet unresolved workflows precede metric-only migration and retry older F
  assert.equal(r.database.prepare('SELECT pending FROM ops_partitions WHERE name=?').get(unknown).pending,0,'quiet source finishes without another webhook');
  assert.equal(r.database.prepare('SELECT count(*) n FROM ops_failures WHERE id=?').get(unknown).n,0);
 });
+
+test('legacy snapshots without workflow ages stay out of pending workflow counts',async t=>{
+ const r=runtime(t);await r.send(seed);await r.flush();
+ const zero={pending:0,queued:0,in_progress:0,stuck:0,unconfirmed:0,oldest_waiting_at:null};
+ const backlog={pr_builds:zero,other_workflows:zero,waiting_jobs:0,running_jobs:0};
+ const insert=(name,data)=>r.database.prepare('INSERT INTO ops_partitions VALUES (?,?,1,?,?)').run(repo+'/'+name,1,Date.now()/1000,JSON.stringify({partition:repo+'/'+name,jobs:[],...data}));
+ insert('old',{backlog:{...backlog,accounting_version:2},pending_workflows:[],pending_workflows_count:5});
+ insert('new',{backlog:{...backlog,accounting_version:3},pending_workflows:[],pending_workflows_count:2,pending_workflows_created:[[Math.floor(Date.now()/3600000-48)*3600,1]]});
+ const value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
+ assert.equal(value.counts.pending_workflows,1);assert.equal(value.counts.stale_pending_workflows,1);
+ assert.equal(value.coverage,'partial');
+});
