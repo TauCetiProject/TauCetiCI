@@ -56,7 +56,7 @@ test('jobs queued longer than GitHub keeps them are counted as stale, not as wai
  const p=pool(mergeActivity([{activity:a.snapshot()},{activity:b.snapshot()}],clock,false));
  assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,2);assert.equal(p.builds.running,1);
  assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
- const legacy=pool(mergeActivity([{activity:{...a.snapshot(),pools:a.snapshot().pools.map(q=>({...q,builds:{...q.builds,stale_waiting:undefined,waiting_created:undefined},all:{...q.all,stale_waiting:undefined,waiting_created:undefined}}))}}],clock,false));
+ const legacy=pool(mergeActivity([{activity:{...a.snapshot(),pools:a.snapshot().pools.map(q=>({...q,builds:{...q.builds,stale_waiting:undefined,waiting_created:undefined,waiting_references:undefined},all:{...q.all,stale_waiting:undefined,waiting_created:undefined,waiting_references:undefined}}))}}],clock,false));
  assert.equal(legacy.builds.stale_waiting,0);assert.equal(legacy.builds.waiting,1);
 });
 test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the snapshot clock',t=>{
@@ -71,7 +71,17 @@ test('a cached snapshot\'s waiting jobs turn stale at the merge clock, not the s
  assert.equal(p.builds.oldest_waiting.id,'101');assert.equal(p.builds.oldest_stale_waiting.id,'100');
  p=pool(mergeActivity(cached,clock+2*86400,false));
  assert.equal(p.builds.waiting,0);assert.equal(p.builds.stale_waiting,2);assert.equal(p.all.stale_waiting,2);
- assert.equal('waiting_created' in p.builds,false);
+ assert.equal('waiting_created' in p.builds,false);assert.equal('waiting_references' in p.builds,false);
+});
+test('past the reference bound, a partition whose referenced jobs all went stale reports its oldest live job as unknown',async t=>{
+ const {WAITING_REFERENCES}=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+ const r=runtime(t);r.ready();
+ for(let i=0;i<WAITING_REFERENCES;i++)r.index.record(run,job(100+i,{status:'queued',assigned:false,created:clock-3600-i,started:null,completed:null}),1);
+ r.index.record(run,job(500,{status:'queued',assigned:false,created:clock-60,started:null,completed:null}),1);
+ const snapshot=r.snapshot();assert.equal(pool(snapshot).builds.waiting_references.length,WAITING_REFERENCES);
+ const p=pool(mergeActivity([{activity:snapshot}],clock+86400-1800,false));
+ assert.equal(p.builds.waiting,1);assert.equal(p.builds.stale_waiting,WAITING_REFERENCES);
+ assert.equal(p.builds.oldest_waiting.created_at,null);assert.equal(p.builds.oldest_stale_waiting.id,String(100+WAITING_REFERENCES-1));
 });
 test('the oldest live waiting job survives an older job in the same partition going stale',t=>{
  const a=runtime(t),b=runtime(t);a.ready();b.ready();

@@ -1241,7 +1241,9 @@ export class Operations {
           if (
             value.schema !== "tauceti.operations.partition/v1" ||
             value.partition !== p.name ||
-            (value.backlog && value.backlog.accounting_version !== 2)
+            (value.backlog && value.backlog.accounting_version !== 2) ||
+            (value.activity?.pools?.length &&
+              !Array.isArray(value.activity.pools[0].all?.waiting_created))
           )
             throw new Error("Facts version skew");
           if (

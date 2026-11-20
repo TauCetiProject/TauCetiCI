@@ -6,11 +6,12 @@ const WINDOWS = [3600, 10800, 86400];
 const RESULTS = ["success", "failure", "cancelled", "skipped", "other"];
 export const activityScope = () => ({
   running: 0, waiting: 0, stale_waiting: 0,
-  /** Queued jobs grouped by creation time ([created, count, one job's reference],
-   * created null if unknown), so a merge classifies staleness and picks the oldest
-   * jobs by its own clock: a partition's cached snapshot is only recomputed when that
-   * partition changes. */
-  waiting_created: [] as [number | null, number, any][],
+  /** Queued jobs counted by creation time ([created, count], created null if
+   * unknown), plus references to the oldest WAITING_REFERENCES of them, so a merge
+   * classifies staleness and picks the oldest jobs by its own clock: a partition's
+   * cached snapshot is only recomputed when that partition changes. */
+  waiting_created: [] as [number | null, number][],
+  waiting_references: [] as any[],
   latest_completion: null as any,
   oldest_running: null as any,
   oldest_waiting: null as any,
@@ -21,6 +22,8 @@ export const activityScope = () => ({
  * record that will never start (a known "zombie"). It is counted separately so
  * that it does not read as live demand. */
 export const STALE_WAITING_SECONDS = 86400;
+/** Bounds snapshot size; past it, a merge reports the oldest live job as unknown. */
+export const WAITING_REFERENCES = 20;
 const earlier = (a: any, b: any, field: string) => {
   if (!a || !Number.isFinite(Date.parse(b[field]))) return b;
   if (!Number.isFinite(Date.parse(a[field]))) return a;
@@ -103,13 +106,12 @@ export class ActivityIndex {
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
         scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
-    // SQLite takes the bare `ref` from the row that supplies MIN(id).
-    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n,MIN(id) first,ref
+    for (const row of this.sql.exec<any>(`SELECT pool,build,created,COUNT(*) n
       FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,created`).toArray()) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all]) {
         const bin = scope.waiting_created.find(b => b[0] === row.created);
-        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n, JSON.parse(row.ref)]);
+        if (bin) bin[1] += row.n; else scope.waiting_created.push([row.created, row.n]);
       }
     }
     for (const pool of pools) for (const [scope, build] of [[pool.all, false], [pool.builds, true]] as const) {
@@ -124,6 +126,10 @@ export class ActivityIndex {
           pool.pool, ...bound).toArray()[0];
         (scope as any)[field] = row ? JSON.parse(row.ref) : null;
       }
+      // Unknown creation times sort first, as in earlier().
+      scope.waiting_references = this.sql.exec<any>(`SELECT ref FROM ops_activity WHERE pool=?${extra}
+        AND active=1 AND running=0 ORDER BY created IS NOT NULL,created ASC,id LIMIT ${WAITING_REFERENCES}`,
+        pool.pool).toArray().map(r => JSON.parse(r.ref));
       for (const kind of build ? [1] : [0, 1]) {
         const row = this.sql.exec<any>("SELECT ref FROM ops_activity WHERE pool=? AND build=? AND completed IS NOT NULL AND completed<=? ORDER BY completed DESC,id LIMIT 1", pool.pool, kind, clock).toArray()[0];
         if (row) scope.latest_completion = later(scope.latest_completion, JSON.parse(row.ref), "completed_at");
@@ -156,12 +162,21 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
       scope.running += incoming.running;
       if (incoming.latest_completion) scope.latest_completion = later(scope.latest_completion, incoming.latest_completion, "completed_at");
       if (incoming.oldest_running) scope.oldest_running = earlier(scope.oldest_running, incoming.oldest_running, "started_at");
-      if (Array.isArray(incoming.waiting_created)) {
-        for (const [created, n, job] of incoming.waiting_created) {
-          const stale = created !== null && created < staleBefore;
-          if (stale) { scope.stale_waiting += n; scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, job, "created_at"); }
-          else { scope.waiting += n; scope.oldest_waiting = earlier(scope.oldest_waiting, job, "created_at"); }
+      if (Array.isArray(incoming.waiting_created) && Array.isArray(incoming.waiting_references)) {
+        const stale = (created: number | null) => created !== null && created < staleBefore;
+        let live = 0;
+        for (const [created, n] of incoming.waiting_created)
+          if (stale(created)) scope.stale_waiting += n; else live += n;
+        scope.waiting += live;
+        let liveReference = null;
+        for (const job of incoming.waiting_references) {
+          const created = job.created_at === null ? null : Date.parse(job.created_at) / 1000;
+          if (stale(created)) scope.oldest_stale_waiting = earlier(scope.oldest_stale_waiting, job, "created_at");
+          else if (!liveReference) liveReference = job;
         }
+        // Every referenced job went stale but live ones remain: their oldest is unknown.
+        if (live && !liveReference) liveReference = { id: null, created_at: null };
+        if (liveReference) scope.oldest_waiting = earlier(scope.oldest_waiting, liveReference, "created_at");
       } else {
         // Snapshots from before waiting_created: classified when they were computed.
         scope.waiting += incoming.waiting; scope.stale_waiting += incoming.stale_waiting || 0;
@@ -176,7 +191,9 @@ export function mergeActivity(facts: any[], clock: number, missing: boolean) {
       }
     }
   }
-  for (const pool of pools.values()) { delete pool.all.waiting_created; delete pool.builds.waiting_created; }
+  for (const pool of pools.values()) for (const scope of [pool.all, pool.builds]) {
+    delete scope.waiting_created; delete scope.waiting_references;
+  }
   return { coverage: !facts.length ? "unavailable" : missing || facts.some(f => !f.activity?.complete) ? "partial" : "retained_observations",
     through: new Date(through * 1000).toISOString(), interval: "minute_aligned",
     pools: [...pools.values()].sort((a,b) => a.pool.localeCompare(b.pool)) };
