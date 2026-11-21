@@ -4159,3 +4159,31 @@ test("crossing the storage threshold during ingestion returns storage_full", asy
   assert.equal(response.status, 507);
   assert.equal((await response.json()).code, "storage_full");
 });
+
+test("a context update refused part-way is applied in full on the next tick", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const context = { observed_at: "x", partitions: [], budget: 1 };
+  globalThis.__operationsTestEnv.CONTROL = {
+    idFromName: (id) => id,
+    get: () => ({ fetch: async () => Response.json(context) }),
+  };
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement) && args[0] === "jobs_context_key") full = true;
+    return result;
+  };
+  r.advance(60000);
+  assert.equal((await r.request("/tick")).status, 507);
+  sql.exec = exec;
+  full = false;
+  r.advance(60000);
+  assert.equal((await r.request("/tick")).status, 200);
+  assert.equal(r.operations.get("jobs_context").budget, 1);
+});

@@ -3054,12 +3054,15 @@ export class Operations {
           if (this.storageFull()) return storageFullResponse();
           const { observed_at: _observed, ...meaning } = context;
           const meaningKey = canonical(meaning);
-          if (this.get("jobs_context_key") !== meaningKey) {
-            this.set("jobs_context_key", meaningKey);
-            this.set("jobs_context", context);
-            this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
-            this.set("revision", (this.get("revision") || 0) + 1);
-          }
+          // One transaction: a refused write cannot leave the new key with
+          // the old payload, which later ticks would never repair.
+          if (this.get("jobs_context_key") !== meaningKey)
+            this.ctx.storage.transactionSync(() => {
+              this.set("jobs_context_key", meaningKey);
+              this.set("jobs_context", context);
+              this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
+              this.set("revision", (this.get("revision") || 0) + 1);
+            });
           for (const p of context.partitions) {
             const known = this.sql
               .exec("SELECT 1 FROM ops_partitions WHERE name=?", p.name)
