@@ -3,6 +3,7 @@ import { historyFrame } from "./operations-history";
 import { mergeActivity, staleAt, STALE_WAITING_SECONDS } from "./operations-activity";
 import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
+import { DATABASE_LIMIT_BYTES, OPERATIONS_TABLES, storageReport } from "./operations-storage";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
 import { call, digest, json, now, operationsScope, type Env } from "./types";
@@ -125,25 +126,42 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
       CREATE INDEX IF NOT EXISTS ops_host_samples_age ON ops_host_samples(resolution,bucket);
     `);
-    // Quiet historical sources will not emit another webhook. Revisit legacy
-    // cached partitions through the existing bounded collector to seed activity
-    // (and, for activity cached before waiting_created, its queued jobs' ages).
-    const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
-      WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
-          OR (json_array_length(data,'$.activity.pools') > 0
-            AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
-      RETURNING name`).toArray();
-    if (legacy.length) {
-      this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
-      this.set("revision", (this.get("revision") || 0) + 1);
-    }
-    // Records evicted before ops_evicted existed are unknown: the producer
-    // resends everything once, so later evictions are all recorded.
-    if (this.get("eviction_tracking") === undefined) {
-      if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
-        this.set("queue_resync", true);
-      this.set("eviction_tracking", 1);
+    // Startup migrations write only when there is something to migrate, so a
+    // full database can still construct the object and serve reads.
+    try {
+      // Quiet historical sources will not emit another webhook. Revisit legacy
+      // cached partitions through the existing bounded collector to seed activity
+      // (and, for activity cached before waiting_created, its queued jobs' ages).
+      // Check with a read first. On a full database an allocating write is a
+      // critical storage error that breaks the object, so never attempt one
+      // when there is nothing to migrate.
+      const condition = `pending=0 AND data IS NOT NULL AND
+          (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
+            OR (json_array_length(data,'$.activity.pools') > 0
+              AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))`;
+      const legacy = this.sql
+        .exec(`SELECT 1 FROM ops_partitions WHERE ${condition} LIMIT 1`)
+        .toArray().length
+        ? this.sql
+            .exec(`UPDATE ops_partitions SET pending=1 WHERE ${condition} RETURNING name`)
+            .toArray()
+        : [];
+      if (legacy.length) {
+        this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
+        this.set("revision", (this.get("revision") || 0) + 1);
+      }
+      // Records evicted before ops_evicted existed are unknown: the producer
+      // resends everything once, so later evictions are all recorded.
+      if (this.get("eviction_tracking") === undefined) {
+        if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
+          this.set("queue_resync", true);
+        this.set("eviction_tracking", 1);
+      }
+    } catch (error) {
+      console.warn(
+        "operations: startup migration unavailable",
+        error instanceof Error ? error.message : "",
+      );
     }
   }
   private get(key: string): any {
@@ -2774,6 +2792,17 @@ export class Operations {
       await this.alarm();
       return json({ ok: true });
     }
+    if (path === "/storage") {
+      // Read only: safe while the database is full.
+      const params = new URL(request.url).searchParams,
+        names = (key: string) =>
+          new Set(
+            (params.get(key) || "")
+              .split(",")
+              .filter((name) => Object.hasOwn(OPERATIONS_TABLES, name)),
+          );
+      return json(storageReport(this.sql, names("exact"), names("bytes")));
+    }
     if (path === "/health") {
       const queuePreparations = this.queuePreparations();
       return json({
@@ -2807,6 +2836,14 @@ export class Operations {
           const row = this.source(this.get("queue_source") || "");
           return row ? { epoch: row.epoch, sequence: row.sequence } : null;
         })(),
+        database_bytes: (() => {
+          try {
+            return this.sql.databaseSize;
+          } catch {
+            return null;
+          }
+        })(),
+        database_limit_bytes: DATABASE_LIMIT_BYTES,
         staged_frames: this.sql
           .exec<{ count: number }>("SELECT COUNT(*) count FROM ops_frames")
           .one().count,

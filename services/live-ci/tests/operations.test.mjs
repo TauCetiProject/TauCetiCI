@@ -3732,3 +3732,79 @@ test("pool activity stays observed while a partition awaits collection, partial 
  value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.pool_activity.coverage,'partial');
 });
+
+test("a full database still constructs and serves the storage report", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  const pages = r.database.prepare("PRAGMA page_count").get().page_count;
+  r.database.exec("PRAGMA max_page_count=" + pages);
+  assert.throws(() =>
+    r.database.exec(
+      "INSERT INTO ops_meta VALUES ('filler','" + "x".repeat(200000) + "')",
+    ),
+  );
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  Object.defineProperty(sql, "databaseSize", {
+    configurable: true,
+    get: () => 9 * 1024 ** 3,
+  });
+  // Any write attempt on a full database is a critical storage error that
+  // breaks the object, whether or not it is caught. Record every attempt.
+  const writes = [];
+  sql.exec = (statement, ...args) => {
+    if (!/^\s*(SELECT|CREATE (TABLE|INDEX|UNIQUE INDEX) IF NOT EXISTS)\b/i.test(statement))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
+    return exec(statement, ...args);
+  };
+  const restarted = new Operations(r.ctx);
+  const response = await restarted.fetch(
+    new Request(
+      "https://internal/storage?exact=ops_entities,unknown_table&bytes=ops_meta",
+    ),
+  );
+  const health = await (
+    await restarted.fetch(new Request("https://internal/health"))
+  ).json();
+  sql.exec = exec;
+  r.database.exec("PRAGMA max_page_count=1073741823");
+  assert.deepEqual(writes, []);
+  assert.equal(health.database_bytes, 9 * 1024 ** 3);
+  assert.equal(response.status, 200);
+  const report = await response.json();
+  assert.equal(report.database_bytes, 9 * 1024 ** 3);
+  assert.equal(report.limit_bytes, 10 * 1024 ** 3);
+  assert.equal(report.used_fraction, 0.9);
+  const entities = r.database
+    .prepare("SELECT COUNT(*) count FROM ops_entities")
+    .get().count;
+  assert.equal(report.tables.ops_entities.rows, entities);
+  assert.ok(report.tables.ops_entities.sampled_mean_bytes > 0);
+  assert.ok(report.tables.ops_entities.estimated_payload_bytes > 0);
+  assert.ok(report.tables.ops_meta.payload_bytes > 0);
+  assert.ok(report.meta_prefixes.length > 0);
+  assert.equal(report.tables.unknown_table, undefined);
+  for (const table of Object.values(report.tables))
+    assert.equal(table.error, undefined);
+});
+
+test("startup migration of a legacy partition still runs on a writable database", async (t) => {
+  const r = runtime(t);
+  r.database.exec("INSERT INTO ops_partitions VALUES ('legacy',1,0,1,'{}')");
+  new Operations(r.ctx);
+  assert.equal(
+    r.database.prepare("SELECT pending FROM ops_partitions WHERE name='legacy'").get().pending,
+    1,
+  );
+});
+
+test("storage samples do not count a row twice across a rowid gap", async (t) => {
+  const r = runtime(t);
+  for (let i = 0; i < 5; i++)
+    r.database.exec(`INSERT INTO ops_failures VALUES ('k','${i}',0,0,'e')`);
+  for (let i = 0; i < 1000; i++)
+    r.database.exec("INSERT OR REPLACE INTO ops_failures VALUES ('k','0',0,0,'e')");
+  const report = await (await r.request("/storage?exact=ops_failures")).json();
+  assert.equal(report.tables.ops_failures.rows, 5);
+  assert.equal(report.tables.ops_failures.sampled_rows, 5);
+});
