@@ -174,3 +174,31 @@ export function storageReport(
     meta_prefixes,
   };
 }
+
+/** Statements that cannot allocate pages: reads, deletes, and schema
+ * creation that is a no-op on an existing schema. */
+export function nonAllocating(statement: string) {
+  return (
+    /^\s*(SELECT|DELETE|PRAGMA)\b/i.test(statement) ||
+    (/^\s*WITH\b/i.test(statement) && !/\b(UPDATE|INSERT|REPLACE)\b/i.test(statement)) ||
+    /^\s*CREATE\s+(UNIQUE\s+)?(TABLE|INDEX)\s+IF\s+NOT\s+EXISTS\b/i.test(statement)
+  );
+}
+
+/** Wrap SQL storage so that, once `full()` holds, any statement that could
+ * allocate throws an ordinary error before SQLite runs it. On a full database
+ * an allocating write is a critical storage error that breaks the object, so
+ * every write path, including background continuations and error handlers,
+ * fails cleanly instead. */
+export function guardedSql(raw: SqlStorage, full: () => boolean): SqlStorage {
+  return {
+    exec(statement: string, ...bindings: any[]) {
+      if (!nonAllocating(statement) && full())
+        throw new Error("Operations storage is full");
+      return raw.exec(statement, ...bindings);
+    },
+    get databaseSize() {
+      return raw.databaseSize;
+    },
+  } as SqlStorage;
+}

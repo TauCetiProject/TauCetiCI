@@ -4097,3 +4097,34 @@ test("retirement skips a served-manifest read that a manifest write overtook", a
   const again = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
   assert.equal(again.retired, 3);
 });
+
+test("work in flight when storage fills issues no allocating write afterwards", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec,
+    writes = [];
+  sql.exec = (statement, ...args) => {
+    if (full && !/^\s*(SELECT|DELETE|PRAGMA)\b/i.test(statement) &&
+        !(/^\s*WITH\b/i.test(statement) && !/\b(UPDATE|INSERT|REPLACE)\b/i.test(statement)))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
+    return exec(statement, ...args);
+  };
+  // Storage fills while the next publication's uploads are in flight.
+  r.onWrite(() => {
+    full = true;
+  });
+  r.advance(10000);
+  await r.send(r.next(2));
+  await r.flush().catch(() => {});
+  await r.drain();
+  sql.exec = exec;
+  assert.ok(full);
+  assert.deepEqual(writes, []);
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "full");
+});

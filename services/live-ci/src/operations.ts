@@ -12,6 +12,7 @@ import {
   STORAGE_RESERVE_BYTES,
   STORAGE_WARNING_FRACTION,
   databaseBytes,
+  guardedSql,
   storageReport,
   storageStatus,
 } from "./operations-storage";
@@ -113,7 +114,8 @@ export class Operations {
   }
 
   constructor(private ctx: DurableObjectState) {
-    this.sql = ctx.storage.sql;
+    const raw = ctx.storage.sql;
+    this.sql = guardedSql(raw, () => this.storageFull());
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS ops_meta(key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS ops_sources(id TEXT PRIMARY KEY,epoch INTEGER,sequence INTEGER,
