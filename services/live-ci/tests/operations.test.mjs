@@ -118,6 +118,10 @@ function runtime(t) {
         writes.push(key);
         objects.set(key, value);
       },
+      async get(key) {
+        const value = objects.get(key);
+        return value === undefined ? null : { text: async () => String(value) };
+      },
       async delete(keys) {
         for (const key of [keys].flat()) objects.delete(key);
       },
@@ -2568,7 +2572,7 @@ for (const deliverAlarms of [true, false])
           return { async put(key, value, options) {
             if (JSON.parse(value).schema === "tauceti.operations.jobs/v1") await fetch("https://hold.example/jobs");
             return target.ARCHIVE.put(key, value, options);
-          }, delete(key) {return target.ARCHIVE.delete(key);} };
+          }, get(key) {return target.ARCHIVE.get(key);}, delete(key) {return target.ARCHIVE.delete(key);} };
         }});`,
               }),
             );
@@ -4049,4 +4053,23 @@ test("an ambiguous manifest write keeps its graph live until an acknowledged one
     1,
   );
   assert.ok(r.objects.has("public" + ambiguous));
+});
+
+test("live roots are bound as one parameter however many there are", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  for (let i = 0; i < 150; i++)
+    r.operations.pinnedRoots.add("d".repeat(64) + "/" + String(i).padStart(64, "0"));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  let most = 0;
+  sql.exec = (statement, ...args) => {
+    most = Math.max(most, args.length);
+    return exec(statement, ...args);
+  };
+  const result = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  sql.exec = exec;
+  assert.equal(result.retired, 0);
+  assert.ok(most <= 3, String(most));
 });

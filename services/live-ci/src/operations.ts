@@ -95,7 +95,6 @@ export class Operations {
   private storageWarned?: number;
   private liveRefreshedAt?: number;
   private pinnedRoots = new Set<string>();
-  private ambiguousRoots = new Set<string>();
   private retireCursor = { objects: 0, keys: 0 };
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
@@ -2348,11 +2347,9 @@ export class Operations {
     for (const root of pinned) this.pinnedRoots.add(root);
     this.pointerStarted = Date.now();
     this.publicationPending.add("manifest");
-    let attempted = false;
     this.pointer = (async () => {
       try {
         if (!(await this.eligible(projection))) return;
-        attempted = true;
         await this.upload("manifest", () =>
           this.env.ARCHIVE.put(
             "public/v1/operations/manifest.json",
@@ -2390,21 +2387,9 @@ export class Operations {
           this.set("publication_error", false);
           this.set("publication_retry", null);
           this.set("publication_failures", 0);
-          // An acknowledged manifest supersedes any ambiguous earlier write.
-          if (this.get("ambiguous_roots")) this.set("ambiguous_roots", null);
-          this.ambiguousRoots.clear();
         });
         this.startMaintenance();
       } catch {
-        if (attempted) {
-          // R2 may have accepted a manifest whose acknowledgement was lost.
-          // Keep its graph live until an acknowledged manifest replaces it.
-          for (const root of pinned) this.ambiguousRoots.add(root);
-          if (!this.storageFull())
-            this.set("ambiguous_roots", [
-              ...new Set([...(this.get("ambiguous_roots") || []), ...pinned]),
-            ].slice(-50));
-        }
         if (this.storageFull()) {
           console.warn("operations: public pointer unavailable");
           return;
@@ -2451,18 +2436,19 @@ export class Operations {
       horizon = clock - OBJECT_RETENTION_SECONDS,
       window = RETIREMENT_WINDOW,
       cursor = this.retireCursor,
-      live = new Set<string>(),
+      served,
     }: {
       horizon?: number;
       window?: number;
       cursor?: { objects: number; keys: number };
-      live?: Set<string>;
-    } = {},
+      served: string[];
+    },
   ) {
     const retired: string[] = [];
     let examined = 0;
     const next = { ...cursor };
     this.ctx.storage.transactionSync(() => {
+      const live = this.liveObjects(served);
       const retire = (hash: string) => {
         // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
         // physical key even if this old delete finishes after an isolate restart.
@@ -2531,57 +2517,70 @@ export class Operations {
     }
     return { retired: retired.length, archive_deleted: deleted, examined, cursor: next };
   }
+  /** Roots of the manifest R2 is actually serving. This covers a manifest
+   * write whose acknowledgement was lost, before or after a restart. Throws
+   * if R2 cannot be read, so callers retire nothing without it. */
+  private async servedRoots(): Promise<string[]> {
+    const object = await this.env.ARCHIVE.get("public/v1/operations/manifest.json");
+    if (!object) return [];
+    const manifest = JSON.parse(await object.text());
+    return Object.values(manifest.domains || {})
+      .map((d: any) => d?.url)
+      .filter((url): url is string => typeof url === "string" && url.startsWith(PREFIX))
+      .map((url) => url.slice(PREFIX.length, -5));
+  }
   /** Refresh the reference time of every live object, so the retention
    * period starts when an object stops being reachable. A full database
    * skips this (it writes), so it must run before publication replaces roots
    * once there is room again. */
-  private refreshLive(clock = now()) {
-    const { roots, live } = this.liveObjects();
+  private async refreshLive(clock = now()) {
+    const served = await this.servedRoots();
+    const roots = this.liveRoots(served);
     if (roots.length)
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
-        SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
+        SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
         UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
         UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
-        ...roots,
+        JSON.stringify(roots),
         clock,
         clock - 3600,
       );
     this.liveRefreshedAt = clock;
-    return live;
+    return served;
   }
-  /** Physical keys of the current manifests and every object they reach. */
-  private liveObjects() {
-    const roots = DOMAINS.flatMap((kind) => [
-      this.state(kind),
-      this.state(kind, false),
-    ])
-      .filter((s) => s?.value.url)
-      .map((s) => s!.value.url.slice(PREFIX.length, -5))
-      // Roots captured by an in-flight or ambiguous manifest write may no
-      // longer be ready.
-      .concat(
-        [...this.pinnedRoots],
-        [...this.ambiguousRoots],
-        (this.get("ambiguous_roots") as string[] | null) || [],
-      );
-    // Objects reachable from a current manifest are never retired, even when
-    // a full database prevents refreshing their reference time.
-    const live = new Set(
+  /** Committed, prepared, in-flight and served manifest roots. */
+  private liveRoots(served: string[]) {
+    return [
+      ...new Set(
+        DOMAINS.flatMap((kind) => [this.state(kind), this.state(kind, false)])
+          .filter((s) => s?.value.url)
+          .map((s) => s!.value.url.slice(PREFIX.length, -5))
+          // Roots captured by an in-flight manifest write may no longer be ready.
+          .concat([...this.pinnedRoots], served),
+      ),
+    ];
+  }
+  /** Every object reachable from a live root. Synchronous: call it in the
+   * same synchronous block as the retirement it protects. */
+  private liveObjects(served: string[]) {
+    const roots = this.liveRoots(served);
+    // Objects reachable from a live manifest are never retired, even when a
+    // full database prevents refreshing their reference time.
+    return new Set(
       roots.length
         ? this.sql
             .exec<{ hash: string }>(
               `WITH RECURSIVE live(hash) AS (
-        SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
+        SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
         UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
         SELECT hash FROM live`,
-              ...roots,
+              JSON.stringify(roots),
             )
             .toArray()
             .map((row) => row.hash)
         : [],
     );
-    return { roots, live };
   }
   /** Delete links whose parent object no longer exists, scanning at most
    * `limit` links after rowid `after`. Returns the next cursor. */
@@ -2620,9 +2619,9 @@ export class Operations {
     else this.maintenanceAt = now();
     this.maintenance = (async () => {
       const clock = now(),
-        live = full ? this.liveObjects().live : this.refreshLive(clock);
+        served = full ? await this.servedRoots() : await this.refreshLive(clock);
       // Publication allocates objects continuously; retire faster than that.
-      const result = await this.retireObjects(clock, MAINTENANCE_RETIREMENTS, { live });
+      const result = await this.retireObjects(clock, MAINTENANCE_RETIREMENTS, { served });
       this.retireCursor = result.cursor;
       this.sql.exec(
         "DELETE FROM ops_changes WHERE snapshot IN (SELECT snapshot FROM ops_frames WHERE received<?)",
@@ -2708,7 +2707,15 @@ export class Operations {
         }
         // After a restart or a full-database period, reference times may be
         // stale. Refresh them before this pass can replace any root.
-        if ((this.liveRefreshedAt || 0) < now() - 600) this.refreshLive();
+        if ((this.liveRefreshedAt || 0) < now() - 600)
+          try {
+            await this.refreshLive();
+          } catch {
+            // Without it a pass could expose stale roots to retirement.
+            console.warn("operations: live reference refresh unavailable");
+            this.publicationRequested = false;
+            return;
+          }
         const bootstrap = this.bootstrapRequested;
         this.publicationRequested = false;
         this.bootstrapRequested = false;
@@ -2755,7 +2762,7 @@ export class Operations {
             objects: int(body.objects_after, 0, Number.MAX_SAFE_INTEGER, 0),
             keys: int(body.keys_after, 0, Number.MAX_SAFE_INTEGER, 0),
           },
-          live: this.liveObjects().live,
+          served: await this.servedRoots(),
         },
       );
       const links = body.links_limit
