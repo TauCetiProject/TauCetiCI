@@ -5,28 +5,29 @@
 // Cloudflare's per-object SQLite limit on Workers Paid.
 export const DATABASE_LIMIT_BYTES = 10 * 1024 ** 3;
 
-// Columns per table. Byte figures are payload lengths (TEXT as UTF-8), not
-// page usage: indexes and B-tree overhead are excluded.
+// Every column per table. Byte figures are approximate payload lengths: TEXT
+// as UTF-8 and numbers by their decimal length. Indexes and B-tree overhead
+// are excluded.
 export const OPERATIONS_TABLES: Record<string, string[]> = {
   ops_meta: ["key", "value"],
-  ops_sources: ["id", "snapshot", "metadata"],
-  ops_frames: ["snapshot", "source", "data", "hash", "metadata", "base"],
-  ops_changes: ["snapshot", "collection", "id", "batch", "data"],
-  ops_entities: ["source", "collection", "id", "batch", "data"],
-  ops_evicted: ["source", "collection", "id", "batch"],
-  ops_objects: ["hash"],
-  ops_object_keys: ["logical", "hash"],
+  ops_sources: ["id", "epoch", "sequence", "committed_epoch", "committed_sequence", "snapshot", "metadata", "received"],
+  ops_frames: ["snapshot", "part", "parts", "source", "epoch", "sequence", "data", "received", "hash", "bytes", "metadata", "base"],
+  ops_changes: ["snapshot", "collection", "id", "batch", "pr_bucket", "data", "part"],
+  ops_entities: ["source", "collection", "id", "batch", "pr_bucket", "data"],
+  ops_evicted: ["source", "collection", "id", "batch", "terminal"],
+  ops_objects: ["hash", "referenced"],
+  ops_object_keys: ["logical", "hash", "allocated"],
   ops_links: ["parent", "child"],
-  ops_dirty: ["kind", "id"],
+  ops_dirty: ["kind", "id", "revision"],
   ops_views: ["kind", "id", "data"],
-  ops_partitions: ["name", "data"],
-  ops_progress: ["repository", "run", "check_run", "session", "data"],
-  ops_hosts: ["machine", "source", "data"],
-  ops_job_facts: ["partition", "id", "repository", "data"],
-  ops_failures: ["kind", "id", "error"],
-  ops_runner_hosts: ["runner", "machine", "instance"],
-  ops_host_samples: ["machine", "data"],
-  ops_activity: ["id", "pool", "result", "ref"],
+  ops_partitions: ["name", "revision", "pending", "received", "data"],
+  ops_progress: ["repository", "run", "attempt", "check_run", "session", "sequence", "received", "data"],
+  ops_hosts: ["machine", "source", "epoch", "sequence", "received", "data"],
+  ops_job_facts: ["partition", "id", "repository", "active", "observed", "data"],
+  ops_failures: ["kind", "id", "failures", "due", "error"],
+  ops_runner_hosts: ["runner", "machine", "instance", "slot", "seen"],
+  ops_host_samples: ["machine", "bucket", "resolution", "data"],
+  ops_activity: ["id", "pool", "build", "active", "running", "created", "started", "completed", "result", "ref"],
   ops_activity_pools: ["pool"],
 };
 
@@ -34,7 +35,6 @@ const SAMPLE_POINTS = 8,
   SAMPLE_ROWS = 25;
 
 function rowBytes(columns: string[]) {
-  // Integer and real columns are counted as eight bytes each by the caller.
   return columns
     .map((c) => `coalesce(length(CAST(${c} AS BLOB)),0)`)
     .join("+");

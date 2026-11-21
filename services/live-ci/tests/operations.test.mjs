@@ -3736,10 +3736,6 @@ test("pool activity stays observed while a partition awaits collection, partial 
 test("a full database still constructs and serves the storage report", async (t) => {
   const r = runtime(t);
   await r.send(seed);
-  // Mark a legacy partition so the startup migration would have to write.
-  r.database.exec(
-    "INSERT INTO ops_partitions VALUES ('legacy',1,0,1,'{}')",
-  );
   const pages = r.database.prepare("PRAGMA page_count").get().page_count;
   r.database.exec("PRAGMA max_page_count=" + pages);
   assert.throws(() =>
@@ -3753,9 +3749,12 @@ test("a full database still constructs and serves the storage report", async (t)
     configurable: true,
     get: () => 9 * 1024 ** 3,
   });
+  // Any write attempt on a full database is a critical storage error that
+  // breaks the object, whether or not it is caught. Record every attempt.
+  const writes = [];
   sql.exec = (statement, ...args) => {
-    if (/^\s*(INSERT|REPLACE|DELETE)\b/i.test(statement))
-      throw new Error("Exceeded the maximum database size.");
+    if (!/^\s*(SELECT|CREATE (TABLE|INDEX|UNIQUE INDEX) IF NOT EXISTS)\b/i.test(statement))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
     return exec(statement, ...args);
   };
   const restarted = new Operations(r.ctx);
@@ -3764,8 +3763,13 @@ test("a full database still constructs and serves the storage report", async (t)
       "https://internal/storage?exact=ops_entities,unknown_table&bytes=ops_meta",
     ),
   );
+  const health = await (
+    await restarted.fetch(new Request("https://internal/health"))
+  ).json();
   sql.exec = exec;
   r.database.exec("PRAGMA max_page_count=1073741823");
+  assert.deepEqual(writes, []);
+  assert.equal(health.database_bytes, 9 * 1024 ** 3);
   assert.equal(response.status, 200);
   const report = await response.json();
   assert.equal(report.database_bytes, 9 * 1024 ** 3);
@@ -3782,8 +3786,16 @@ test("a full database still constructs and serves the storage report", async (t)
   assert.equal(report.tables.unknown_table, undefined);
   for (const table of Object.values(report.tables))
     assert.equal(table.error, undefined);
-  const health = await (await restarted.fetch(new Request("https://internal/health"))).json();
-  assert.equal(health.database_bytes, 9 * 1024 ** 3);
+});
+
+test("startup migration of a legacy partition still runs on a writable database", async (t) => {
+  const r = runtime(t);
+  r.database.exec("INSERT INTO ops_partitions VALUES ('legacy',1,0,1,'{}')");
+  new Operations(r.ctx);
+  assert.equal(
+    r.database.prepare("SELECT pending FROM ops_partitions WHERE name='legacy'").get().pending,
+    1,
+  );
 });
 
 test("storage samples do not count a row twice across a rowid gap", async (t) => {
