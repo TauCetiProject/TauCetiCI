@@ -4008,3 +4008,45 @@ test("a publication pass started by a completion callback stops when storage is 
   await r.drain();
   assert.equal(r.writes.length, writes);
 });
+
+test("an ambiguous manifest write keeps its graph live until an acknowledged one replaces it", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  // The next manifest PUT reaches R2 but its acknowledgement is lost.
+  r.advance(10000);
+  await r.send(r.next(2));
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    put = archive.put;
+  let ambiguous;
+  archive.put = async (key, value) => {
+    if (!key.endsWith("/manifest.json")) return put(key, value);
+    // The first manifest write lands but reports failure; later ones fail.
+    if (ambiguous) throw new Error("R2 unavailable");
+    await put(key, value);
+    ambiguous = JSON.parse(value).domains.queue.url;
+    throw new Error("lost manifest acknowledgement");
+  };
+  await r.flush();
+  assert.ok(ambiguous);
+  assert.equal(r.manifest().domains.queue.url, ambiguous);
+  // A newer generation is prepared while manifest writes keep failing, so R2
+  // still serves the ambiguous one and no tracked state references it.
+  r.advance(20000);
+  await r.send(r.next(3));
+  await r.flush();
+  archive.put = put;
+  assert.equal(r.manifest().domains.queue.url, ambiguous);
+  assert.notEqual(r.operations.state("queue").value.url, ambiguous);
+  assert.notEqual(r.operations.state("queue", false).value.url, ambiguous);
+  const hash = ambiguous.slice("/v1/operations/objects/".length, -5);
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  await r.request("/prune", { older_than_days: 2, limit: 5000 });
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE hash=?").get(hash).n,
+    1,
+  );
+  assert.ok(r.objects.has("public" + ambiguous));
+});

@@ -95,6 +95,7 @@ export class Operations {
   private storageWarned?: number;
   private liveRefreshedAt?: number;
   private pinnedRoots = new Set<string>();
+  private ambiguousRoots = new Set<string>();
   private retireCursor = { objects: 0, keys: 0 };
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
@@ -910,6 +911,8 @@ export class Operations {
             }
           }
         });
+        // The upload above is awaited; never write a receipt into a full database.
+        if (this.storageFull()) throw new Error("Operations storage is full");
         this.ctx.storage.transactionSync(() => {
           this.sql.exec(
             "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
@@ -2345,9 +2348,11 @@ export class Operations {
     for (const root of pinned) this.pinnedRoots.add(root);
     this.pointerStarted = Date.now();
     this.publicationPending.add("manifest");
+    let attempted = false;
     this.pointer = (async () => {
       try {
         if (!(await this.eligible(projection))) return;
+        attempted = true;
         await this.upload("manifest", () =>
           this.env.ARCHIVE.put(
             "public/v1/operations/manifest.json",
@@ -2385,9 +2390,25 @@ export class Operations {
           this.set("publication_error", false);
           this.set("publication_retry", null);
           this.set("publication_failures", 0);
+          // An acknowledged manifest supersedes any ambiguous earlier write.
+          if (this.get("ambiguous_roots")) this.set("ambiguous_roots", null);
+          this.ambiguousRoots.clear();
         });
         this.startMaintenance();
       } catch {
+        if (attempted) {
+          // R2 may have accepted a manifest whose acknowledgement was lost.
+          // Keep its graph live until an acknowledged manifest replaces it.
+          for (const root of pinned) this.ambiguousRoots.add(root);
+          if (!this.storageFull())
+            this.set("ambiguous_roots", [
+              ...new Set([...(this.get("ambiguous_roots") || []), ...pinned]),
+            ].slice(-50));
+        }
+        if (this.storageFull()) {
+          console.warn("operations: public pointer unavailable");
+          return;
+        }
         const failures = (this.get("publication_failures") || 0) + 1;
         this.set("publication_failures", failures);
         this.set("publication_error", true);
@@ -2537,8 +2558,13 @@ export class Operations {
     ])
       .filter((s) => s?.value.url)
       .map((s) => s!.value.url.slice(PREFIX.length, -5))
-      // Roots captured by an in-flight manifest write may no longer be ready.
-      .concat([...this.pinnedRoots]);
+      // Roots captured by an in-flight or ambiguous manifest write may no
+      // longer be ready.
+      .concat(
+        [...this.pinnedRoots],
+        [...this.ambiguousRoots],
+        (this.get("ambiguous_roots") as string[] | null) || [],
+      );
     // Objects reachable from a current manifest are never retired, even when
     // a full database prevents refreshing their reference time.
     const live = new Set(
