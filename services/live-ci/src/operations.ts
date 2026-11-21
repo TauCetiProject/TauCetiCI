@@ -2890,11 +2890,13 @@ export class Operations {
       const old = this.get("history");
       if (old && Date.parse(value.observed_at) < Date.parse(old.observed_at))
         return json({ error: "Older report" }, 409);
-      if (canonical(old) !== canonical(value))
-        this.set("history_revision", (this.get("history_revision") || 0) + 1);
-      this.set("history", value);
-      this.set("history_received", new Date(now() * 1000).toISOString());
-      this.set("revision", (this.get("revision") || 0) + 1);
+      this.ctx.storage.transactionSync(() => {
+        if (canonical(old) !== canonical(value))
+          this.set("history_revision", (this.get("history_revision") || 0) + 1);
+        this.set("history", value);
+        this.set("history_received", new Date(now() * 1000).toISOString());
+        this.set("revision", (this.get("revision") || 0) + 1);
+      });
       await this.schedule();
       return json({ accepted: true });
     }
