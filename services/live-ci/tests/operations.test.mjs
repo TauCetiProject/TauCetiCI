@@ -4128,3 +4128,34 @@ test("work in flight when storage fills issues no allocating write afterwards", 
   const health = await (await r.request("/health")).json();
   assert.equal(health.storage.status, "full");
 });
+
+test("crossing the storage threshold during ingestion returns storage_full", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  // The first write of the frame fills the database.
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement)) full = true;
+    return result;
+  };
+  const queue = await r.request("/queue", r.next(2));
+  assert.equal(queue.status, 507);
+  assert.equal((await queue.json()).code, "storage_full");
+  full = false;
+  const history = JSON.parse(readFileSync("tests/fixtures/operations-history.json", "utf8"));
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement)) full = true;
+    return result;
+  };
+  const response = await r.request("/history", history);
+  sql.exec = exec;
+  assert.equal(response.status, 507);
+  assert.equal((await response.json()).code, "storage_full");
+});

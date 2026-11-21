@@ -13,6 +13,7 @@ import {
   STORAGE_WARNING_FRACTION,
   databaseBytes,
   guardedSql,
+  StorageFullError,
   storageReport,
   storageStatus,
 } from "./operations-storage";
@@ -917,7 +918,7 @@ export class Operations {
           }
         });
         // The upload above is awaited; never write a receipt into a full database.
-        if (this.storageFull()) throw new Error("Operations storage is full");
+        if (this.storageFull()) throw new StorageFullError();
         this.ctx.storage.transactionSync(() => {
           this.sql.exec(
             "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
@@ -2758,6 +2759,15 @@ export class Operations {
   }
 
   async fetch(request: Request) {
+    try {
+      return await this.handle(request);
+    } catch (error) {
+      // The storage guard refused a write that would have broken the object.
+      if (error instanceof StorageFullError) return storageFullResponse();
+      throw error;
+    }
+  }
+  private async handle(request: Request) {
     const path = new URL(request.url).pathname;
     // Write paths check here and again after every await before writing.
     if (
@@ -2856,6 +2866,7 @@ export class Operations {
           this.stage(frame, fingerprint),
         );
       } catch (error) {
+        if (error instanceof StorageFullError) return storageFullResponse();
         const message = error instanceof Error ? error.message : "";
         const code =
           message === "Snapshot staging limit exceeded"

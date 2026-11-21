@@ -190,11 +190,16 @@ export function nonAllocating(statement: string) {
  * an allocating write is a critical storage error that breaks the object, so
  * every write path, including background continuations and error handlers,
  * fails cleanly instead. */
+export class StorageFullError extends Error {
+  constructor() {
+    super("Operations storage is full");
+  }
+}
+
 export function guardedSql(raw: SqlStorage, full: () => boolean): SqlStorage {
   return {
     exec(statement: string, ...bindings: any[]) {
-      if (!nonAllocating(statement) && full())
-        throw new Error("Operations storage is full");
+      if (!nonAllocating(statement) && full()) throw new StorageFullError();
       return raw.exec(statement, ...bindings);
     },
     get databaseSize() {

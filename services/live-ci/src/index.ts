@@ -580,7 +580,7 @@ export default {
       return await handle(request, env, ctx);
     } catch (error) {
       console.error("live-ci request failed", String(error));
-      if (String(error).includes("maximum database size"))
+      if (/maximum database size|Operations storage is full/.test(String(error)))
         return json(
           { error: "Operations storage is full", code: "storage_full" },
           507,
