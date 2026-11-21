@@ -4073,3 +4073,27 @@ test("live roots are bound as one parameter however many there are", async (t) =
   assert.equal(result.retired, 0);
   assert.ok(most <= 3, String(most));
 });
+
+test("retirement skips a served-manifest read that a manifest write overtook", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  staleObjects(r, 3, 9);
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    get = archive.get;
+  archive.get = async (key) => {
+    const value = await get(key);
+    // A manifest write starts and settles while this read is in flight.
+    r.operations.manifestGeneration += 2;
+    return value;
+  };
+  const result = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  archive.get = get;
+  assert.equal(result.skipped, "manifest_changed");
+  assert.equal(result.retired, 0);
+  const again = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  assert.equal(again.retired, 3);
+});

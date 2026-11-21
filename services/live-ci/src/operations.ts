@@ -29,6 +29,7 @@ import {
 } from "./operations-model";
 
 const PREFIX = "/v1/operations/objects/";
+type Served = { generation: number; roots: string[] };
 const storageFullResponse = () =>
   json({ error: "Operations storage is full", code: "storage_full" }, 507);
 const BUILD_CLASSES = ["pr_build", "staging_build", "other_build"];
@@ -95,6 +96,9 @@ export class Operations {
   private storageWarned?: number;
   private liveRefreshedAt?: number;
   private pinnedRoots = new Set<string>();
+  // Advances when a manifest write starts or settles. A served-manifest read
+  // is only trusted if no manifest write started or settled during it.
+  private manifestGeneration = 0;
   private retireCursor = { objects: 0, keys: 0 };
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
@@ -2345,6 +2349,7 @@ export class Operations {
         .filter((url): url is string => !!url)
         .map((url) => url.slice(PREFIX.length, -5));
     for (const root of pinned) this.pinnedRoots.add(root);
+    this.manifestGeneration++;
     this.pointerStarted = Date.now();
     this.publicationPending.add("manifest");
     this.pointer = (async () => {
@@ -2405,6 +2410,7 @@ export class Operations {
       } finally {
         this.pointer = undefined;
         this.pinnedRoots.clear();
+        this.manifestGeneration++;
         this.publicationPending.delete("manifest");
         await this.rearm();
         this.nudge();
@@ -2441,14 +2447,17 @@ export class Operations {
       horizon?: number;
       window?: number;
       cursor?: { objects: number; keys: number };
-      served: string[];
+      served: Served;
     },
   ) {
     const retired: string[] = [];
     let examined = 0;
     const next = { ...cursor };
+    // The served manifest may have changed while it was read; retire nothing.
+    if (!this.current(served))
+      return { retired: 0, archive_deleted: 0, examined: 0, cursor, skipped: "manifest_changed" };
     this.ctx.storage.transactionSync(() => {
-      const live = this.liveObjects(served);
+      const live = this.liveObjects(served.roots);
       const retire = (hash: string) => {
         // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
         // physical key even if this old delete finishes after an isolate restart.
@@ -2520,22 +2529,33 @@ export class Operations {
   /** Roots of the manifest R2 is actually serving. This covers a manifest
    * write whose acknowledgement was lost, before or after a restart. Throws
    * if R2 cannot be read, so callers retire nothing without it. */
-  private async servedRoots(): Promise<string[]> {
+  private async servedRoots(): Promise<Served> {
+    const generation = this.manifestGeneration;
     const object = await this.env.ARCHIVE.get("public/v1/operations/manifest.json");
-    if (!object) return [];
-    const manifest = JSON.parse(await object.text());
-    return Object.values(manifest.domains || {})
-      .map((d: any) => d?.url)
-      .filter((url): url is string => typeof url === "string" && url.startsWith(PREFIX))
-      .map((url) => url.slice(PREFIX.length, -5));
+    const manifest = object ? JSON.parse(await object.text()) : { domains: {} };
+    return {
+      generation,
+      roots: Object.values(manifest.domains || {})
+        .map((d: any) => d?.url)
+        .filter((url): url is string => typeof url === "string" && url.startsWith(PREFIX))
+        .map((url) => url.slice(PREFIX.length, -5)),
+    };
+  }
+  /** False if a manifest write started or settled since `served` was read. */
+  private current(served: Served) {
+    return served.generation === this.manifestGeneration;
   }
   /** Refresh the reference time of every live object, so the retention
    * period starts when an object stops being reachable. A full database
    * skips this (it writes), so it must run before publication replaces roots
    * once there is room again. */
   private async refreshLive(clock = now()) {
-    const served = await this.servedRoots();
-    const roots = this.liveRoots(served);
+    let served = await this.servedRoots();
+    for (let i = 0; !this.current(served); i++) {
+      if (i >= 3) throw new Error("manifest changed during refresh");
+      served = await this.servedRoots();
+    }
+    const roots = this.liveRoots(served.roots);
     if (roots.length)
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
