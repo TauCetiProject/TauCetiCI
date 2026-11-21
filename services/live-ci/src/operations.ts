@@ -126,25 +126,34 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
       CREATE INDEX IF NOT EXISTS ops_host_samples_age ON ops_host_samples(resolution,bucket);
     `);
-    // Quiet historical sources will not emit another webhook. Revisit legacy
-    // cached partitions through the existing bounded collector to seed activity
-    // (and, for activity cached before waiting_created, its queued jobs' ages).
-    const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
-      WHERE pending=0 AND data IS NOT NULL AND
-        (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
-          OR (json_array_length(data,'$.activity.pools') > 0
-            AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
-      RETURNING name`).toArray();
-    if (legacy.length) {
-      this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
-      this.set("revision", (this.get("revision") || 0) + 1);
-    }
-    // Records evicted before ops_evicted existed are unknown: the producer
-    // resends everything once, so later evictions are all recorded.
-    if (this.get("eviction_tracking") === undefined) {
-      if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
-        this.set("queue_resync", true);
-      this.set("eviction_tracking", 1);
+    // A full database fails every allocating write. Startup migrations must
+    // not prevent the object from serving reads and the storage report.
+    try {
+      // Quiet historical sources will not emit another webhook. Revisit legacy
+      // cached partitions through the existing bounded collector to seed activity
+      // (and, for activity cached before waiting_created, its queued jobs' ages).
+      const legacy = this.sql.exec(`UPDATE ops_partitions SET pending=1
+        WHERE pending=0 AND data IS NOT NULL AND
+          (json_type(data,'$.activity') IS NULL OR json_extract(data,'$.backlog.accounting_version') IS NOT 3
+            OR (json_array_length(data,'$.activity.pools') > 0
+              AND json_type(data,'$.activity.pools[0].all.waiting_references') IS NULL))
+        RETURNING name`).toArray();
+      if (legacy.length) {
+        this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
+        this.set("revision", (this.get("revision") || 0) + 1);
+      }
+      // Records evicted before ops_evicted existed are unknown: the producer
+      // resends everything once, so later evictions are all recorded.
+      if (this.get("eviction_tracking") === undefined) {
+        if (this.sql.exec("SELECT 1 FROM ops_sources LIMIT 1").toArray().length)
+          this.set("queue_resync", true);
+        this.set("eviction_tracking", 1);
+      }
+    } catch (error) {
+      console.warn(
+        "operations: startup migration unavailable",
+        error instanceof Error ? error.message : "",
+      );
     }
   }
   private get(key: string): any {

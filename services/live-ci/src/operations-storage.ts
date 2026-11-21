@@ -40,9 +40,10 @@ function rowBytes(columns: string[]) {
     .join("+");
 }
 
-/** `exact` names tables to COUNT(*) (one index scan each); `bytes` names
- * tables whose payload is summed over every row (a full table scan). Other
- * tables are estimated from the rowid span and a sample of rows. */
+/** By default each table reports its rowid range and a small descriptive
+ * sample. `exact` names tables to COUNT(*) (one index scan each) and estimate
+ * payload from the sample; `bytes` names tables whose payload is summed over
+ * every row (a full table scan). */
 export function storageReport(
   sql: SqlStorage,
   exact: Set<string>,
@@ -59,32 +60,40 @@ export function storageReport(
   for (const [table, columns] of Object.entries(OPERATIONS_TABLES)) {
     const started = Date.now();
     try {
-      const span = sql
-        .exec<{ lo: number | null; hi: number | null }>(
-          `SELECT min(rowid) lo,max(rowid) hi FROM ${table}`,
-        )
-        .one();
+      // Separate MIN and MAX queries each use SQLite's single-seek optimisation.
+      const lo = sql
+          .exec<{ v: number | null }>(`SELECT min(rowid) v FROM ${table}`)
+          .one().v,
+        hi = sql
+          .exec<{ v: number | null }>(`SELECT max(rowid) v FROM ${table}`)
+          .one().v;
       const report: any = {
-        rowid_min: span.lo,
-        rowid_max: span.hi,
-        rowid_span: span.lo === null ? 0 : span.hi! - span.lo + 1,
+        rowid_min: lo,
+        rowid_max: hi,
+        // An upper bound on the row count: deletes and INSERT OR REPLACE leave gaps.
+        rowid_span: lo === null ? 0 : hi! - lo + 1,
       };
-      if (span.lo !== null) {
+      if (lo !== null) {
+        // Descriptive only: windows after evenly spaced rowids, never overlapping.
         let rows = 0,
-          total = 0;
+          total = 0,
+          next = lo;
         for (let i = 0; i < SAMPLE_POINTS; i++) {
-          const at =
-            span.lo +
-            Math.floor(((span.hi! - span.lo) * i) / Math.max(1, SAMPLE_POINTS - 1));
+          const at = Math.max(
+            next,
+            lo + Math.floor(((hi! - lo) * i) / Math.max(1, SAMPLE_POINTS - 1)),
+          );
           const sample = sql
-            .exec<{ n: number; b: number | null }>(
-              `SELECT count(*) n,sum(b) b FROM (SELECT ${rowBytes(columns)} b FROM ${table} WHERE rowid>=? ORDER BY rowid LIMIT ?)`,
+            .exec<{ n: number; b: number | null; last: number | null }>(
+              `SELECT count(*) n,sum(b) b,max(r) last FROM (SELECT rowid r,${rowBytes(columns)} b FROM ${table} WHERE rowid>=? ORDER BY rowid LIMIT ?)`,
               at,
               SAMPLE_ROWS,
             )
             .one();
           rows += sample.n;
           total += sample.b || 0;
+          if (sample.last === null) break;
+          next = sample.last + 1;
         }
         report.sampled_rows = rows;
         report.sampled_mean_bytes = rows ? Math.round(total / rows) : null;
@@ -99,13 +108,11 @@ export function storageReport(
           .one();
         report.rows = counted.n;
         if (bytes.has(table)) report.payload_bytes = counted.b || 0;
+        else if (report.sampled_mean_bytes != null)
+          report.estimated_payload_bytes = Math.round(
+            counted.n * report.sampled_mean_bytes,
+          );
       }
-      const rows = report.rows ?? report.rowid_span;
-      report.estimated_payload_bytes =
-        report.payload_bytes ??
-        (report.sampled_mean_bytes === undefined || report.sampled_mean_bytes === null
-          ? 0
-          : Math.round(rows * report.sampled_mean_bytes));
       report.elapsed_ms = Date.now() - started;
       tables[table] = report;
     } catch (error) {

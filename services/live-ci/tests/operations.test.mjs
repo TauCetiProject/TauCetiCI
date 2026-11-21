@@ -3733,23 +3733,41 @@ test("pool activity stays observed while a partition awaits collection, partial 
  assert.equal(value.pool_activity.coverage,'partial');
 });
 
-test("the storage report reads a full database without writing", async (t) => {
+test("a full database still constructs and serves the storage report", async (t) => {
   const r = runtime(t);
   await r.send(seed);
+  // Mark a legacy partition so the startup migration would have to write.
+  r.database.exec(
+    "INSERT INTO ops_partitions VALUES ('legacy',1,0,1,'{}')",
+  );
+  const pages = r.database.prepare("PRAGMA page_count").get().page_count;
+  r.database.exec("PRAGMA max_page_count=" + pages);
+  assert.throws(() =>
+    r.database.exec(
+      "INSERT INTO ops_meta VALUES ('filler','" + "x".repeat(200000) + "')",
+    ),
+  );
   const sql = r.ctx.storage.sql,
     exec = sql.exec;
-  Object.defineProperty(sql, "databaseSize", { get: () => 9 * 1024 **3 });
+  Object.defineProperty(sql, "databaseSize", {
+    configurable: true,
+    get: () => 9 * 1024 ** 3,
+  });
   sql.exec = (statement, ...args) => {
-    if (!/^\s*SELECT\b/i.test(statement))
+    if (/^\s*(INSERT|REPLACE|DELETE)\b/i.test(statement))
       throw new Error("Exceeded the maximum database size.");
     return exec(statement, ...args);
   };
-  const response = await r.request(
-    "/storage?exact=ops_entities,unknown_table&bytes=ops_meta",
+  const restarted = new Operations(r.ctx);
+  const response = await restarted.fetch(
+    new Request(
+      "https://internal/storage?exact=ops_entities,unknown_table&bytes=ops_meta",
+    ),
   );
+  sql.exec = exec;
+  r.database.exec("PRAGMA max_page_count=1073741823");
   assert.equal(response.status, 200);
   const report = await response.json();
-  sql.exec = exec;
   assert.equal(report.database_bytes, 9 * 1024 ** 3);
   assert.equal(report.limit_bytes, 10 * 1024 ** 3);
   assert.equal(report.used_fraction, 0.9);
@@ -3758,11 +3776,23 @@ test("the storage report reads a full database without writing", async (t) => {
     .get().count;
   assert.equal(report.tables.ops_entities.rows, entities);
   assert.ok(report.tables.ops_entities.sampled_mean_bytes > 0);
+  assert.ok(report.tables.ops_entities.estimated_payload_bytes > 0);
   assert.ok(report.tables.ops_meta.payload_bytes > 0);
   assert.ok(report.meta_prefixes.length > 0);
   assert.equal(report.tables.unknown_table, undefined);
   for (const table of Object.values(report.tables))
     assert.equal(table.error, undefined);
-  const health = await (await r.request("/health")).json();
+  const health = await (await restarted.fetch(new Request("https://internal/health"))).json();
   assert.equal(health.database_bytes, 9 * 1024 ** 3);
+});
+
+test("storage samples do not count a row twice across a rowid gap", async (t) => {
+  const r = runtime(t);
+  for (let i = 0; i < 5; i++)
+    r.database.exec(`INSERT INTO ops_failures VALUES ('k','${i}',0,0,'e')`);
+  for (let i = 0; i < 1000; i++)
+    r.database.exec("INSERT OR REPLACE INTO ops_failures VALUES ('k','0',0,0,'e')");
+  const report = await (await r.request("/storage?exact=ops_failures")).json();
+  assert.equal(report.tables.ops_failures.rows, 5);
+  assert.equal(report.tables.ops_failures.sampled_rows, 5);
 });
