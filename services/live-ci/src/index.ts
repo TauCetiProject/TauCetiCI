@@ -483,21 +483,12 @@ async function handle(
         query.set(key, (url.searchParams.get(key) || "").slice(0, 500));
       return stub(env.OPERATIONS, "operations").fetch("https://internal/storage?" + query);
     }
-    if (path === "/admin/operations-prune") {
+    if (path === "/admin/operations-prune" && request.method === "POST") {
       if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
-      const value =
-        request.method === "POST"
-          ? b
-          : { dry_run: true, older_than_days: url.searchParams.get("older_than_days") };
+      const fields = ["older_than_days", "limit", "window", "objects_after", "keys_after", "links_after", "links_limit"];
       return stub(env.OPERATIONS, "operations").fetch("https://internal/prune", {
         method: "POST",
-        body: JSON.stringify({
-          dry_run: !!value.dry_run,
-          older_than_days: value.older_than_days,
-          limit: value.limit,
-          links_after: value.links_after,
-          links_limit: value.links_limit,
-        }),
+        body: JSON.stringify(Object.fromEntries(fields.map((k) => [k, b[k]]))),
       });
     }
     if (path === "/admin/backlog" && request.method === "GET")

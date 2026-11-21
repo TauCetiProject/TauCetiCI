@@ -6,6 +6,7 @@ import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
 import {
   DATABASE_LIMIT_BYTES,
   MAINTENANCE_RETIREMENTS,
+  RETIREMENT_WINDOW,
   OBJECT_RETENTION_SECONDS,
   OPERATIONS_TABLES,
   STORAGE_RESERVE_BYTES,
@@ -28,6 +29,8 @@ import {
 } from "./operations-model";
 
 const PREFIX = "/v1/operations/objects/";
+const storageFullResponse = () =>
+  json({ error: "Operations storage is full", code: "storage_full" }, 507);
 const BUILD_CLASSES = ["pr_build", "staging_build", "other_build"];
 const BUILD_CLASS_SQL =
   "CASE WHEN json_extract(data,'$.job_class') IN ('pr_build','staging_build','other_build') THEN 1 ELSE 0 END";
@@ -90,6 +93,9 @@ export class Operations {
   private maintenance?: Promise<void>;
   private maintenanceAt?: number;
   private storageWarned?: number;
+  private liveRefreshedAt?: number;
+  private pinnedRoots = new Set<string>();
+  private retireCursor = { objects: 0, keys: 0 };
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
@@ -138,9 +144,9 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
       CREATE INDEX IF NOT EXISTS ops_host_samples_age ON ops_host_samples(resolution,bucket);
     `);
-    // Startup migrations write only when there is something to migrate, so a
-    // full database can still construct the object and serve reads.
-    try {
+    // Startup migrations write only when there is something to migrate and
+    // never on a full database, so the object can still serve reads and cleanup.
+    if (!this.storageFull()) try {
       // Quiet historical sources will not emit another webhook. Revisit legacy
       // cached partitions through the existing bounded collector to seed activity
       // (and, for activity cached before waiting_created, its queued jobs' ages).
@@ -2332,7 +2338,11 @@ export class Operations {
         },
       ]),
     );
-    const clock = now();
+    const clock = now(),
+      pinned = DOMAINS.map((kind) => captured[kind]?.value.url)
+        .filter((url): url is string => !!url)
+        .map((url) => url.slice(PREFIX.length, -5));
+    for (const root of pinned) this.pinnedRoots.add(root);
     this.pointerStarted = Date.now();
     this.publicationPending.add("manifest");
     this.pointer = (async () => {
@@ -2388,6 +2398,7 @@ export class Operations {
         console.warn("operations: public pointer unavailable");
       } finally {
         this.pointer = undefined;
+        this.pinnedRoots.clear();
         this.publicationPending.delete("manifest");
         await this.rearm();
         this.nudge();
@@ -2407,35 +2418,86 @@ export class Operations {
     }
     return used !== null && used >= DATABASE_LIMIT_BYTES - STORAGE_RESERVE_BYTES;
   }
-  /** Retire up to `limit` objects unreferenced since `horizon`. Every SQL
-   * statement here is a DELETE, so this runs on a full database. */
+  /** Retire up to `limit` objects unreferenced since `horizon`, examining at
+   * most `window` rows of each of ops_objects and ops_object_keys after the
+   * cursors. Cursors advance past skipped rows and wrap at the end, so
+   * protected rows cannot stall progress. Every SQL write here is a DELETE,
+   * so this runs on a full database. */
   async retireObjects(
     clock: number,
     limit: number,
-    horizon = clock - OBJECT_RETENTION_SECONDS,
-    live = new Set<string>(),
+    {
+      horizon = clock - OBJECT_RETENTION_SECONDS,
+      window = RETIREMENT_WINDOW,
+      cursor = this.retireCursor,
+      live = new Set<string>(),
+    }: {
+      horizon?: number;
+      window?: number;
+      cursor?: { objects: number; keys: number };
+      live?: Set<string>;
+    } = {},
   ) {
     const retired: string[] = [];
+    let examined = 0;
+    const next = { ...cursor };
     this.ctx.storage.transactionSync(() => {
-      for (const row of this.sql
-        .exec<{ hash: string; logical: string | null }>(
-          `SELECT o.hash,k.logical FROM ops_objects o LEFT JOIN ops_object_keys k ON k.hash=o.hash WHERE o.referenced<?
-         UNION ALL SELECT k.hash,k.logical FROM ops_object_keys k WHERE k.allocated<?
-         AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash) LIMIT ?`,
-          horizon,
-          horizon,
-          limit,
-        )
-        .toArray()) {
-        // An active logical write protects its pending physical allocation.
-        if (live.has(row.hash) || this.objectWrites.has(row.logical || row.hash))
-          continue;
+      const retire = (hash: string) => {
         // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
         // physical key even if this old delete finishes after an isolate restart.
-        this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", row.hash);
-        this.sql.exec("DELETE FROM ops_objects WHERE hash=?", row.hash);
-        this.sql.exec("DELETE FROM ops_links WHERE parent=?", row.hash);
-        retired.push(row.hash);
+        this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", hash);
+        this.sql.exec("DELETE FROM ops_objects WHERE hash=?", hash);
+        this.sql.exec("DELETE FROM ops_links WHERE parent=?", hash);
+        retired.push(hash);
+      };
+      const objects = this.sql
+        .exec<{ id: number; hash: string; referenced: number; logical: string | null }>(
+          `SELECT o.rowid id,o.hash,o.referenced,k.logical FROM ops_objects o
+           LEFT JOIN ops_object_keys k ON k.hash=o.hash
+           WHERE o.rowid>? ORDER BY o.rowid LIMIT ?`,
+          cursor.objects,
+          window,
+        )
+        .toArray();
+      examined += objects.length;
+      next.objects = objects.length < window ? 0 : objects.at(-1)!.id;
+      for (const row of objects) {
+        if (retired.length >= limit) {
+          next.objects = row.id - 1;
+          break;
+        }
+        // Reachable objects and active logical writes are never retired.
+        if (
+          row.referenced < horizon &&
+          !live.has(row.hash) &&
+          !this.objectWrites.has(row.logical || row.hash)
+        )
+          retire(row.hash);
+      }
+      // Allocations whose upload never produced a receipt.
+      const keys = this.sql
+        .exec<{ id: number; hash: string; logical: string; allocated: number; received: number }>(
+          `SELECT k.rowid id,k.hash,k.logical,k.allocated,
+             EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash) received
+           FROM ops_object_keys k WHERE k.rowid>? ORDER BY k.rowid LIMIT ?`,
+          cursor.keys,
+          window,
+        )
+        .toArray();
+      examined += keys.length;
+      next.keys = keys.length < window ? 0 : keys.at(-1)!.id;
+      for (const row of keys) {
+        if (retired.length >= limit) {
+          next.keys = row.id - 1;
+          break;
+        }
+        if (
+          !row.received &&
+          row.allocated < horizon &&
+          !live.has(row.hash) &&
+          !this.objectWrites.has(row.logical)
+        )
+          retire(row.hash);
       }
     });
     let deleted = 0;
@@ -2446,7 +2508,26 @@ export class Operations {
       await this.upload("maintenance", () => this.env.ARCHIVE.delete(keys));
       deleted += keys.length;
     }
-    return { retired: retired.length, archive_deleted: deleted };
+    return { retired: retired.length, archive_deleted: deleted, examined, cursor: next };
+  }
+  /** Refresh the reference time of every live object, so the retention
+   * period starts when an object stops being reachable. A full database
+   * skips this (it writes), so it must run before publication replaces roots
+   * once there is room again. */
+  private refreshLive(clock = now()) {
+    const { roots, live } = this.liveObjects();
+    if (roots.length)
+      this.sql.exec(
+        `WITH RECURSIVE live(hash) AS (
+        SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
+        ...roots,
+        clock,
+        clock - 3600,
+      );
+    this.liveRefreshedAt = clock;
+    return live;
   }
   /** Physical keys of the current manifests and every object they reach. */
   private liveObjects() {
@@ -2455,7 +2536,9 @@ export class Operations {
       this.state(kind, false),
     ])
       .filter((s) => s?.value.url)
-      .map((s) => s!.value.url.slice(PREFIX.length, -5));
+      .map((s) => s!.value.url.slice(PREFIX.length, -5))
+      // Roots captured by an in-flight manifest write may no longer be ready.
+      .concat([...this.pinnedRoots]);
     // Objects reachable from a current manifest are never retired, even when
     // a full database prevents refreshing their reference time.
     const live = new Set(
@@ -2473,20 +2556,6 @@ export class Operations {
         : [],
     );
     return { roots, live };
-  }
-  /** Count retirement candidates without writing (two table scans). */
-  retirementCandidates(horizon: number) {
-    return {
-      objects: this.sql
-        .exec<{ n: number }>("SELECT count(*) n FROM ops_objects WHERE referenced<?", horizon)
-        .one().n,
-      allocations: this.sql
-        .exec<{ n: number }>(
-          "SELECT count(*) n FROM ops_object_keys k WHERE k.allocated<? AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash)",
-          horizon,
-        )
-        .one().n,
-    };
   }
   /** Delete links whose parent object no longer exists, scanning at most
    * `limit` links after rowid `after`. Returns the next cursor. */
@@ -2525,19 +2594,10 @@ export class Operations {
     else this.maintenanceAt = now();
     this.maintenance = (async () => {
       const clock = now(),
-        { roots, live } = this.liveObjects();
-      if (roots.length && !full)
-        this.sql.exec(
-          `WITH RECURSIVE live(hash) AS (
-        SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
-        UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
-          ...roots,
-          clock,
-          clock - 3600,
-        );
+        live = full ? this.liveObjects().live : this.refreshLive(clock);
       // Publication allocates objects continuously; retire faster than that.
-      await this.retireObjects(clock, MAINTENANCE_RETIREMENTS, undefined, live);
+      const result = await this.retireObjects(clock, MAINTENANCE_RETIREMENTS, { live });
+      this.retireCursor = result.cursor;
       this.sql.exec(
         "DELETE FROM ops_changes WHERE snapshot IN (SELECT snapshot FROM ops_frames WHERE received<?)",
         clock - 3600,
@@ -2633,44 +2693,46 @@ export class Operations {
       this.startMaintenance();
       return;
     }
+    // After a restart or a full-database period, reference times may be stale.
+    if ((this.liveRefreshedAt || 0) < now() - 600) this.refreshLive();
     await this.publish(true);
   }
 
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
-    if (
-      ["/queue", "/history", "/progress", "/host", "/hosts", "/partition"].includes(path) &&
-      this.storageFull()
-    )
-      return json(
-        { error: "Operations storage is full", code: "storage_full" },
-        507,
-      );
+    if (["/queue", "/history", "/progress", "/host", "/hosts", "/partition"].includes(path)) {
+      // Buffer the body first so the check is not separated from the
+      // handler's synchronous writes by a body read.
+      const body = await request.text();
+      if (this.storageFull()) return storageFullResponse();
+      request = new Request(request.url, { method: "POST", body });
+    }
     if (path === "/prune") {
       // Bounded one-off retirement for an operator. Deletes only.
       const body: any = await request.json().catch(() => ({})),
         clock = now(),
         requested = body.older_than_days == null ? 7 : Number(body.older_than_days),
         days = Math.max(2, Number.isFinite(requested) ? requested : 7),
-        horizon = clock - days * 86400,
+        int = (v: any, lo: number, hi: number, d: number) =>
+          Math.min(hi, Math.max(lo, Math.floor(Number.isFinite(Number(v)) ? Number(v) : d))),
         before = databaseBytes(this.sql);
-      if (body.dry_run)
-        return json({
-          older_than_days: days,
-          candidates: this.retirementCandidates(horizon),
-          storage: storageStatus(before),
-        });
-      const limit = Math.min(5000, Math.max(1, Math.floor(Number(body.limit) || 1000)));
       const retired = await this.retireObjects(
         clock,
-        limit,
-        horizon,
-        this.liveObjects().live,
+        int(body.limit, 1, 5000, 1000),
+        {
+          horizon: clock - days * 86400,
+          window: int(body.window, 1, 50000, RETIREMENT_WINDOW),
+          cursor: {
+            objects: int(body.objects_after, 0, Number.MAX_SAFE_INTEGER, 0),
+            keys: int(body.keys_after, 0, Number.MAX_SAFE_INTEGER, 0),
+          },
+          live: this.liveObjects().live,
+        },
       );
       const links = body.links_limit
         ? this.sweepLinks(
-            Math.max(0, Math.floor(Number(body.links_after) || 0)),
-            Math.min(20000, Math.max(1, Math.floor(Number(body.links_limit)))),
+            int(body.links_after, 0, Number.MAX_SAFE_INTEGER, 0),
+            int(body.links_limit, 1, 20000, 1000),
           )
         : null;
       return json({
@@ -2729,6 +2791,8 @@ export class Operations {
       const canonicalFrame = canonical(frame),
         fingerprint = await digest(canonicalFrame);
       frame = JSON.parse(canonicalFrame);
+      // The digest above is awaited; check again before writing.
+      if (this.storageFull()) return storageFullResponse();
       try {
         result = this.ctx.storage.transactionSync(() =>
           this.stage(frame, fingerprint),
@@ -2902,7 +2966,7 @@ export class Operations {
       if (this.storageFull()) {
         // Free space before any other work; every other step writes.
         this.startMaintenance();
-        return json({ ok: false, code: "storage_full" }, 507);
+        return storageFullResponse();
       }
       this.set("manifest_heartbeat", now());
       if ((this.get("context_checked") || 0) < now() - 45 && this.env.CONTROL) {

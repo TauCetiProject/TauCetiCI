@@ -16,6 +16,8 @@ export const OBJECT_RETENTION_SECONDS = 2 * 86400;
 // Objects retired per maintenance pass (at most once a minute). Publication
 // allocates roughly a hundred objects a minute.
 export const MAINTENANCE_RETIREMENTS = 1000;
+// Rows of ops_objects and of ops_object_keys examined per retirement pass.
+export const RETIREMENT_WINDOW = 20000;
 
 export function databaseBytes(sql: SqlStorage): number | null {
   try {

@@ -3914,7 +3914,7 @@ test("storage status warns at eighty percent of the limit", async (t) => {
   assert.equal(health.storage.used_fraction, 0.8);
 });
 
-test("the operator prune counts, bounds and never goes below two days", async (t) => {
+test("the operator prune is bounded by a cursor and never goes below two days", async (t) => {
   const r = runtime(t);
   await r.send(seed);
   await r.flush();
@@ -3922,16 +3922,22 @@ test("the operator prune counts, bounds and never goes below two days", async (t
   staleObjects(r, 30, 8);
   const recent = staleObjects(r, 5, 1);
   const prune = async (body) => (await r.request("/prune", body)).json();
-  const dry = await prune({ dry_run: true, older_than_days: 7 });
-  assert.equal(dry.candidates.objects, 30);
-  assert.equal(countRows(r, "ops_objects"), live + 35);
   const first = await prune({ older_than_days: 7, limit: 10 });
   assert.equal(first.retired, 10);
   assert.equal(first.archive_deleted, 10);
   assert.equal(countRows(r, "ops_objects"), live + 25);
+  // A small window examines at most that many rows of each table.
+  const windowed = await prune({
+    older_than_days: 7,
+    limit: 5000,
+    window: 3,
+    objects_after: first.cursor.objects,
+    keys_after: first.cursor.keys,
+  });
+  assert.ok(windowed.examined <= 6);
+  assert.ok(windowed.cursor.objects > first.cursor.objects);
   const floor = await prune({ older_than_days: 0, limit: 5000 });
   assert.equal(floor.older_than_days, 2);
-  assert.equal(floor.retired, 20);
   assert.equal(countRows(r, "ops_objects"), live + 5);
   for (const hash of recent)
     assert.ok(r.objects.has("public/v1/operations/objects/" + hash + ".json"));
@@ -3939,4 +3945,52 @@ test("the operator prune counts, bounds and never goes below two days", async (t
   const sweep = await prune({ older_than_days: 7, limit: 1, links_limit: 100000 });
   assert.equal(sweep.links.orphans_deleted, 1);
   assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("protected stale objects cannot stall retirement behind them", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  // Every current object has an old reference time, as after a long full period.
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  const live = countRows(r, "ops_objects");
+  const stale = staleObjects(r, 20, 9);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  let cursor = { objects: 0, keys: 0 },
+    retired = 0;
+  for (let i = 0; i < 20 && retired < stale.length; i++) {
+    const result = await prune({
+      older_than_days: 7,
+      limit: 2,
+      window: 4,
+      objects_after: cursor.objects,
+      keys_after: cursor.keys,
+    });
+    retired += result.retired;
+    cursor = result.cursor;
+  }
+  assert.equal(retired, stale.length);
+  assert.equal(countRows(r, "ops_objects"), live);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("reference times are refreshed before publication replaces stale roots", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const old = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  const restarted = new Operations(r.ctx);
+  r.advance(10000);
+  await restarted.fetch(
+    new Request("https://internal/queue", { method: "POST", body: JSON.stringify(r.next(2)) }),
+  );
+  await restarted.alarm();
+  await r.drain();
+  const row = r.database.prepare("SELECT referenced FROM ops_objects WHERE hash=?").get(old);
+  assert.ok(row.referenced >= Math.floor(Date.now() / 1000) - 3600);
 });
