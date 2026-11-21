@@ -3,7 +3,17 @@ import { historyFrame } from "./operations-history";
 import { mergeActivity, staleAt, STALE_WAITING_SECONDS } from "./operations-activity";
 import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
-import { DATABASE_LIMIT_BYTES, OPERATIONS_TABLES, storageReport } from "./operations-storage";
+import {
+  DATABASE_LIMIT_BYTES,
+  MAINTENANCE_RETIREMENTS,
+  OBJECT_RETENTION_SECONDS,
+  OPERATIONS_TABLES,
+  STORAGE_RESERVE_BYTES,
+  STORAGE_WARNING_FRACTION,
+  databaseBytes,
+  storageReport,
+  storageStatus,
+} from "./operations-storage";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
 import { call, digest, json, now, operationsScope, type Env } from "./types";
@@ -78,6 +88,8 @@ export class Operations {
   private pointer?: Promise<void>;
   private pointerStarted?: number;
   private maintenance?: Promise<void>;
+  private maintenanceAt?: number;
+  private storageWarned?: number;
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
@@ -2383,19 +2395,138 @@ export class Operations {
     })();
     this.ctx.waitUntil(this.pointer);
   }
+  /** True when the database is within STORAGE_RESERVE_BYTES of its limit.
+   * An allocating write there is a critical storage error that breaks the
+   * object, so callers must not attempt one. */
+  private storageFull() {
+    const used = databaseBytes(this.sql);
+    if (used !== null && used >= STORAGE_WARNING_FRACTION * DATABASE_LIMIT_BYTES &&
+        (this.storageWarned || 0) < now() - 3600) {
+      this.storageWarned = now();
+      console.warn("operations: database storage above warning level", used);
+    }
+    return used !== null && used >= DATABASE_LIMIT_BYTES - STORAGE_RESERVE_BYTES;
+  }
+  /** Retire up to `limit` objects unreferenced since `horizon`. Every SQL
+   * statement here is a DELETE, so this runs on a full database. */
+  async retireObjects(
+    clock: number,
+    limit: number,
+    horizon = clock - OBJECT_RETENTION_SECONDS,
+    live = new Set<string>(),
+  ) {
+    const retired: string[] = [];
+    this.ctx.storage.transactionSync(() => {
+      for (const row of this.sql
+        .exec<{ hash: string; logical: string | null }>(
+          `SELECT o.hash,k.logical FROM ops_objects o LEFT JOIN ops_object_keys k ON k.hash=o.hash WHERE o.referenced<?
+         UNION ALL SELECT k.hash,k.logical FROM ops_object_keys k WHERE k.allocated<?
+         AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash) LIMIT ?`,
+          horizon,
+          horizon,
+          limit,
+        )
+        .toArray()) {
+        // An active logical write protects its pending physical allocation.
+        if (live.has(row.hash) || this.objectWrites.has(row.logical || row.hash))
+          continue;
+        // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
+        // physical key even if this old delete finishes after an isolate restart.
+        this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", row.hash);
+        this.sql.exec("DELETE FROM ops_objects WHERE hash=?", row.hash);
+        this.sql.exec("DELETE FROM ops_links WHERE parent=?", row.hash);
+        retired.push(row.hash);
+      }
+    });
+    let deleted = 0;
+    for (let i = 0; i < retired.length; i += 1000) {
+      const keys = retired
+        .slice(i, i + 1000)
+        .map((hash) => "public" + PREFIX + hash + ".json");
+      await this.upload("maintenance", () => this.env.ARCHIVE.delete(keys));
+      deleted += keys.length;
+    }
+    return { retired: retired.length, archive_deleted: deleted };
+  }
+  /** Physical keys of the current manifests and every object they reach. */
+  private liveObjects() {
+    const roots = DOMAINS.flatMap((kind) => [
+      this.state(kind),
+      this.state(kind, false),
+    ])
+      .filter((s) => s?.value.url)
+      .map((s) => s!.value.url.slice(PREFIX.length, -5));
+    // Objects reachable from a current manifest are never retired, even when
+    // a full database prevents refreshing their reference time.
+    const live = new Set(
+      roots.length
+        ? this.sql
+            .exec<{ hash: string }>(
+              `WITH RECURSIVE live(hash) AS (
+        SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        SELECT hash FROM live`,
+              ...roots,
+            )
+            .toArray()
+            .map((row) => row.hash)
+        : [],
+    );
+    return { roots, live };
+  }
+  /** Count retirement candidates without writing (two table scans). */
+  retirementCandidates(horizon: number) {
+    return {
+      objects: this.sql
+        .exec<{ n: number }>("SELECT count(*) n FROM ops_objects WHERE referenced<?", horizon)
+        .one().n,
+      allocations: this.sql
+        .exec<{ n: number }>(
+          "SELECT count(*) n FROM ops_object_keys k WHERE k.allocated<? AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash)",
+          horizon,
+        )
+        .one().n,
+    };
+  }
+  /** Delete links whose parent object no longer exists, scanning at most
+   * `limit` links after rowid `after`. Returns the next cursor. */
+  sweepLinks(after: number, limit: number) {
+    const rows = this.sql
+      .exec<{ id: number; orphan: number }>(
+        `SELECT l.rowid id,NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=l.parent) orphan
+         FROM ops_links l WHERE l.rowid>? ORDER BY l.rowid LIMIT ?`,
+        after,
+        limit,
+      )
+      .toArray();
+    let orphans = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows)
+        if (row.orphan) {
+          this.sql.exec("DELETE FROM ops_links WHERE rowid=?", row.id);
+          orphans++;
+        }
+    });
+    return {
+      scanned: rows.length,
+      orphans_deleted: orphans,
+      next: rows.length === limit ? rows.at(-1)!.id : null,
+    };
+  }
   private startMaintenance() {
-    if (this.maintenance || (this.get("maintenance_at") || 0) > now() - 60)
+    if (
+      this.maintenance ||
+      Math.max(this.get("maintenance_at") || 0, this.maintenanceAt || 0) > now() - 60
+    )
       return;
-    this.set("maintenance_at", now());
+    const full = this.storageFull();
+    // On a full database retire first: the marker below is a write.
+    if (!full) this.set("maintenance_at", now());
+    else this.maintenanceAt = now();
     this.maintenance = (async () => {
       const clock = now(),
-        roots = DOMAINS.flatMap((kind) => [
-          this.state(kind),
-          this.state(kind, false),
-        ])
-          .filter((s) => s?.value.url)
-          .map((s) => s!.value.url.slice(PREFIX.length, -5));
-      if (roots.length)
+        { roots, live } = this.liveObjects();
+      if (roots.length && !full)
         this.sql.exec(
           `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (${roots.map(() => "?").join(",")})
@@ -2405,48 +2536,8 @@ export class Operations {
           clock,
           clock - 3600,
         );
-      for (const row of this.sql
-        .exec<{ hash: string; referenced: number; logical: string | null }>(
-          `SELECT o.hash,o.referenced,k.logical FROM ops_objects o LEFT JOIN ops_object_keys k ON k.hash=o.hash WHERE o.referenced<?
-         UNION ALL SELECT k.hash,k.allocated referenced,k.logical FROM ops_object_keys k WHERE k.allocated<?
-         AND NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=k.hash) LIMIT 20`,
-          clock - 7 * 86400,
-          clock - 7 * 86400,
-        )
-        .toArray()) {
-        // A preceding R2 await can make a selected candidate reachable again.
-        // An active logical write also protects its pending physical allocation.
-        const receipt = this.sql
-          .exec<{
-            referenced: number;
-          }>("SELECT referenced FROM ops_objects WHERE hash=?", row.hash)
-          .toArray()[0];
-        const allocation = this.sql
-          .exec<{
-            logical: string;
-            allocated: number;
-          }>(
-            "SELECT logical,allocated FROM ops_object_keys WHERE hash=?",
-            row.hash,
-          )
-          .toArray()[0];
-        if (
-          (receipt ? receipt.referenced : allocation?.allocated) !==
-            row.referenced ||
-          this.objectWrites.has(allocation?.logical || row.hash)
-        )
-          continue;
-        // Retirement is durable and atomic. A reconstruction gets a DIFFERENT
-        // physical key even if this old delete finishes after an isolate restart.
-        this.ctx.storage.transactionSync(() => {
-          this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", row.hash);
-          this.sql.exec("DELETE FROM ops_objects WHERE hash=?", row.hash);
-          this.sql.exec("DELETE FROM ops_links WHERE parent=?", row.hash);
-        });
-        await this.upload("maintenance", () =>
-          this.env.ARCHIVE.delete("public" + PREFIX + row.hash + ".json"),
-        );
-      }
+      // Publication allocates objects continuously; retire faster than that.
+      await this.retireObjects(clock, MAINTENANCE_RETIREMENTS, undefined, live);
       this.sql.exec(
         "DELETE FROM ops_changes WHERE snapshot IN (SELECT snapshot FROM ops_frames WHERE received<?)",
         clock - 3600,
@@ -2538,11 +2629,58 @@ export class Operations {
     }
   }
   async alarm() {
+    if (this.storageFull()) {
+      this.startMaintenance();
+      return;
+    }
     await this.publish(true);
   }
 
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
+    if (
+      ["/queue", "/history", "/progress", "/host", "/hosts", "/partition"].includes(path) &&
+      this.storageFull()
+    )
+      return json(
+        { error: "Operations storage is full", code: "storage_full" },
+        507,
+      );
+    if (path === "/prune") {
+      // Bounded one-off retirement for an operator. Deletes only.
+      const body: any = await request.json().catch(() => ({})),
+        clock = now(),
+        requested = body.older_than_days == null ? 7 : Number(body.older_than_days),
+        days = Math.max(2, Number.isFinite(requested) ? requested : 7),
+        horizon = clock - days * 86400,
+        before = databaseBytes(this.sql);
+      if (body.dry_run)
+        return json({
+          older_than_days: days,
+          candidates: this.retirementCandidates(horizon),
+          storage: storageStatus(before),
+        });
+      const limit = Math.min(5000, Math.max(1, Math.floor(Number(body.limit) || 1000)));
+      const retired = await this.retireObjects(
+        clock,
+        limit,
+        horizon,
+        this.liveObjects().live,
+      );
+      const links = body.links_limit
+        ? this.sweepLinks(
+            Math.max(0, Math.floor(Number(body.links_after) || 0)),
+            Math.min(20000, Math.max(1, Math.floor(Number(body.links_limit)))),
+          )
+        : null;
+      return json({
+        older_than_days: days,
+        ...retired,
+        links,
+        database_bytes_before: before,
+        storage: storageStatus(databaseBytes(this.sql)),
+      });
+    }
     if (path === "/backlog") {
       const repo = "TauCetiProject/TauCeti";
       const source = this.source(this.get("queue_source") || "");
@@ -2761,6 +2899,11 @@ export class Operations {
       return json({ ok: true });
     }
     if (path === "/tick") {
+      if (this.storageFull()) {
+        // Free space before any other work; every other step writes.
+        this.startMaintenance();
+        return json({ ok: false, code: "storage_full" }, 507);
+      }
       this.set("manifest_heartbeat", now());
       if ((this.get("context_checked") || 0) < now() - 45 && this.env.CONTROL) {
         this.set("context_checked", now());
@@ -2844,6 +2987,7 @@ export class Operations {
           }
         })(),
         database_limit_bytes: DATABASE_LIMIT_BYTES,
+        storage: storageStatus(databaseBytes(this.sql)),
         staged_frames: this.sql
           .exec<{ count: number }>("SELECT COUNT(*) count FROM ops_frames")
           .one().count,

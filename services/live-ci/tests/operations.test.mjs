@@ -118,8 +118,8 @@ function runtime(t) {
         writes.push(key);
         objects.set(key, value);
       },
-      async delete(key) {
-        objects.delete(key);
+      async delete(keys) {
+        for (const key of [keys].flat()) objects.delete(key);
       },
     },
   };
@@ -2750,7 +2750,7 @@ test("an old source epoch finishing its upload cannot restore its prepared queue
   assert.equal(queueSequence(r), 1);
 });
 
-test("background GC rechecks stale candidates reused while an earlier delete was pending", async (t) => {
+test("content reused while a retirement delete is pending is republished under a new key", async (t) => {
   const r = runtime(t);
   await r.send(seed);
   await r.flush();
@@ -2782,34 +2782,39 @@ test("background GC rechecks stale candidates reused while an earlier delete was
     });
   const archive = globalThis.__operationsTestEnv.ARCHIVE,
     remove = archive.delete;
-  archive.delete = async (key) => {
+  archive.delete = async (keys) => {
     if (!deleting) {
-      deleting = key;
+      deleting = [keys].flat();
       enter();
       await gate;
     }
-    return remove(key);
+    for (const key of [keys].flat()) await remove(key);
   };
   r.operations.set("maintenance_at", 0);
   r.operations.startMaintenance();
-  let target;
+  let target, current;
   try {
     await entered;
-    target = choices.find((c) => "public" + c.ref.url !== deleting);
-    assert.ok(target);
-    await r.request("/history", target.value);
-    await pumpUntil(
-      r,
-      () => r.manifest().domains.history.url === target.ref.url,
+    // Both stale rows retire atomically, before any R2 delete is awaited.
+    assert.deepEqual(
+      deleting.sort(),
+      choices.map((c) => "public" + c.ref.url).sort(),
     );
-    assert.ok(r.objects.has("public" + target.ref.url));
+    target = choices[1];
+    await r.request("/history", target.value);
+    await pumpUntil(r, () => {
+      current = r.manifest().domains.history?.url;
+      return !choices.some((c) => c.ref.url === current) &&
+        current !== undefined && r.objects.has("public" + current);
+    });
   } finally {
     release();
     await r.drain();
   }
+  assert.notEqual(current, target.ref.url);
   assert.ok(
-    r.objects.has("public" + target.ref.url),
-    "GC cannot delete the newly public root from its stale candidate list",
+    r.objects.has("public" + current),
+    "GC cannot delete the newly public root under its new physical key",
   );
 });
 
@@ -2893,7 +2898,7 @@ test("a retired physical key cannot delete a recreated history object after publ
   const archive = globalThis.__operationsTestEnv.ARCHIVE,
     remove = archive.delete;
   archive.delete = async (key) => {
-    if (key === "public" + old.url) {
+    if ([key].flat().includes("public" + old.url)) {
       enter();
       await gate;
     }
@@ -3807,4 +3812,131 @@ test("storage samples do not count a row twice across a rowid gap", async (t) =>
   const report = await (await r.request("/storage?exact=ops_failures")).json();
   assert.equal(report.tables.ops_failures.rows, 5);
   assert.equal(report.tables.ops_failures.sampled_rows, 5);
+});
+
+function staleObjects(r, count, ageDays) {
+  const insert = r.database.prepare("INSERT INTO ops_objects VALUES (?,?)"),
+    key = r.database.prepare("INSERT INTO ops_object_keys VALUES (?,?,?)"),
+    link = r.database.prepare("INSERT INTO ops_links VALUES (?,?)"),
+    at = Math.floor(Date.now() / 1000) - ageDays * 86400,
+    hashes = [];
+  for (let i = 0; i < count; i++) {
+    const hash =
+      "a".repeat(63) + (ageDays % 10) + "/" + String(i).padStart(64, "0");
+    insert.run(hash, at);
+    key.run("logical-" + ageDays + "-" + i, hash, at);
+    link.run(hash, "b".repeat(64) + "/" + String(i).padStart(64, "0"));
+    r.objects.set("public/v1/operations/objects/" + hash + ".json", "{}");
+    hashes.push(hash);
+  }
+  return hashes;
+}
+const countRows = (r, table) =>
+  r.database.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
+function setDatabaseSize(r, bytes) {
+  Object.defineProperty(r.ctx.storage.sql, "databaseSize", {
+    configurable: true,
+    get: () => bytes(),
+  });
+}
+
+test("one maintenance pass retires far more than twenty stale objects and keeps live ones", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const live = countRows(r, "ops_objects");
+  const stale = staleObjects(r, 300, 3);
+  const recent = staleObjects(r, 5, 1);
+  r.operations.set("maintenance_at", 0);
+  r.operations.startMaintenance();
+  await r.drain();
+  assert.equal(countRows(r, "ops_objects"), live + recent.length);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_links WHERE parent LIKE 'a%3/%'").get().n,
+    0,
+  );
+  for (const hash of stale)
+    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("a full database rejects ingestion with storage_full and frees space on tick", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const stale = staleObjects(r, 50, 3);
+  const limit = 10 * 1024 ** 3;
+  let full = true;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec,
+    writes = [];
+  sql.exec = (statement, ...args) => {
+    if (/^\s*(INSERT|UPDATE|REPLACE)\b/i.test(statement))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
+    return exec(statement, ...args);
+  };
+  const before = countRows(r, "ops_entities");
+  const rejected = await r.request("/queue", r.next(2));
+  assert.equal(rejected.status, 507);
+  assert.equal((await rejected.json()).code, "storage_full");
+  for (const path of ["/history", "/progress", "/host", "/hosts", "/partition"])
+    assert.equal((await r.request(path, {})).status, 507, path);
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "full");
+  r.advance(120000);
+  const tick = await r.request("/tick");
+  assert.equal(tick.status, 507);
+  await r.drain();
+  sql.exec = exec;
+  assert.deepEqual(writes, []);
+  assert.equal(countRows(r, "ops_entities"), before);
+  for (const hash of stale)
+    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE hash LIKE 'aaaa%'").get().n,
+    0,
+  );
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+  full = false;
+  assert.equal((await r.request("/queue", r.next(2))).status, 200);
+});
+
+test("storage status warns at eighty percent of the limit", async (t) => {
+  const r = runtime(t);
+  const limit = 10 * 1024 ** 3;
+  let used = 0.79 * limit;
+  setDatabaseSize(r, () => used);
+  assert.equal((await (await r.request("/health")).json()).storage.status, "ok");
+  used = 0.8 * limit;
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "warning");
+  assert.equal(health.storage.used_fraction, 0.8);
+});
+
+test("the operator prune counts, bounds and never goes below two days", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const live = countRows(r, "ops_objects");
+  staleObjects(r, 30, 8);
+  const recent = staleObjects(r, 5, 1);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  const dry = await prune({ dry_run: true, older_than_days: 7 });
+  assert.equal(dry.candidates.objects, 30);
+  assert.equal(countRows(r, "ops_objects"), live + 35);
+  const first = await prune({ older_than_days: 7, limit: 10 });
+  assert.equal(first.retired, 10);
+  assert.equal(first.archive_deleted, 10);
+  assert.equal(countRows(r, "ops_objects"), live + 25);
+  const floor = await prune({ older_than_days: 0, limit: 5000 });
+  assert.equal(floor.older_than_days, 2);
+  assert.equal(floor.retired, 20);
+  assert.equal(countRows(r, "ops_objects"), live + 5);
+  for (const hash of recent)
+    assert.ok(r.objects.has("public/v1/operations/objects/" + hash + ".json"));
+  r.database.exec(`INSERT INTO ops_links VALUES ('${"c".repeat(64)}/x','child')`);
+  const sweep = await prune({ older_than_days: 7, limit: 1, links_limit: 100000 });
+  assert.equal(sweep.links.orphans_deleted, 1);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
 });

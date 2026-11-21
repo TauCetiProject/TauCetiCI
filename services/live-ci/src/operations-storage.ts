@@ -4,6 +4,43 @@
 
 // Cloudflare's per-object SQLite limit on Workers Paid.
 export const DATABASE_LIMIT_BYTES = 10 * 1024 ** 3;
+// /health reports "warning" and the object logs hourly above this fraction.
+export const STORAGE_WARNING_FRACTION = 0.8;
+// Writes stop this far below the limit. On a full database an allocating
+// write is a critical storage error that breaks the object; deletes still work.
+export const STORAGE_RESERVE_BYTES = 128 * 1024 ** 2;
+// Unreferenced published objects are retired after this long. Manifests are
+// served with stale-if-error=86400, so an edge can point at an object for a
+// day after it stops being referenced.
+export const OBJECT_RETENTION_SECONDS = 2 * 86400;
+// Objects retired per maintenance pass (at most once a minute). Publication
+// allocates roughly a hundred objects a minute.
+export const MAINTENANCE_RETIREMENTS = 1000;
+
+export function databaseBytes(sql: SqlStorage): number | null {
+  try {
+    return sql.databaseSize;
+  } catch {
+    return null;
+  }
+}
+
+export function storageStatus(used: number | null) {
+  return {
+    database_bytes: used,
+    limit_bytes: DATABASE_LIMIT_BYTES,
+    used_fraction:
+      used === null ? null : Math.round((used / DATABASE_LIMIT_BYTES) * 1e4) / 1e4,
+    status:
+      used === null
+        ? "unknown"
+        : used >= DATABASE_LIMIT_BYTES - STORAGE_RESERVE_BYTES
+          ? "full"
+          : used >= STORAGE_WARNING_FRACTION * DATABASE_LIMIT_BYTES
+            ? "warning"
+            : "ok",
+  };
+}
 
 // Every column per table. Byte figures are approximate payload lengths: TEXT
 // as UTF-8 and numbers by their decimal length. Indexes and B-tree overhead
@@ -49,13 +86,7 @@ export function storageReport(
   exact: Set<string>,
   bytes: Set<string>,
 ) {
-  const database = (() => {
-    try {
-      return sql.databaseSize;
-    } catch {
-      return null;
-    }
-  })();
+  const database = databaseBytes(sql);
   const tables: Record<string, any> = {};
   for (const [table, columns] of Object.entries(OPERATIONS_TABLES)) {
     const started = Date.now();
@@ -136,10 +167,7 @@ export function storageReport(
       meta_prefixes = null;
     }
   return {
-    database_bytes: database,
-    limit_bytes: DATABASE_LIMIT_BYTES,
-    used_fraction:
-      database === null ? null : Math.round((database / DATABASE_LIMIT_BYTES) * 1e4) / 1e4,
+    ...storageStatus(database),
     tables,
     meta_prefixes,
   };

@@ -483,6 +483,23 @@ async function handle(
         query.set(key, (url.searchParams.get(key) || "").slice(0, 500));
       return stub(env.OPERATIONS, "operations").fetch("https://internal/storage?" + query);
     }
+    if (path === "/admin/operations-prune") {
+      if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+      const value =
+        request.method === "POST"
+          ? b
+          : { dry_run: true, older_than_days: url.searchParams.get("older_than_days") };
+      return stub(env.OPERATIONS, "operations").fetch("https://internal/prune", {
+        method: "POST",
+        body: JSON.stringify({
+          dry_run: !!value.dry_run,
+          older_than_days: value.older_than_days,
+          limit: value.limit,
+          links_after: value.links_after,
+          links_limit: value.links_limit,
+        }),
+      });
+    }
     if (path === "/admin/backlog" && request.method === "GET")
       return json(await call(env.CONTROL, "control", "/backlog", {
         cursor: (url.searchParams.get("cursor") || "").slice(0, 200),
@@ -572,6 +589,11 @@ export default {
       return await handle(request, env, ctx);
     } catch (error) {
       console.error("live-ci request failed", String(error));
+      if (String(error).includes("maximum database size"))
+        return json(
+          { error: "Operations storage is full", code: "storage_full" },
+          507,
+        );
       return json({ error: "Request failed" }, 500);
     }
   },
