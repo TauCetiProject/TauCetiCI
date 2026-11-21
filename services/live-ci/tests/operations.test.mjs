@@ -3732,3 +3732,37 @@ test("pool activity stays observed while a partition awaits collection, partial 
  value=r.object(await r.operations.jobsView(r.operations.projection('jobs')));
  assert.equal(value.pool_activity.coverage,'partial');
 });
+
+test("the storage report reads a full database without writing", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  Object.defineProperty(sql, "databaseSize", { get: () => 9 * 1024 **3 });
+  sql.exec = (statement, ...args) => {
+    if (!/^\s*SELECT\b/i.test(statement))
+      throw new Error("Exceeded the maximum database size.");
+    return exec(statement, ...args);
+  };
+  const response = await r.request(
+    "/storage?exact=ops_entities,unknown_table&bytes=ops_meta",
+  );
+  assert.equal(response.status, 200);
+  const report = await response.json();
+  sql.exec = exec;
+  assert.equal(report.database_bytes, 9 * 1024 ** 3);
+  assert.equal(report.limit_bytes, 10 * 1024 ** 3);
+  assert.equal(report.used_fraction, 0.9);
+  const entities = r.database
+    .prepare("SELECT COUNT(*) count FROM ops_entities")
+    .get().count;
+  assert.equal(report.tables.ops_entities.rows, entities);
+  assert.ok(report.tables.ops_entities.sampled_mean_bytes > 0);
+  assert.ok(report.tables.ops_meta.payload_bytes > 0);
+  assert.ok(report.meta_prefixes.length > 0);
+  assert.equal(report.tables.unknown_table, undefined);
+  for (const table of Object.values(report.tables))
+    assert.equal(table.error, undefined);
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.database_bytes, 9 * 1024 ** 3);
+});

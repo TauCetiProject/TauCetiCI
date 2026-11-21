@@ -476,6 +476,13 @@ async function handle(
     }
     if (path === "/admin/health")
       return json(await call(env.CONTROL, "control", "/health"));
+    if (path === "/admin/operations-storage" && request.method === "GET") {
+      if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
+      const query = new URLSearchParams();
+      for (const key of ["exact", "bytes"])
+        query.set(key, (url.searchParams.get(key) || "").slice(0, 500));
+      return stub(env.OPERATIONS, "operations").fetch("https://internal/storage?" + query);
+    }
     if (path === "/admin/backlog" && request.method === "GET")
       return json(await call(env.CONTROL, "control", "/backlog", {
         cursor: (url.searchParams.get("cursor") || "").slice(0, 200),

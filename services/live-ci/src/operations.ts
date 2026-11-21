@@ -3,6 +3,7 @@ import { historyFrame } from "./operations-history";
 import { mergeActivity, staleAt, STALE_WAITING_SECONDS } from "./operations-activity";
 import { mergeBacklogs } from "./operations-backlog";
 import { hostFrame, publicHosts, retainHostFacts } from "./operations-hosts";
+import { DATABASE_LIMIT_BYTES, OPERATIONS_TABLES, storageReport } from "./operations-storage";
 import { PUBLIC_POOLS } from "./runner-registry";
 import { env as bindings } from "cloudflare:workers";
 import { call, digest, json, now, operationsScope, type Env } from "./types";
@@ -2774,6 +2775,17 @@ export class Operations {
       await this.alarm();
       return json({ ok: true });
     }
+    if (path === "/storage") {
+      // Read only: safe while the database is full.
+      const params = new URL(request.url).searchParams,
+        names = (key: string) =>
+          new Set(
+            (params.get(key) || "")
+              .split(",")
+              .filter((name) => Object.hasOwn(OPERATIONS_TABLES, name)),
+          );
+      return json(storageReport(this.sql, names("exact"), names("bytes")));
+    }
     if (path === "/health") {
       const queuePreparations = this.queuePreparations();
       return json({
@@ -2807,6 +2819,14 @@ export class Operations {
           const row = this.source(this.get("queue_source") || "");
           return row ? { epoch: row.epoch, sequence: row.sequence } : null;
         })(),
+        database_bytes: (() => {
+          try {
+            return this.sql.databaseSize;
+          } catch {
+            return null;
+          }
+        })(),
+        database_limit_bytes: DATABASE_LIMIT_BYTES,
         staged_frames: this.sql
           .exec<{ count: number }>("SELECT COUNT(*) count FROM ops_frames")
           .one().count,
