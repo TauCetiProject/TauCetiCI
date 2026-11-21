@@ -173,6 +173,23 @@ follow its returned cursor for additional pages. These operations require the
 admin bearer token and make no GitHub requests. Successful replay moves the body
 back to the normal delivery archive; duplicate messages remain idempotent.
 
+The Operations Durable Object keeps its SQLite database under Cloudflare's 10 GiB
+per-object limit. Operations `/health` reports `storage.status`: `warning` from 80%
+of the limit, and `full` within 128 MiB of it. When full, ingestion returns HTTP 507
+with code `storage_full` and the minute tick only retires objects, since on a full
+database any allocating write breaks the object while deletes still succeed.
+Published objects unreferenced for two days are retired, up to 1,000 per minute,
+examining at most 20,000 rows of `ops_objects` and of `ops_object_keys` per pass
+from a cursor that wraps. Reference times of reachable objects are refreshed before
+publication resumes, so the two days start when an object stops being reachable.
+`GET /admin/operations-storage` reports per-table rowid ranges and sampled row sizes;
+`?exact=` and `?bytes=` take table names for `COUNT(*)` and a full payload scan.
+`POST /admin/operations-prune` with `{"older_than_days": 7, "limit": 1000}` retires
+up to 5,000 objects (never newer than two days), examining `window` rows (at most
+50,000) of each table after `objects_after`/`keys_after`; pass back the returned
+`cursor`. `links_after`/`links_limit` also delete links whose parent object no
+longer exists.
+
 `POST /admin/repair-members` processes up to eight due bors membership repairs.
 `POST /admin/recompute` with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-17"}`
 recalculates at most forty stored self-hosted jobs using reversible metric deltas.

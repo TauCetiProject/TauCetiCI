@@ -118,8 +118,12 @@ function runtime(t) {
         writes.push(key);
         objects.set(key, value);
       },
-      async delete(key) {
-        objects.delete(key);
+      async get(key) {
+        const value = objects.get(key);
+        return value === undefined ? null : { text: async () => String(value) };
+      },
+      async delete(keys) {
+        for (const key of [keys].flat()) objects.delete(key);
       },
     },
   };
@@ -2568,7 +2572,7 @@ for (const deliverAlarms of [true, false])
           return { async put(key, value, options) {
             if (JSON.parse(value).schema === "tauceti.operations.jobs/v1") await fetch("https://hold.example/jobs");
             return target.ARCHIVE.put(key, value, options);
-          }, delete(key) {return target.ARCHIVE.delete(key);} };
+          }, get(key) {return target.ARCHIVE.get(key);}, delete(key) {return target.ARCHIVE.delete(key);} };
         }});`,
               }),
             );
@@ -2750,7 +2754,7 @@ test("an old source epoch finishing its upload cannot restore its prepared queue
   assert.equal(queueSequence(r), 1);
 });
 
-test("background GC rechecks stale candidates reused while an earlier delete was pending", async (t) => {
+test("content reused while a retirement delete is pending is republished under a new key", async (t) => {
   const r = runtime(t);
   await r.send(seed);
   await r.flush();
@@ -2782,34 +2786,39 @@ test("background GC rechecks stale candidates reused while an earlier delete was
     });
   const archive = globalThis.__operationsTestEnv.ARCHIVE,
     remove = archive.delete;
-  archive.delete = async (key) => {
+  archive.delete = async (keys) => {
     if (!deleting) {
-      deleting = key;
+      deleting = [keys].flat();
       enter();
       await gate;
     }
-    return remove(key);
+    for (const key of [keys].flat()) await remove(key);
   };
   r.operations.set("maintenance_at", 0);
   r.operations.startMaintenance();
-  let target;
+  let target, current;
   try {
     await entered;
-    target = choices.find((c) => "public" + c.ref.url !== deleting);
-    assert.ok(target);
-    await r.request("/history", target.value);
-    await pumpUntil(
-      r,
-      () => r.manifest().domains.history.url === target.ref.url,
+    // Both stale rows retire atomically, before any R2 delete is awaited.
+    assert.deepEqual(
+      deleting.sort(),
+      choices.map((c) => "public" + c.ref.url).sort(),
     );
-    assert.ok(r.objects.has("public" + target.ref.url));
+    target = choices[1];
+    await r.request("/history", target.value);
+    await pumpUntil(r, () => {
+      current = r.manifest().domains.history?.url;
+      return !choices.some((c) => c.ref.url === current) &&
+        current !== undefined && r.objects.has("public" + current);
+    });
   } finally {
     release();
     await r.drain();
   }
+  assert.notEqual(current, target.ref.url);
   assert.ok(
-    r.objects.has("public" + target.ref.url),
-    "GC cannot delete the newly public root from its stale candidate list",
+    r.objects.has("public" + current),
+    "GC cannot delete the newly public root under its new physical key",
   );
 });
 
@@ -2893,7 +2902,7 @@ test("a retired physical key cannot delete a recreated history object after publ
   const archive = globalThis.__operationsTestEnv.ARCHIVE,
     remove = archive.delete;
   archive.delete = async (key) => {
-    if (key === "public" + old.url) {
+    if ([key].flat().includes("public" + old.url)) {
       enter();
       await gate;
     }
@@ -3807,4 +3816,374 @@ test("storage samples do not count a row twice across a rowid gap", async (t) =>
   const report = await (await r.request("/storage?exact=ops_failures")).json();
   assert.equal(report.tables.ops_failures.rows, 5);
   assert.equal(report.tables.ops_failures.sampled_rows, 5);
+});
+
+function staleObjects(r, count, ageDays) {
+  const insert = r.database.prepare("INSERT INTO ops_objects VALUES (?,?)"),
+    key = r.database.prepare("INSERT INTO ops_object_keys VALUES (?,?,?)"),
+    link = r.database.prepare("INSERT INTO ops_links VALUES (?,?)"),
+    at = Math.floor(Date.now() / 1000) - ageDays * 86400,
+    hashes = [];
+  for (let i = 0; i < count; i++) {
+    const hash =
+      "a".repeat(63) + (ageDays % 10) + "/" + String(i).padStart(64, "0");
+    insert.run(hash, at);
+    key.run("logical-" + ageDays + "-" + i, hash, at);
+    link.run(hash, "b".repeat(64) + "/" + String(i).padStart(64, "0"));
+    r.objects.set("public/v1/operations/objects/" + hash + ".json", "{}");
+    hashes.push(hash);
+  }
+  return hashes;
+}
+const countRows = (r, table) =>
+  r.database.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
+function setDatabaseSize(r, bytes) {
+  Object.defineProperty(r.ctx.storage.sql, "databaseSize", {
+    configurable: true,
+    get: () => bytes(),
+  });
+}
+
+test("one maintenance pass retires far more than twenty stale objects and keeps live ones", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const live = countRows(r, "ops_objects");
+  const stale = staleObjects(r, 300, 3);
+  const recent = staleObjects(r, 5, 1);
+  r.operations.set("maintenance_at", 0);
+  r.operations.startMaintenance();
+  await r.drain();
+  assert.equal(countRows(r, "ops_objects"), live + recent.length);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_links WHERE parent LIKE 'a%3/%'").get().n,
+    0,
+  );
+  for (const hash of stale)
+    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("a full database rejects ingestion with storage_full and frees space on tick", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const stale = staleObjects(r, 50, 3);
+  const limit = 10 * 1024 ** 3;
+  let full = true;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec,
+    writes = [];
+  sql.exec = (statement, ...args) => {
+    if (/^\s*(INSERT|UPDATE|REPLACE)\b/i.test(statement))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
+    return exec(statement, ...args);
+  };
+  const before = countRows(r, "ops_entities");
+  const rejected = await r.request("/queue", r.next(2));
+  assert.equal(rejected.status, 507);
+  assert.equal((await rejected.json()).code, "storage_full");
+  for (const path of ["/history", "/progress", "/host", "/hosts", "/partition"])
+    assert.equal((await r.request(path, {})).status, 507, path);
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "full");
+  r.advance(120000);
+  const tick = await r.request("/tick");
+  assert.equal(tick.status, 507);
+  await r.drain();
+  sql.exec = exec;
+  assert.deepEqual(writes, []);
+  assert.equal(countRows(r, "ops_entities"), before);
+  for (const hash of stale)
+    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE hash LIKE 'aaaa%'").get().n,
+    0,
+  );
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+  full = false;
+  assert.equal((await r.request("/queue", r.next(2))).status, 200);
+});
+
+test("storage status warns at eighty percent of the limit", async (t) => {
+  const r = runtime(t);
+  const limit = 10 * 1024 ** 3;
+  let used = 0.79 * limit;
+  setDatabaseSize(r, () => used);
+  assert.equal((await (await r.request("/health")).json()).storage.status, "ok");
+  used = 0.8 * limit;
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "warning");
+  assert.equal(health.storage.used_fraction, 0.8);
+});
+
+test("the operator prune is bounded by a cursor and never goes below two days", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const live = countRows(r, "ops_objects");
+  staleObjects(r, 30, 8);
+  const recent = staleObjects(r, 5, 1);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  const first = await prune({ older_than_days: 7, limit: 10 });
+  assert.equal(first.retired, 10);
+  assert.equal(first.archive_deleted, 10);
+  assert.equal(countRows(r, "ops_objects"), live + 25);
+  // A small window examines at most that many rows of each table.
+  const windowed = await prune({
+    older_than_days: 7,
+    limit: 5000,
+    window: 3,
+    objects_after: first.cursor.objects,
+    keys_after: first.cursor.keys,
+  });
+  assert.ok(windowed.examined <= 6);
+  assert.ok(windowed.cursor.objects > first.cursor.objects);
+  const floor = await prune({ older_than_days: 0, limit: 5000 });
+  assert.equal(floor.older_than_days, 2);
+  assert.equal(countRows(r, "ops_objects"), live + 5);
+  for (const hash of recent)
+    assert.ok(r.objects.has("public/v1/operations/objects/" + hash + ".json"));
+  r.database.exec(`INSERT INTO ops_links VALUES ('${"c".repeat(64)}/x','child')`);
+  const sweep = await prune({ older_than_days: 7, limit: 1, links_limit: 100000 });
+  assert.equal(sweep.links.orphans_deleted, 1);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("protected stale objects cannot stall retirement behind them", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  // Every current object has an old reference time, as after a long full period.
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  const live = countRows(r, "ops_objects");
+  const stale = staleObjects(r, 20, 9);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  let cursor = { objects: 0, keys: 0 },
+    retired = 0;
+  for (let i = 0; i < 20 && retired < stale.length; i++) {
+    const result = await prune({
+      older_than_days: 7,
+      limit: 2,
+      window: 4,
+      objects_after: cursor.objects,
+      keys_after: cursor.keys,
+    });
+    retired += result.retired;
+    cursor = result.cursor;
+  }
+  assert.equal(retired, stale.length);
+  assert.equal(countRows(r, "ops_objects"), live);
+  assert.ok(r.objects.has("public" + r.manifest().domains.queue.url));
+});
+
+test("reference times are refreshed before publication replaces stale roots", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const old = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  const restarted = new Operations(r.ctx);
+  r.advance(10000);
+  // Ingestion schedules publication directly, without the alarm.
+  await restarted.fetch(
+    new Request("https://internal/queue", { method: "POST", body: JSON.stringify(r.next(2)) }),
+  );
+  await restarted.publish();
+  await r.drain();
+  const row = r.database.prepare("SELECT referenced FROM ops_objects WHERE hash=?").get(old);
+  assert.ok(row.referenced >= Math.floor(Date.now() / 1000) - 3600);
+});
+
+test("a publication pass started by a completion callback stops when storage is full", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  setDatabaseSize(r, () => limit - 1024);
+  const writes = r.writes.length;
+  r.advance(60000);
+  await r.operations.publish();
+  await r.drain();
+  assert.equal(r.writes.length, writes);
+});
+
+test("an ambiguous manifest write keeps its graph live until an acknowledged one replaces it", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  // The next manifest PUT reaches R2 but its acknowledgement is lost.
+  r.advance(10000);
+  await r.send(r.next(2));
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    put = archive.put;
+  let ambiguous;
+  archive.put = async (key, value) => {
+    if (!key.endsWith("/manifest.json")) return put(key, value);
+    // The first manifest write lands but reports failure; later ones fail.
+    if (ambiguous) throw new Error("R2 unavailable");
+    await put(key, value);
+    ambiguous = JSON.parse(value).domains.queue.url;
+    throw new Error("lost manifest acknowledgement");
+  };
+  await r.flush();
+  assert.ok(ambiguous);
+  assert.equal(r.manifest().domains.queue.url, ambiguous);
+  // A newer generation is prepared while manifest writes keep failing, so R2
+  // still serves the ambiguous one and no tracked state references it.
+  r.advance(20000);
+  await r.send(r.next(3));
+  await r.flush();
+  archive.put = put;
+  assert.equal(r.manifest().domains.queue.url, ambiguous);
+  assert.notEqual(r.operations.state("queue").value.url, ambiguous);
+  assert.notEqual(r.operations.state("queue", false).value.url, ambiguous);
+  const hash = ambiguous.slice("/v1/operations/objects/".length, -5);
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  await r.request("/prune", { older_than_days: 2, limit: 5000 });
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE hash=?").get(hash).n,
+    1,
+  );
+  assert.ok(r.objects.has("public" + ambiguous));
+});
+
+test("live roots are bound as one parameter however many there are", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  for (let i = 0; i < 150; i++)
+    r.operations.pinnedRoots.add("d".repeat(64) + "/" + String(i).padStart(64, "0"));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  let most = 0;
+  sql.exec = (statement, ...args) => {
+    most = Math.max(most, args.length);
+    return exec(statement, ...args);
+  };
+  const result = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  sql.exec = exec;
+  assert.equal(result.retired, 0);
+  assert.ok(most <= 3, String(most));
+});
+
+test("retirement skips a served-manifest read that a manifest write overtook", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  r.database
+    .prepare("UPDATE ops_objects SET referenced=?")
+    .run(Math.floor(Date.now() / 1000) - 9 * 86400);
+  staleObjects(r, 3, 9);
+  const archive = globalThis.__operationsTestEnv.ARCHIVE,
+    get = archive.get;
+  archive.get = async (key) => {
+    const value = await get(key);
+    // A manifest write starts and settles while this read is in flight.
+    r.operations.manifestGeneration += 2;
+    return value;
+  };
+  const result = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  archive.get = get;
+  assert.equal(result.skipped, "manifest_changed");
+  assert.equal(result.retired, 0);
+  const again = await (await r.request("/prune", { older_than_days: 7, limit: 10 })).json();
+  assert.equal(again.retired, 3);
+});
+
+test("work in flight when storage fills issues no allocating write afterwards", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec,
+    writes = [];
+  sql.exec = (statement, ...args) => {
+    if (full && !/^\s*(SELECT|DELETE|PRAGMA)\b/i.test(statement) &&
+        !(/^\s*WITH\b/i.test(statement) && !/\b(UPDATE|INSERT|REPLACE)\b/i.test(statement)))
+      writes.push(statement.trim().split(/\s+/).slice(0, 3).join(" "));
+    return exec(statement, ...args);
+  };
+  // Storage fills while the next publication's uploads are in flight.
+  r.onWrite(() => {
+    full = true;
+  });
+  r.advance(10000);
+  await r.send(r.next(2));
+  await r.flush().catch(() => {});
+  await r.drain();
+  sql.exec = exec;
+  assert.ok(full);
+  assert.deepEqual(writes, []);
+  const health = await (await r.request("/health")).json();
+  assert.equal(health.storage.status, "full");
+});
+
+test("crossing the storage threshold during ingestion returns storage_full", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  // The first write of the frame fills the database.
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement)) full = true;
+    return result;
+  };
+  const queue = await r.request("/queue", r.next(2));
+  assert.equal(queue.status, 507);
+  assert.equal((await queue.json()).code, "storage_full");
+  full = false;
+  const history = JSON.parse(readFileSync("tests/fixtures/operations-history.json", "utf8"));
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement)) full = true;
+    return result;
+  };
+  const response = await r.request("/history", history);
+  sql.exec = exec;
+  assert.equal(response.status, 507);
+  assert.equal((await response.json()).code, "storage_full");
+});
+
+test("a context update refused part-way is applied in full on the next tick", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const context = { observed_at: "x", partitions: [], budget: 1 };
+  globalThis.__operationsTestEnv.CONTROL = {
+    idFromName: (id) => id,
+    get: () => ({ fetch: async () => Response.json(context) }),
+  };
+  const limit = 10 * 1024 ** 3;
+  let full = false;
+  setDatabaseSize(r, () => (full ? limit - 1024 : limit / 2));
+  const sql = r.ctx.storage.sql,
+    exec = sql.exec;
+  sql.exec = (statement, ...args) => {
+    const result = exec(statement, ...args);
+    if (/^\s*INSERT/i.test(statement) && args[0] === "jobs_context_key") full = true;
+    return result;
+  };
+  r.advance(60000);
+  assert.equal((await r.request("/tick")).status, 507);
+  sql.exec = exec;
+  full = false;
+  r.advance(60000);
+  assert.equal((await r.request("/tick")).status, 200);
+  assert.equal(r.operations.get("jobs_context").budget, 1);
 });
