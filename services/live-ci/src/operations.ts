@@ -2673,6 +2673,16 @@ export class Operations {
     if (this.publishing) return this.publishing;
     this.publishing = (async () => {
       do {
+        // Every pass, including coalesced ones from completion callbacks.
+        if (this.storageFull()) {
+          // Drop the request: the minute tick publishes once there is room.
+          this.publicationRequested = false;
+          this.startMaintenance();
+          return;
+        }
+        // After a restart or a full-database period, reference times may be
+        // stale. Refresh them before this pass can replace any root.
+        if ((this.liveRefreshedAt || 0) < now() - 600) this.refreshLive();
         const bootstrap = this.bootstrapRequested;
         this.publicationRequested = false;
         this.bootstrapRequested = false;
@@ -2689,24 +2699,17 @@ export class Operations {
     }
   }
   async alarm() {
-    if (this.storageFull()) {
-      this.startMaintenance();
-      return;
-    }
-    // After a restart or a full-database period, reference times may be stale.
-    if ((this.liveRefreshedAt || 0) < now() - 600) this.refreshLive();
     await this.publish(true);
   }
 
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
-    if (["/queue", "/history", "/progress", "/host", "/hosts", "/partition"].includes(path)) {
-      // Buffer the body first so the check is not separated from the
-      // handler's synchronous writes by a body read.
-      const body = await request.text();
-      if (this.storageFull()) return storageFullResponse();
-      request = new Request(request.url, { method: "POST", body });
-    }
+    // Write paths check here and again after every await before writing.
+    if (
+      ["/queue", "/history", "/progress", "/host", "/hosts", "/partition"].includes(path) &&
+      this.storageFull()
+    )
+      return storageFullResponse();
     if (path === "/prune") {
       // Bounded one-off retirement for an operator. Deletes only.
       const body: any = await request.json().catch(() => ({})),
@@ -2817,6 +2820,7 @@ export class Operations {
       } catch {
         return json({ error: "Invalid public history" }, 400);
       }
+      if (this.storageFull()) return storageFullResponse();
       const old = this.get("history");
       if (old && Date.parse(value.observed_at) < Date.parse(old.observed_at))
         return json({ error: "Older report" }, 409);
@@ -2836,6 +2840,7 @@ export class Operations {
       } catch {
         return json({ error: "Invalid public progress" }, 400);
       }
+      if (this.storageFull()) return storageFullResponse();
       const c = body.claims;
       if (!this.repositories().includes(c.repository))
         return json({ error: "Repository not public" }, 403);
@@ -2885,6 +2890,7 @@ export class Operations {
       } catch {
         return json({ error: "Invalid scoped host observation" }, 400);
       }
+      if (this.storageFull()) return storageFullResponse();
       let host = frame.hosts[0];
       const source = frame.source;
       const old = this.sql
@@ -2927,6 +2933,7 @@ export class Operations {
       } catch {
         return json({ error: "Invalid public host observation" }, 400);
       }
+      if (this.storageFull()) return storageFullResponse();
       const previous = this.get("hosts");
       if (
         previous &&
@@ -2958,6 +2965,7 @@ export class Operations {
     }
     if (path === "/partition") {
       const value: any = await request.json();
+      if (this.storageFull()) return storageFullResponse();
       if (this.partition(value.partition, value.revision))
         await this.schedule();
       return json({ ok: true });
@@ -2977,6 +2985,7 @@ export class Operations {
             "control",
             "/operations-context",
           );
+          if (this.storageFull()) return storageFullResponse();
           const { observed_at: _observed, ...meaning } = context;
           const meaningKey = canonical(meaning);
           if (this.get("jobs_context_key") !== meaningKey) {
@@ -2993,6 +3002,7 @@ export class Operations {
           }
           this.set("jobs_context_error", false);
         } catch {
+          if (this.storageFull()) return storageFullResponse();
           this.set("jobs_context_error", true);
         }
       }

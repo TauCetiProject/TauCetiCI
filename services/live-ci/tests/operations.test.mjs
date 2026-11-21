@@ -3986,11 +3986,25 @@ test("reference times are refreshed before publication replaces stale roots", as
     .run(Math.floor(Date.now() / 1000) - 9 * 86400);
   const restarted = new Operations(r.ctx);
   r.advance(10000);
+  // Ingestion schedules publication directly, without the alarm.
   await restarted.fetch(
     new Request("https://internal/queue", { method: "POST", body: JSON.stringify(r.next(2)) }),
   );
-  await restarted.alarm();
+  await restarted.publish();
   await r.drain();
   const row = r.database.prepare("SELECT referenced FROM ops_objects WHERE hash=?").get(old);
   assert.ok(row.referenced >= Math.floor(Date.now() / 1000) - 3600);
+});
+
+test("a publication pass started by a completion callback stops when storage is full", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const limit = 10 * 1024 ** 3;
+  setDatabaseSize(r, () => limit - 1024);
+  const writes = r.writes.length;
+  r.advance(60000);
+  await r.operations.publish();
+  await r.drain();
+  assert.equal(r.writes.length, writes);
 });
