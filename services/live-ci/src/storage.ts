@@ -518,11 +518,12 @@ export class FactPartition {
         truncated: rows.length > 1100 || runs.length > 500 });
     }
     if (path === "/current") {
+      // Rowid order: the subset jobs_active(active) returned when over the limit.
       const jobs = this.sql
         .exec(
           `SELECT id,run,attempt,json_extract(data,'$.name') name,json_extract(data,'$.status') status,
         json_extract(data,'$.kind') kind,json_extract(data,'$.assigned') assigned,json_extract(data,'$.updated') updated
-        FROM jobs WHERE active=1 LIMIT 1000`,
+        FROM jobs WHERE active=1 ORDER BY rowid LIMIT 1000`,
         )
         .toArray();
       const runs = this.sql

@@ -102,9 +102,6 @@ export class Operations {
   // is only trusted if no manifest write started or settled during it.
   private manifestGeneration = 0;
   private retireCursor = { objects: 0, keys: 0 };
-  // Set once this instance has swept job facts left without a partition.
-  private jobFactsSwept = false;
-  private childrenRecorded = false;
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
@@ -135,7 +132,7 @@ export class Operations {
       CREATE INDEX IF NOT EXISTS ops_entities_batch ON ops_entities(source,collection,batch,id);
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
       CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,terminal INTEGER,PRIMARY KEY(source,collection,id));
-      CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER,children TEXT);
+      CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
       CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
       CREATE TABLE IF NOT EXISTS ops_links(parent TEXT,child TEXT,PRIMARY KEY(parent,child));
@@ -148,7 +145,6 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_job_facts(partition TEXT,id TEXT,repository TEXT,active INTEGER,observed REAL,data TEXT,PRIMARY KEY(partition,id));
       CREATE INDEX IF NOT EXISTS ops_job_facts_current ON ops_job_facts(active DESC,observed DESC,id ASC);
       CREATE INDEX IF NOT EXISTS ops_job_facts_completed_class ON ops_job_facts(active,(${BUILD_CLASS_SQL}),observed DESC,id ASC);
-      DROP INDEX IF EXISTS ops_job_facts_repo;
       CREATE TABLE IF NOT EXISTS ops_failures(kind TEXT,id TEXT,failures INTEGER,due INTEGER,error TEXT,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS ops_runner_hosts(runner TEXT PRIMARY KEY,machine TEXT,instance TEXT,slot INTEGER,seen INTEGER);
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
@@ -185,41 +181,15 @@ export class Operations {
           this.set("queue_resync", true);
         this.set("eviction_tracking", 1);
       }
-      this.childrenColumn();
+      // No query uses this index; dropping it saves a row per job fact write.
+      if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='index' AND name='ops_job_facts_repo'").toArray().length)
+        this.sql.exec("DROP INDEX ops_job_facts_repo");
     } catch (error) {
       console.warn(
         "operations: startup migration unavailable",
         error instanceof Error ? error.message : "",
       );
     }
-  }
-  /** Whether ops_objects records each object's children in one JSON column.
-   * Objects received before it existed keep one ops_links row per child, which
-   * retirement removes with its parent. Adding the column writes only the
-   * schema; it is attempted again later if a full database refused it. */
-  private childrenColumn(): boolean {
-    if (this.childrenRecorded) return true;
-    const present = () =>
-      !!this.sql
-        .exec("SELECT 1 FROM pragma_table_info('ops_objects') WHERE name='children'")
-        .toArray().length;
-    if (!present() && !this.storageFull())
-      try {
-        this.sql.exec("ALTER TABLE ops_objects ADD COLUMN children TEXT");
-      } catch {
-        /* Retried on the next receipt. */
-      }
-    return (this.childrenRecorded = present());
-  }
-  /** Recursive step from live objects to their children, through both the
-   * JSON column and links recorded before it. */
-  private liveChildren() {
-    return (
-      "UNION SELECT child FROM ops_links JOIN live ON parent=live.hash" +
-      (this.childrenColumn()
-        ? "\n        UNION SELECT c.value FROM live JOIN ops_objects o ON o.hash=live.hash JOIN json_each(o.children) c"
-        : "")
-    );
   }
   private get(key: string): any {
     const row = this.sql
@@ -948,38 +918,20 @@ export class Operations {
         });
         // The upload above is awaited; never write a receipt into a full database.
         if (this.storageFull()) throw new StorageFullError();
-        const children = [
-          ...new Set(
-            Array.from(
-              data.matchAll(
-                /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
-              ),
-              (match) => match[1],
-            ),
-          ),
-        ];
         this.ctx.storage.transactionSync(() => {
-          // One row per object: its children share the receipt row.
-          if (this.childrenColumn())
+          this.sql.exec(
+            "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
+            hash,
+            now(),
+          );
+          for (const match of data.matchAll(
+            /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
+          ))
             this.sql.exec(
-              "INSERT OR IGNORE INTO ops_objects(hash,referenced,children) VALUES (?,?,?)",
+              "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
               hash,
-              now(),
-              children.length ? JSON.stringify(children) : null,
+              match[1],
             );
-          else {
-            this.sql.exec(
-              "INSERT OR IGNORE INTO ops_objects(hash,referenced) VALUES (?,?)",
-              hash,
-              now(),
-            );
-            for (const child of children)
-              this.sql.exec(
-                "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
-                hash,
-                child,
-              );
-          }
         });
       } else {
         if (timing) timing.cache_hits++;
@@ -1426,7 +1378,7 @@ export class Operations {
     );
     // Job facts are only inserted for an existing partition, so expiring a
     // partition is what orphans them: delete those by key. A whole-table sweep
-    // runs once per instance, for orphans an earlier version may have left.
+    // runs once, for orphans an earlier version may have left.
     this.ctx.storage.transactionSync(() => {
       for (const { name } of this.sql
         .exec<{ name: string }>(
@@ -1435,11 +1387,12 @@ export class Operations {
         )
         .toArray())
         this.sql.exec("DELETE FROM ops_job_facts WHERE partition=?", name);
-      if (!this.jobFactsSwept)
+      if (!this.get("job_facts_swept")) {
         this.sql.exec(
           "DELETE FROM ops_job_facts WHERE partition NOT IN (SELECT name FROM ops_partitions)",
         );
-      this.jobFactsSwept = true;
+        this.set("job_facts_swept", 1);
+      }
     });
   }
   private recordHost(host: any) {
@@ -2627,7 +2580,7 @@ export class Operations {
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        ${this.liveChildren()})
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
         UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
         JSON.stringify(roots),
         clock,
@@ -2660,7 +2613,7 @@ export class Operations {
             .exec<{ hash: string }>(
               `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        ${this.liveChildren()})
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
         SELECT hash FROM live`,
               JSON.stringify(roots),
             )

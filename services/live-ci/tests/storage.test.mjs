@@ -814,3 +814,11 @@ test("the operations job list and active counts read bounded index ranges", asyn
   assert.match(counts, /ops_activity_current \(pool=\? AND active=\?\)/);
   assert.ok(fact);
 });
+
+test("current jobs over the limit keep the rowid-ordered subset", async t => {
+  const f = fixture(t, 1005);
+  const expected = f.ctx.db.prepare("SELECT id FROM jobs WHERE active=1 ORDER BY rowid LIMIT 1000").all().map(r => r.id);
+  const current = await post(f.fact, "/current");
+  assert.deepEqual(current.jobs.map(j => j.id), expected);
+  assert.equal(current.truncated, true);
+});

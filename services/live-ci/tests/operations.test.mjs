@@ -4188,67 +4188,6 @@ test("a context update refused part-way is applied in full on the next tick", as
   assert.equal(r.operations.get("jobs_context").budget, 1);
 });
 
-test("objects keep their children in one row and legacy links still protect descendants", async (t) => {
-  const r = runtime(t);
-  await r.send(seed);
-  await r.flush();
-  // New receipts write no per-child link rows.
-  assert.equal(countRows(r, "ops_links"), 0);
-  const root = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
-  const children = JSON.parse(
-    r.database.prepare("SELECT children FROM ops_objects WHERE hash=?").get(root).children,
-  );
-  assert.ok(children.length > 0);
-  // A live object received before the column, whose child is recorded only as a link.
-  const old = Math.floor(Date.now() / 1000) - 9 * 86400,
-    legacy = "d".repeat(64) + "/" + "1".repeat(64),
-    grandchild = "d".repeat(64) + "/" + "2".repeat(64);
-  for (const hash of [legacy, grandchild]) {
-    r.database.prepare("INSERT INTO ops_objects(hash,referenced) VALUES (?,?)").run(hash, old);
-    r.objects.set("public/v1/operations/objects/" + hash + ".json", "{}");
-  }
-  r.database.prepare("INSERT INTO ops_links VALUES (?,?)").run(legacy, grandchild);
-  r.database
-    .prepare("UPDATE ops_objects SET children=? WHERE hash=?")
-    .run(JSON.stringify([...children, legacy]), root);
-  r.database.prepare("UPDATE ops_objects SET referenced=?").run(old);
-  const stale = staleObjects(r, 20, 9);
-  const reachable = [root, ...children, legacy, grandchild],
-    present = () => reachable.filter((hash) =>
-      r.database.prepare("SELECT 1 FROM ops_objects WHERE hash=?").get(hash));
-  const before = present();
-  assert.ok(before.includes(grandchild) && before.length > 3);
-  const prune = async (body) => (await r.request("/prune", body)).json();
-  assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
-  assert.deepEqual(present(), before);
-  assert.equal(countRows(r, "ops_links"), 1);
-  for (const hash of stale)
-    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
-});
-
-test("an existing database gains the children column without rewriting its objects", async (t) => {
-  const r = runtime(t);
-  await r.send(seed);
-  await r.flush();
-  r.database.exec("ALTER TABLE ops_objects DROP COLUMN children");
-  const before = r.database.prepare("SELECT hash,referenced FROM ops_objects ORDER BY rowid").all();
-  const restarted = new Operations(r.ctx);
-  assert.equal(
-    r.database.prepare("SELECT COUNT(*) n FROM pragma_table_info('ops_objects') WHERE name='children'").get().n,
-    1,
-  );
-  assert.deepEqual(
-    r.database.prepare("SELECT hash,referenced FROM ops_objects ORDER BY rowid").all(),
-    before,
-  );
-  assert.equal(
-    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE children IS NOT NULL").get().n,
-    0,
-  );
-  new Operations(r.ctx); // A second start finds the column and changes nothing.
-  assert.ok(restarted);
-});
-
 test("an unchanged metadata value or dirty mark writes no row", async (t) => {
   const r = runtime(t);
   const changes = () => r.database.prepare("SELECT total_changes() n").get().n;
@@ -4267,7 +4206,7 @@ test("an unchanged metadata value or dirty mark writes no row", async (t) => {
   assert.equal(r.database.prepare("SELECT revision FROM ops_dirty WHERE id='1'").get().revision, 8);
 });
 
-test("expiring partitions deletes their job facts by key after one orphan sweep per instance", async (t) => {
+test("expiring partitions deletes their job facts by key after one recorded orphan sweep", async (t) => {
   const r = runtime(t);
   await r.send(seed);
   await r.flush();
@@ -4291,4 +4230,16 @@ test("expiring partitions deletes their job facts by key after one orphan sweep 
   r.ctx.storage.sql.exec = exec;
   assert.equal(countRows(r, "ops_job_facts"), 0);
   assert.equal(sweeps(), 1);
+});
+
+test("the unused job facts index is dropped only when storage has room", async (t) => {
+  const r = runtime(t);
+  const exists = () => !!r.database.prepare("SELECT 1 FROM sqlite_master WHERE name='ops_job_facts_repo'").get();
+  r.database.exec("CREATE INDEX ops_job_facts_repo ON ops_job_facts(repository,active,observed)");
+  setDatabaseSize(r, () => 10 * 1024 ** 3 - 1024);
+  new Operations(r.ctx);
+  assert.equal(exists(), true);
+  setDatabaseSize(r, () => 1024);
+  new Operations(r.ctx);
+  assert.equal(exists(), false);
 });

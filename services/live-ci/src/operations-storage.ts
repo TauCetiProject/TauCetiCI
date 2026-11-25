@@ -54,7 +54,7 @@ export const OPERATIONS_TABLES: Record<string, string[]> = {
   ops_changes: ["snapshot", "collection", "id", "batch", "pr_bucket", "data", "part"],
   ops_entities: ["source", "collection", "id", "batch", "pr_bucket", "data"],
   ops_evicted: ["source", "collection", "id", "batch", "terminal"],
-  ops_objects: ["hash", "referenced", "children"],
+  ops_objects: ["hash", "referenced"],
   ops_object_keys: ["logical", "hash", "allocated"],
   ops_links: ["parent", "child"],
   ops_dirty: ["kind", "id", "revision"],
