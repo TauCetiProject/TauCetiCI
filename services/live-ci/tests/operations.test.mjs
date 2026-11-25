@@ -3000,7 +3000,7 @@ test("live legacy content-hash receipts are reused without rewriting deployed ob
   const ref = { url: "/v1/operations/objects/" + hash + ".json" };
   r.objects.set("public" + ref.url, data);
   r.database
-    .prepare("INSERT INTO ops_objects VALUES (?,?)")
+    .prepare("INSERT INTO ops_objects(hash,referenced) VALUES (?,?)")
     .run(hash, Math.floor(Date.now() / 1000));
   const writes = r.writes.length;
   assert.deepEqual(
@@ -3819,7 +3819,7 @@ test("storage samples do not count a row twice across a rowid gap", async (t) =>
 });
 
 function staleObjects(r, count, ageDays) {
-  const insert = r.database.prepare("INSERT INTO ops_objects VALUES (?,?)"),
+  const insert = r.database.prepare("INSERT INTO ops_objects(hash,referenced) VALUES (?,?)"),
     key = r.database.prepare("INSERT INTO ops_object_keys VALUES (?,?,?)"),
     link = r.database.prepare("INSERT INTO ops_links VALUES (?,?)"),
     at = Math.floor(Date.now() / 1000) - ageDays * 86400,
@@ -4186,4 +4186,109 @@ test("a context update refused part-way is applied in full on the next tick", as
   r.advance(60000);
   assert.equal((await r.request("/tick")).status, 200);
   assert.equal(r.operations.get("jobs_context").budget, 1);
+});
+
+test("objects keep their children in one row and legacy links still protect descendants", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  // New receipts write no per-child link rows.
+  assert.equal(countRows(r, "ops_links"), 0);
+  const root = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
+  const children = JSON.parse(
+    r.database.prepare("SELECT children FROM ops_objects WHERE hash=?").get(root).children,
+  );
+  assert.ok(children.length > 0);
+  // A live object received before the column, whose child is recorded only as a link.
+  const old = Math.floor(Date.now() / 1000) - 9 * 86400,
+    legacy = "d".repeat(64) + "/" + "1".repeat(64),
+    grandchild = "d".repeat(64) + "/" + "2".repeat(64);
+  for (const hash of [legacy, grandchild]) {
+    r.database.prepare("INSERT INTO ops_objects(hash,referenced) VALUES (?,?)").run(hash, old);
+    r.objects.set("public/v1/operations/objects/" + hash + ".json", "{}");
+  }
+  r.database.prepare("INSERT INTO ops_links VALUES (?,?)").run(legacy, grandchild);
+  r.database
+    .prepare("UPDATE ops_objects SET children=? WHERE hash=?")
+    .run(JSON.stringify([...children, legacy]), root);
+  r.database.prepare("UPDATE ops_objects SET referenced=?").run(old);
+  const stale = staleObjects(r, 20, 9);
+  const reachable = [root, ...children, legacy, grandchild],
+    present = () => reachable.filter((hash) =>
+      r.database.prepare("SELECT 1 FROM ops_objects WHERE hash=?").get(hash));
+  const before = present();
+  assert.ok(before.includes(grandchild) && before.length > 3);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
+  assert.deepEqual(present(), before);
+  assert.equal(countRows(r, "ops_links"), 1);
+  for (const hash of stale)
+    assert.equal(r.objects.has("public/v1/operations/objects/" + hash + ".json"), false);
+});
+
+test("an existing database gains the children column without rewriting its objects", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  r.database.exec("ALTER TABLE ops_objects DROP COLUMN children");
+  const before = r.database.prepare("SELECT hash,referenced FROM ops_objects ORDER BY rowid").all();
+  const restarted = new Operations(r.ctx);
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM pragma_table_info('ops_objects') WHERE name='children'").get().n,
+    1,
+  );
+  assert.deepEqual(
+    r.database.prepare("SELECT hash,referenced FROM ops_objects ORDER BY rowid").all(),
+    before,
+  );
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_objects WHERE children IS NOT NULL").get().n,
+    0,
+  );
+  new Operations(r.ctx); // A second start finds the column and changes nothing.
+  assert.ok(restarted);
+});
+
+test("an unchanged metadata value or dirty mark writes no row", async (t) => {
+  const r = runtime(t);
+  const changes = () => r.database.prepare("SELECT total_changes() n").get().n;
+  r.operations.set("example", { a: 1 });
+  let before = changes();
+  r.operations.set("example", { a: 1 });
+  assert.equal(changes(), before);
+  r.operations.set("example", { a: 2 });
+  assert.equal(changes(), before + 1);
+  assert.deepEqual(r.operations.get("example"), { a: 2 });
+  r.operations.dirty("batch", "1", 7);
+  before = changes();
+  r.operations.dirty("batch", "1", 7);
+  assert.equal(changes(), before);
+  r.operations.dirty("batch", "1", 8);
+  assert.equal(r.database.prepare("SELECT revision FROM ops_dirty WHERE id='1'").get().revision, 8);
+});
+
+test("expiring partitions deletes their job facts by key after one orphan sweep per instance", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const old = Math.floor(Date.now() / 1000) - 31 * 86400;
+  const fact = r.database.prepare("INSERT INTO ops_job_facts VALUES (?,?,?,0,0,'{}')");
+  r.database.prepare("INSERT INTO ops_partitions VALUES (?,1,0,?,NULL)").run(repo + "/2026-01-01", old);
+  fact.run(repo + "/2026-01-01", "1", repo);
+  fact.run(repo + "/gone", "2", repo);
+  const statements = [], exec = r.ctx.storage.sql.exec;
+  r.ctx.storage.sql.exec = (sql, ...args) => {
+    statements.push(sql);
+    return exec(sql, ...args);
+  };
+  const sweeps = () => statements.filter((s) => /partition NOT IN/.test(s)).length;
+  await r.operations.collectJobs(r.operations.projection("facts"));
+  assert.equal(countRows(r, "ops_job_facts"), 0);
+  assert.equal(sweeps(), 1);
+  r.database.prepare("INSERT INTO ops_partitions VALUES (?,1,0,?,NULL)").run(repo + "/2026-01-02", old);
+  fact.run(repo + "/2026-01-02", "3", repo);
+  await r.operations.collectJobs(r.operations.projection("facts"));
+  r.ctx.storage.sql.exec = exec;
+  assert.equal(countRows(r, "ops_job_facts"), 0);
+  assert.equal(sweeps(), 1);
 });

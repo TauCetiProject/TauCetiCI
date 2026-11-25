@@ -102,6 +102,9 @@ export class Operations {
   // is only trusted if no manifest write started or settled during it.
   private manifestGeneration = 0;
   private retireCursor = { objects: 0, keys: 0 };
+  // Set once this instance has swept job facts left without a partition.
+  private jobFactsSwept = false;
+  private childrenRecorded = false;
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
@@ -132,7 +135,7 @@ export class Operations {
       CREATE INDEX IF NOT EXISTS ops_entities_batch ON ops_entities(source,collection,batch,id);
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
       CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,terminal INTEGER,PRIMARY KEY(source,collection,id));
-      CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
+      CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER,children TEXT);
       CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
       CREATE TABLE IF NOT EXISTS ops_links(parent TEXT,child TEXT,PRIMARY KEY(parent,child));
@@ -145,7 +148,7 @@ export class Operations {
       CREATE TABLE IF NOT EXISTS ops_job_facts(partition TEXT,id TEXT,repository TEXT,active INTEGER,observed REAL,data TEXT,PRIMARY KEY(partition,id));
       CREATE INDEX IF NOT EXISTS ops_job_facts_current ON ops_job_facts(active DESC,observed DESC,id ASC);
       CREATE INDEX IF NOT EXISTS ops_job_facts_completed_class ON ops_job_facts(active,(${BUILD_CLASS_SQL}),observed DESC,id ASC);
-      CREATE INDEX IF NOT EXISTS ops_job_facts_repo ON ops_job_facts(repository,active,observed);
+      DROP INDEX IF EXISTS ops_job_facts_repo;
       CREATE TABLE IF NOT EXISTS ops_failures(kind TEXT,id TEXT,failures INTEGER,due INTEGER,error TEXT,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS ops_runner_hosts(runner TEXT PRIMARY KEY,machine TEXT,instance TEXT,slot INTEGER,seen INTEGER);
       CREATE TABLE IF NOT EXISTS ops_host_samples(machine TEXT,bucket INTEGER,resolution INTEGER,data TEXT,PRIMARY KEY(machine,bucket,resolution));
@@ -182,12 +185,41 @@ export class Operations {
           this.set("queue_resync", true);
         this.set("eviction_tracking", 1);
       }
+      this.childrenColumn();
     } catch (error) {
       console.warn(
         "operations: startup migration unavailable",
         error instanceof Error ? error.message : "",
       );
     }
+  }
+  /** Whether ops_objects records each object's children in one JSON column.
+   * Objects received before it existed keep one ops_links row per child, which
+   * retirement removes with its parent. Adding the column writes only the
+   * schema; it is attempted again later if a full database refused it. */
+  private childrenColumn(): boolean {
+    if (this.childrenRecorded) return true;
+    const present = () =>
+      !!this.sql
+        .exec("SELECT 1 FROM pragma_table_info('ops_objects') WHERE name='children'")
+        .toArray().length;
+    if (!present() && !this.storageFull())
+      try {
+        this.sql.exec("ALTER TABLE ops_objects ADD COLUMN children TEXT");
+      } catch {
+        /* Retried on the next receipt. */
+      }
+    return (this.childrenRecorded = present());
+  }
+  /** Recursive step from live objects to their children, through both the
+   * JSON column and links recorded before it. */
+  private liveChildren() {
+    return (
+      "UNION SELECT child FROM ops_links JOIN live ON parent=live.hash" +
+      (this.childrenColumn()
+        ? "\n        UNION SELECT c.value FROM live JOIN ops_objects o ON o.hash=live.hash JOIN json_each(o.children) c"
+        : "")
+    );
   }
   private get(key: string): any {
     const row = this.sql
@@ -196,8 +228,10 @@ export class Operations {
     return row ? JSON.parse(row.value) : undefined;
   }
   private set(key: string, value: any) {
+    // An unchanged value writes no row; a changed one updates it in place.
     this.sql.exec(
-      "INSERT OR REPLACE INTO ops_meta VALUES (?,?)",
+      `INSERT INTO ops_meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value
+       WHERE ops_meta.value IS NOT excluded.value`,
       key,
       JSON.stringify(value),
     );
@@ -446,6 +480,8 @@ export class Operations {
     )
       throw new Error("Snapshot scope differs from its records");
     const revision = (this.get("revision") || 0) + 1;
+    // Each marked attempt advances jobs_revision by one; the total is written once.
+    let attemptMarks = 0;
     // Mark old AND new joins, including deletions, before mutating current state.
     const mark = (row: {
       collection: string;
@@ -453,8 +489,7 @@ export class Operations {
       batch: string | null;
       pr_bucket: number | null;
     }) => {
-      if (row.collection === "attempts")
-        this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
+      if (row.collection === "attempts") attemptMarks++;
       if (row.batch !== null) this.dirty("batch", row.batch, revision);
       if (row.pr_bucket !== null)
         this.dirty("pr", String(row.pr_bucket), revision);
@@ -464,8 +499,9 @@ export class Operations {
         if (!metadata.collection_complete[collection]) continue;
         for (const row of this.sql
           .exec<any>(
-            `SELECT collection,id,batch,pr_bucket FROM ops_entities WHERE source=? AND collection=?
-        AND id NOT IN (SELECT id FROM ops_changes WHERE snapshot=? AND collection=? AND data!='null')`,
+            `DELETE FROM ops_entities WHERE source=? AND collection=? AND id NOT IN
+        (SELECT id FROM ops_changes WHERE snapshot=? AND collection=? AND data!='null')
+        RETURNING collection,id,batch,pr_bucket`,
             id,
             collection,
             frame.snapshot,
@@ -473,14 +509,6 @@ export class Operations {
           )
           .toArray())
           mark(row);
-        this.sql.exec(
-          `DELETE FROM ops_entities WHERE source=? AND collection=? AND id NOT IN
-        (SELECT id FROM ops_changes WHERE snapshot=? AND collection=? AND data!='null')`,
-          id,
-          collection,
-          frame.snapshot,
-          collection,
-        );
       }
     for (const row of this.sql
       .exec<any>(
@@ -586,17 +614,12 @@ export class Operations {
     }
     for (const row of this.sql
       .exec<any>(
-        "SELECT collection,id,batch,pr_bucket FROM ops_entities WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
+        "DELETE FROM ops_entities WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches') RETURNING collection,id,batch,pr_bucket",
         id,
         id,
       )
       .toArray())
       mark(row);
-    this.sql.exec(
-      "DELETE FROM ops_entities WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
-      id,
-      id,
-    );
     for (const row of this.sql
       .exec<any>(
         `SELECT collection,id,batch,pr_bucket FROM ops_entities m WHERE m.source=? AND m.collection='members'
@@ -614,46 +637,49 @@ export class Operations {
     // A record evicted for the byte budget stays missing until the producer
     // sends it again, deletes it or retires its batch: an unchanged record is
     // never re-sent, so later commits within budget still lack it.
-    if (frame.base === null)
-      this.sql.exec("DELETE FROM ops_evicted WHERE source=?", id);
-    else
+    // With nothing evicted, every deletion below is a no-op: skip their scans.
+    if (this.sql.exec("SELECT 1 FROM ops_evicted WHERE source=? LIMIT 1", id).toArray().length) {
+      if (frame.base === null)
+        this.sql.exec("DELETE FROM ops_evicted WHERE source=?", id);
+      else
+        this.sql.exec(
+          "DELETE FROM ops_evicted WHERE source=? AND (collection,id) IN (SELECT collection,id FROM ops_changes WHERE snapshot=?)",
+          id,
+          frame.snapshot,
+        );
       this.sql.exec(
-        "DELETE FROM ops_evicted WHERE source=? AND (collection,id) IN (SELECT collection,id FROM ops_changes WHERE snapshot=?)",
+        "DELETE FROM ops_evicted WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
         id,
-        frame.snapshot,
+        id,
       );
-    this.sql.exec(
-      "DELETE FROM ops_evicted WHERE source=? AND collection IN ('members','attempts','tasks','events') AND batch NOT IN (SELECT id FROM ops_entities WHERE source=? AND collection='batches')",
-      id,
-      id,
-    );
-    this.sql.exec(
-      `DELETE FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1 AND id IN (SELECT id FROM
-      (SELECT id FROM ops_entities WHERE source=? AND collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved')
-      UNION SELECT id FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1)
-      ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET 5000)`,
-      id,
-      id,
-      id,
-    );
-    // Count caps would have retired these anyway; they are no longer missing.
-    for (const [collection, limit] of [
-      ["events", 3000],
-      ["tasks", 20000],
-      ["attempts", 20000],
-    ] as const)
       this.sql.exec(
-        `DELETE FROM ops_evicted WHERE source=? AND collection=? AND id IN (SELECT id FROM
-        (SELECT id FROM ops_entities WHERE source=? AND collection=? UNION SELECT id FROM ops_evicted WHERE source=? AND collection=?)
-        ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET ?)`,
+        `DELETE FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1 AND id IN (SELECT id FROM
+        (SELECT id FROM ops_entities WHERE source=? AND collection='inputs' AND json_extract(data,'$.state') NOT IN ('waiting','reserved')
+        UNION SELECT id FROM ops_evicted WHERE source=? AND collection='inputs' AND terminal=1)
+        ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET 5000)`,
         id,
-        collection,
         id,
-        collection,
         id,
-        collection,
-        limit,
       );
+      // Count caps would have retired these anyway; they are no longer missing.
+      for (const [collection, limit] of [
+        ["events", 3000],
+        ["tasks", 20000],
+        ["attempts", 20000],
+      ] as const)
+        this.sql.exec(
+          `DELETE FROM ops_evicted WHERE source=? AND collection=? AND id IN (SELECT id FROM
+          (SELECT id FROM ops_entities WHERE source=? AND collection=? UNION SELECT id FROM ops_evicted WHERE source=? AND collection=?)
+          ORDER BY CAST(id AS INTEGER) DESC LIMIT -1 OFFSET ?)`,
+          id,
+          collection,
+          id,
+          collection,
+          id,
+          collection,
+          limit,
+        );
+    }
     let retainedBytes = this.sql
       .exec<{
         bytes: number;
@@ -748,6 +774,8 @@ export class Operations {
     );
     this.sql.exec("DELETE FROM ops_frames WHERE source=?", id);
     this.sql.exec("DELETE FROM ops_changes WHERE snapshot=?", frame.snapshot);
+    if (attemptMarks)
+      this.set("jobs_revision", (this.get("jobs_revision") || 0) + attemptMarks);
     if (frame.base === null) this.set("queue_resync", false);
     this.set("queue_receipts", receipts);
     this.set("queue_pending", null);
@@ -757,7 +785,8 @@ export class Operations {
 
   private dirty(kind: string, id: string, revision: number) {
     this.sql.exec(
-      "INSERT INTO ops_dirty VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision",
+      `INSERT INTO ops_dirty VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET revision=excluded.revision
+       WHERE ops_dirty.revision IS NOT excluded.revision`,
       kind,
       id,
       revision,
@@ -919,20 +948,38 @@ export class Operations {
         });
         // The upload above is awaited; never write a receipt into a full database.
         if (this.storageFull()) throw new StorageFullError();
+        const children = [
+          ...new Set(
+            Array.from(
+              data.matchAll(
+                /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
+              ),
+              (match) => match[1],
+            ),
+          ),
+        ];
         this.ctx.storage.transactionSync(() => {
-          this.sql.exec(
-            "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
-            hash,
-            now(),
-          );
-          for (const match of data.matchAll(
-            /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
-          ))
+          // One row per object: its children share the receipt row.
+          if (this.childrenColumn())
             this.sql.exec(
-              "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
+              "INSERT OR IGNORE INTO ops_objects(hash,referenced,children) VALUES (?,?,?)",
               hash,
-              match[1],
+              now(),
+              children.length ? JSON.stringify(children) : null,
             );
+          else {
+            this.sql.exec(
+              "INSERT OR IGNORE INTO ops_objects(hash,referenced) VALUES (?,?)",
+              hash,
+              now(),
+            );
+            for (const child of children)
+              this.sql.exec(
+                "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
+                hash,
+                child,
+              );
+          }
         });
       } else {
         if (timing) timing.cache_hits++;
@@ -1377,13 +1424,23 @@ export class Operations {
         }
       }),
     );
-    this.sql.exec(
-      "DELETE FROM ops_partitions WHERE received<? AND pending=0",
-      now() - 30 * 86400,
-    );
-    this.sql.exec(
-      "DELETE FROM ops_job_facts WHERE partition NOT IN (SELECT name FROM ops_partitions)",
-    );
+    // Job facts are only inserted for an existing partition, so expiring a
+    // partition is what orphans them: delete those by key. A whole-table sweep
+    // runs once per instance, for orphans an earlier version may have left.
+    this.ctx.storage.transactionSync(() => {
+      for (const { name } of this.sql
+        .exec<{ name: string }>(
+          "DELETE FROM ops_partitions WHERE received<? AND pending=0 RETURNING name",
+          now() - 30 * 86400,
+        )
+        .toArray())
+        this.sql.exec("DELETE FROM ops_job_facts WHERE partition=?", name);
+      if (!this.jobFactsSwept)
+        this.sql.exec(
+          "DELETE FROM ops_job_facts WHERE partition NOT IN (SELECT name FROM ops_partitions)",
+        );
+      this.jobFactsSwept = true;
+    });
   }
   private recordHost(host: any) {
     for (const slot of host.slots)
@@ -1406,7 +1463,10 @@ export class Operations {
         if (!old || old.slot !== slot.slot)
           this.set("jobs_revision", (this.get("jobs_revision") || 0) + 1);
         this.sql.exec(
-          "INSERT OR REPLACE INTO ops_runner_hosts VALUES (?,?,?,?,?)",
+          `INSERT INTO ops_runner_hosts VALUES (?,?,?,?,?) ON CONFLICT(runner) DO UPDATE SET
+           machine=excluded.machine,instance=excluded.instance,slot=excluded.slot,seen=excluded.seen
+           WHERE ops_runner_hosts.machine IS NOT excluded.machine OR ops_runner_hosts.instance IS NOT excluded.instance
+             OR ops_runner_hosts.slot IS NOT excluded.slot OR ops_runner_hosts.seen IS NOT excluded.seen`,
           slot.runner_id,
           host.machine_id,
           slot.instance_id,
@@ -1491,8 +1551,10 @@ export class Operations {
         m.min = m.min === null ? metric : Math.min(m.min, metric);
         m.max = m.max === null ? metric : Math.max(m.max, metric);
       }
+      // Update the aggregate in place: its key and age index entry are unchanged.
       this.sql.exec(
-        "INSERT OR REPLACE INTO ops_host_samples VALUES (?,?,?,?)",
+        `INSERT INTO ops_host_samples VALUES (?,?,?,?) ON CONFLICT(machine,bucket,resolution)
+         DO UPDATE SET data=excluded.data`,
         host.machine_id,
         bucket,
         resolution,
@@ -1679,7 +1741,8 @@ export class Operations {
     }
     const queueAttempts = this.sql
       .exec<{ data: string }>(
-        "SELECT data FROM ops_entities WHERE collection='attempts' AND json_extract(data,'$.run_id') IS NOT NULL",
+        // Every entity's source is in ops_sources; naming it reads only attempts.
+        "SELECT data FROM ops_entities WHERE source IN (SELECT id FROM ops_sources) AND collection='attempts' AND json_extract(data,'$.run_id') IS NOT NULL",
       )
       .toArray()
       .map((r) => JSON.parse(r.data));
@@ -2257,7 +2320,8 @@ export class Operations {
       this.ctx.storage.transactionSync(() => {
         for (const v of updates)
           this.sql.exec(
-            "INSERT OR REPLACE INTO ops_views VALUES (?,?,?)",
+            `INSERT INTO ops_views VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data
+             WHERE ops_views.data IS NOT excluded.data`,
             v.kind,
             v.id,
             JSON.stringify(v.data),
@@ -2563,7 +2627,7 @@ export class Operations {
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        ${this.liveChildren()})
         UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
         JSON.stringify(roots),
         clock,
@@ -2596,7 +2660,7 @@ export class Operations {
             .exec<{ hash: string }>(
               `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        ${this.liveChildren()})
         SELECT hash FROM live`,
               JSON.stringify(roots),
             )
@@ -2932,7 +2996,8 @@ export class Operations {
       )
         return json({ error: "Superseded progress" }, 409);
       this.sql.exec(
-        "INSERT OR REPLACE INTO ops_progress VALUES (?,?,?,?,?,?,?,?)",
+        `INSERT INTO ops_progress VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(repository,run,attempt,check_run)
+         DO UPDATE SET session=excluded.session,sequence=excluded.sequence,received=excluded.received,data=excluded.data`,
         ...args,
         value.session,
         value.sequence,
@@ -2977,7 +3042,8 @@ export class Operations {
       host = retainHostFacts(host, old ? JSON.parse(old.data) : null);
       this.ctx.storage.transactionSync(() => {
         this.sql.exec(
-          "INSERT OR REPLACE INTO ops_hosts VALUES (?,?,?,?,?,?)",
+          `INSERT INTO ops_hosts VALUES (?,?,?,?,?,?) ON CONFLICT(machine) DO UPDATE SET source=excluded.source,
+           epoch=excluded.epoch,sequence=excluded.sequence,received=excluded.received,data=excluded.data`,
           host.machine_id,
           source.id,
           source.epoch,

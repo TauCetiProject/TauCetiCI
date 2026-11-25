@@ -78,8 +78,10 @@ export class FactPartition {
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,run TEXT,attempt INTEGER,active INTEGER,data TEXT,contribution TEXT);
       CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run,attempt);
       CREATE INDEX IF NOT EXISTS jobs_estimated ON jobs(run,attempt) WHERE json_extract(data,'$.estimated')=1;
-      CREATE INDEX IF NOT EXISTS jobs_active ON jobs(active);
       CREATE INDEX IF NOT EXISTS jobs_archive ON jobs(active,run,id);
+      CREATE INDEX IF NOT EXISTS jobs_recent ON jobs(active,CAST(json_extract(data,'$.updated') AS REAL))
+        WHERE json_extract(data,'$.estimated')=0;
+      DROP INDEX IF EXISTS jobs_active;
       CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT,day TEXT,data TEXT);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY,at INTEGER);

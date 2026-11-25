@@ -104,16 +104,19 @@ export class ActivityIndex {
     }));
     const byPool = new Map(pools.map(p => [p.pool, p]));
     const staleBefore = clock - STALE_WAITING_SECONDS;
+    // Every recorded pool is in ops_activity_pools. Naming them lets these
+    // counts read only the active rows of ops_activity_current.
     const active = this.sql.exec<any>(`SELECT pool,build,running,
       CASE WHEN running=0 AND created<? THEN 1 ELSE 0 END stale,COUNT(*) n FROM ops_activity
-      WHERE active=1 GROUP BY pool,build,running,stale`, staleBefore).toArray();
+      INDEXED BY ops_activity_current WHERE pool IN (SELECT pool FROM ops_activity_pools) AND active=1 GROUP BY pool,build,running,stale`, staleBefore).toArray();
     for (const row of active) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all])
         scope[row.running ? "running" : row.stale ? "stale_waiting" : "waiting"] += row.n;
     }
     for (const row of this.sql.exec<any>(`SELECT pool,build,CAST(created/${HOUR} AS INTEGER)*${HOUR} hour,COUNT(*) n
-      FROM ops_activity WHERE active=1 AND running=0 GROUP BY pool,build,hour`).toArray()) {
+      FROM ops_activity INDEXED BY ops_activity_current
+      WHERE pool IN (SELECT pool FROM ops_activity_pools) AND active=1 AND running=0 GROUP BY pool,build,hour`).toArray()) {
       const pool = byPool.get(row.pool)!;
       for (const scope of row.build ? [pool.all, pool.builds] : [pool.all]) {
         const bin = scope.waiting_created.find(b => b[0] === row.hour);
