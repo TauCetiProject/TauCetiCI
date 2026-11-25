@@ -789,3 +789,36 @@ test('an empty job enumeration is invalidated when a live workflow advances',asy
   run:rawRun(f.run,{status:'pending',updated_at:new Date((f.run.updated+1)*1000).toISOString()})});
  assert.equal((await post(f.fact,'/status',{id:'100',attempt:1})).verified,false);
 });
+
+test("the operations job list and active counts read bounded index ranges", async t => {
+  const ctx = context(t);
+  // An existing partition, created with the earlier single-column index.
+  ctx.db.exec("CREATE TABLE jobs (id TEXT PRIMARY KEY,run TEXT,attempt INTEGER,active INTEGER,data TEXT,contribution TEXT);" +
+    "CREATE INDEX jobs_active ON jobs(active)");
+  ctx.db.exec("INSERT INTO jobs VALUES ('1','100',1,1,'{\"estimated\":false,\"updated\":5}','[]')");
+  const fact = new FactPartition(ctx, {});
+  const indexes = ctx.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='jobs'").all().map(r => r.name);
+  assert.ok(indexes.includes("jobs_recent")); assert.ok(!indexes.includes("jobs_active"));
+  const plan = (sql) => ctx.db.prepare("EXPLAIN QUERY PLAN " + sql).all().map(r => r.detail).join("; ");
+  const list = plan("SELECT data,run,attempt FROM jobs WHERE json_extract(data,'$.estimated')=0 ORDER BY active DESC,CAST(json_extract(data,'$.updated') AS REAL) DESC LIMIT 1101");
+  assert.match(list, /jobs_recent/); assert.doesNotMatch(list, /TEMP B-TREE/);
+  assert.match(plan("SELECT COUNT(*) n FROM jobs WHERE active=1"), /COVERING INDEX jobs_archive \(active=\?\)/);
+  const f = fixture(t, 3), stamp = Date.now() / 1000;
+  const jobs = f.ctx.storage.sql.exec("SELECT data FROM jobs").toArray().map(r => JSON.parse(r.data));
+  f.fact.replaceJob(f.run, { ...jobs[0], status: "completed", conclusion: "success", completed: stamp - 60, updated: stamp }, stamp);
+  const observation = await (await f.fact.fetch(new Request("https://internal/operations", { method: "POST", body: "{}" }))).json();
+  // Active jobs first, then the most recently updated completed ones.
+  assert.deepEqual(observation.jobs.slice(0, 2).map(j => j.id).sort(), [jobs[1].id, jobs[2].id].sort());
+  assert.equal(observation.jobs[2].id, jobs[0].id);
+  const counts = f.ctx.db.prepare("EXPLAIN QUERY PLAN SELECT pool,build,running,COUNT(*) n FROM ops_activity INDEXED BY ops_activity_current WHERE pool IN (SELECT pool FROM ops_activity_pools) AND active=1 GROUP BY pool,build,running").all().map(r => r.detail).join("; ");
+  assert.match(counts, /ops_activity_current \(pool=\? AND active=\?\)/);
+  assert.ok(fact);
+});
+
+test("current jobs over the limit keep the rowid-ordered subset", async t => {
+  const f = fixture(t, 1005);
+  const expected = f.ctx.db.prepare("SELECT id FROM jobs WHERE active=1 ORDER BY rowid LIMIT 1000").all().map(r => r.id);
+  const current = await post(f.fact, "/current");
+  assert.deepEqual(current.jobs.map(j => j.id), expected);
+  assert.equal(current.truncated, true);
+});

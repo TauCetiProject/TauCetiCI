@@ -78,8 +78,10 @@ export class FactPartition {
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,run TEXT,attempt INTEGER,active INTEGER,data TEXT,contribution TEXT);
       CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run,attempt);
       CREATE INDEX IF NOT EXISTS jobs_estimated ON jobs(run,attempt) WHERE json_extract(data,'$.estimated')=1;
-      CREATE INDEX IF NOT EXISTS jobs_active ON jobs(active);
       CREATE INDEX IF NOT EXISTS jobs_archive ON jobs(active,run,id);
+      CREATE INDEX IF NOT EXISTS jobs_recent ON jobs(active,CAST(json_extract(data,'$.updated') AS REAL))
+        WHERE json_extract(data,'$.estimated')=0;
+      DROP INDEX IF EXISTS jobs_active;
       CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT,day TEXT,data TEXT);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY,at INTEGER);
@@ -516,11 +518,12 @@ export class FactPartition {
         truncated: rows.length > 1100 || runs.length > 500 });
     }
     if (path === "/current") {
+      // Rowid order: the subset jobs_active(active) returned when over the limit.
       const jobs = this.sql
         .exec(
           `SELECT id,run,attempt,json_extract(data,'$.name') name,json_extract(data,'$.status') status,
         json_extract(data,'$.kind') kind,json_extract(data,'$.assigned') assigned,json_extract(data,'$.updated') updated
-        FROM jobs WHERE active=1 LIMIT 1000`,
+        FROM jobs WHERE active=1 ORDER BY rowid LIMIT 1000`,
         )
         .toArray();
       const runs = this.sql
