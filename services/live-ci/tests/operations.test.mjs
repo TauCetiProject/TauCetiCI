@@ -4344,3 +4344,23 @@ test("the storage report counts rows written per statement since start", async (
   assert.ok(meta.calls >= 1 && meta.rows_written >= 1);
   assert.ok(!report.writes.statements.some((s) => s.sql.startsWith("SELECT")));
 });
+
+test("without ops_children receipts write links and liveness follows them", async (t) => {
+  const r = runtime(t);
+  // As after a start on a full database, which does not create the table.
+  r.database.exec("DROP TABLE ops_children");
+  r.operations.childrenTable = false;
+  await r.send(seed);
+  await r.flush();
+  assert.ok(countRows(r, "ops_links") > 0);
+  const old = Math.floor(Date.now() / 1000) - 9 * 86400;
+  r.database.prepare("UPDATE ops_objects SET referenced=?").run(old);
+  const reachable = r.database.prepare("SELECT hash FROM ops_objects").all().map((row) => row.hash);
+  const stale = staleObjects(r, 5, 9);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
+  assert.deepEqual(
+    r.database.prepare("SELECT hash FROM ops_objects").all().map((row) => row.hash),
+    reachable,
+  );
+});
