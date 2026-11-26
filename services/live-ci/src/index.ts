@@ -485,7 +485,7 @@ async function handle(
     }
     if (path === "/admin/operations-prune" && request.method === "POST") {
       if (!env.OPERATIONS) return json({ error: "Operations reporting unavailable" }, 503);
-      const fields = ["older_than_days", "limit", "window", "objects_after", "keys_after", "links_after", "links_limit"];
+      const fields = ["older_than_days", "limit", "window", "objects_after", "keys_after", "links_after", "links_limit", "children_after", "children_limit"];
       return stub(env.OPERATIONS, "operations").fetch("https://internal/prune", {
         method: "POST",
         body: JSON.stringify(Object.fromEntries(fields.map((k) => [k, b[k]]))),

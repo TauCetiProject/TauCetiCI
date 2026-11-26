@@ -4308,3 +4308,27 @@ test("legacy links still protect descendants of objects without a children row",
   assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
   assert.deepEqual(present(), before);
 });
+
+test("a database without ops_children records links only until the table exists", async (t) => {
+  const r = runtime(t);
+  r.database.exec("DROP TABLE ops_children");
+  const full = { value: true };
+  setDatabaseSize(r, () => (full.value ? 10 * 1024 ** 3 : 1));
+  new Operations(r.ctx); // A full database does not create the table.
+  assert.equal(r.database.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='ops_children'").get().n, 0);
+  full.value = false;
+  const restarted = new Operations(r.ctx);
+  assert.equal(r.database.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='ops_children'").get().n, 1);
+  assert.ok(restarted);
+});
+
+test("the children sweep deletes rows whose object was retired by an earlier release", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const kept = countRows(r, "ops_children");
+  r.database.prepare("INSERT INTO ops_children VALUES (?,?)").run("e".repeat(64) + "/x", "[]");
+  const sweep = await (await r.request("/prune", { older_than_days: 7, limit: 1, children_limit: 100000 })).json();
+  assert.equal(sweep.children.orphans_deleted, 1);
+  assert.equal(countRows(r, "ops_children"), kept);
+});
