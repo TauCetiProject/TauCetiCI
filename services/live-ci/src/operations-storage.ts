@@ -57,6 +57,7 @@ export const OPERATIONS_TABLES: Record<string, string[]> = {
   ops_objects: ["hash", "referenced"],
   ops_object_keys: ["logical", "hash", "allocated"],
   ops_links: ["parent", "child"],
+  ops_children: ["hash", "children"],
   ops_dirty: ["kind", "id", "revision"],
   ops_views: ["kind", "id", "data"],
   ops_partitions: ["name", "revision", "pending", "received", "data"],

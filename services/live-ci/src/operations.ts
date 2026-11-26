@@ -133,6 +133,7 @@ export class Operations {
       CREATE INDEX IF NOT EXISTS ops_entities_pr ON ops_entities(source,collection,pr_bucket,id);
       CREATE TABLE IF NOT EXISTS ops_evicted(source TEXT,collection TEXT,id TEXT,batch TEXT,terminal INTEGER,PRIMARY KEY(source,collection,id));
       CREATE TABLE IF NOT EXISTS ops_objects(hash TEXT PRIMARY KEY,referenced INTEGER);
+      CREATE TABLE IF NOT EXISTS ops_children(hash TEXT PRIMARY KEY,children TEXT);
       CREATE TABLE IF NOT EXISTS ops_object_keys(logical TEXT PRIMARY KEY,hash TEXT,allocated INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS ops_object_keys_hash ON ops_object_keys(hash);
       CREATE TABLE IF NOT EXISTS ops_links(parent TEXT,child TEXT,PRIMARY KEY(parent,child));
@@ -918,19 +919,36 @@ export class Operations {
         });
         // The upload above is awaited; never write a receipt into a full database.
         if (this.storageFull()) throw new StorageFullError();
+        const children = [
+          ...new Set(
+            Array.from(
+              data.matchAll(
+                /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
+              ),
+              (match) => match[1],
+            ),
+          ),
+        ];
         this.ctx.storage.transactionSync(() => {
           this.sql.exec(
             "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
             hash,
             now(),
           );
-          for (const match of data.matchAll(
-            /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
-          ))
+          // One row per parent object lists all of its children.
+          if (children.length)
+            this.sql.exec(
+              "INSERT OR IGNORE INTO ops_children VALUES (?,?)",
+              hash,
+              JSON.stringify(children),
+            );
+          // Earlier releases follow only these rows. Keep writing them until
+          // every release that can be rolled back to reads ops_children.
+          for (const child of children)
             this.sql.exec(
               "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
               hash,
-              match[1],
+              child,
             );
         });
       } else {
@@ -2483,6 +2501,7 @@ export class Operations {
         // physical key even if this old delete finishes after an isolate restart.
         this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", hash);
         this.sql.exec("DELETE FROM ops_objects WHERE hash=?", hash);
+        this.sql.exec("DELETE FROM ops_children WHERE hash=?", hash);
         this.sql.exec("DELETE FROM ops_links WHERE parent=?", hash);
         retired.push(hash);
       };
@@ -2580,7 +2599,8 @@ export class Operations {
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash
+        UNION SELECT c.value FROM ops_children o JOIN live ON o.hash=live.hash JOIN json_each(o.children) c)
         UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
         JSON.stringify(roots),
         clock,
@@ -2613,7 +2633,8 @@ export class Operations {
             .exec<{ hash: string }>(
               `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash
+        UNION SELECT c.value FROM ops_children o JOIN live ON o.hash=live.hash JOIN json_each(o.children) c)
         SELECT hash FROM live`,
               JSON.stringify(roots),
             )

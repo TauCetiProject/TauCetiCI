@@ -4243,3 +4243,68 @@ test("the unused job facts index is dropped only when storage has room", async (
   new Operations(r.ctx);
   assert.equal(exists(), false);
 });
+
+test("objects record their children in one row and liveness follows that row alone", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const root = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
+  const children = JSON.parse(
+    r.database.prepare("SELECT children FROM ops_children WHERE hash=?").get(root).children,
+  );
+  assert.ok(children.length > 0);
+  // Leaves have no children row.
+  assert.ok(countRows(r, "ops_children") < countRows(r, "ops_objects"));
+  // Links are still written alongside it for rollback.
+  assert.equal(
+    r.database.prepare("SELECT COUNT(*) n FROM ops_links WHERE parent=?").get(root).n,
+    children.length,
+  );
+  // Without any links the children rows alone protect every descendant.
+  r.database.exec("DELETE FROM ops_links");
+  const old = Math.floor(Date.now() / 1000) - 9 * 86400;
+  r.database.prepare("UPDATE ops_objects SET referenced=?").run(old);
+  const reachable = r.database.prepare("SELECT hash FROM ops_objects").all().map((row) => row.hash);
+  const stale = staleObjects(r, 20, 9);
+  r.database.exec("DELETE FROM ops_links");
+  r.database.prepare("INSERT INTO ops_children VALUES (?,?)").run(stale[0], JSON.stringify([stale[1]]));
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
+  assert.deepEqual(
+    r.database.prepare("SELECT hash FROM ops_objects").all().map((row) => row.hash),
+    reachable,
+  );
+  // Retirement removes a retired parent's children row.
+  assert.equal(r.database.prepare("SELECT COUNT(*) n FROM ops_children WHERE hash=?").get(stale[0]).n, 0);
+});
+
+test("legacy links still protect descendants of objects without a children row", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const root = r.manifest().domains.queue.url.slice("/v1/operations/objects/".length, -5);
+  const old = Math.floor(Date.now() / 1000) - 9 * 86400,
+    legacy = "d".repeat(64) + "/" + "1".repeat(64),
+    grandchild = "d".repeat(64) + "/" + "2".repeat(64);
+  for (const hash of [legacy, grandchild]) {
+    r.database.prepare("INSERT INTO ops_objects VALUES (?,?)").run(hash, old);
+    r.objects.set("public/v1/operations/objects/" + hash + ".json", "{}");
+  }
+  // The root reaches the legacy object through its children row, and the
+  // legacy object reaches its child only through a link.
+  r.database.prepare("INSERT INTO ops_links VALUES (?,?)").run(legacy, grandchild);
+  const children = JSON.parse(
+    r.database.prepare("SELECT children FROM ops_children WHERE hash=?").get(root).children,
+  );
+  r.database.prepare("UPDATE ops_children SET children=? WHERE hash=?").run(JSON.stringify([...children, legacy]), root);
+  r.database.prepare("UPDATE ops_objects SET referenced=?").run(old);
+  const stale = staleObjects(r, 20, 9);
+  const present = () =>
+    [root, ...children, legacy, grandchild].filter((hash) =>
+      r.database.prepare("SELECT 1 FROM ops_objects WHERE hash=?").get(hash));
+  const before = present();
+  assert.ok(before.includes(grandchild) && before.length > 3);
+  const prune = async (body) => (await r.request("/prune", body)).json();
+  assert.equal((await prune({ older_than_days: 7, limit: 5000 })).retired, stale.length);
+  assert.deepEqual(present(), before);
+});
