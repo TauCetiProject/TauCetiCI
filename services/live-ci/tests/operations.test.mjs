@@ -4331,6 +4331,8 @@ test("the children sweep deletes rows whose object was retired by an earlier rel
   const sweep = await (await r.request("/prune", { older_than_days: 7, limit: 1, children_limit: 100000 })).json();
   assert.equal(sweep.children.orphans_deleted, 1);
   assert.equal(countRows(r, "ops_children"), kept);
+});
+
 test("the storage report counts rows written per statement since start", async (t) => {
   const r = runtime(t);
   await r.send(seed);

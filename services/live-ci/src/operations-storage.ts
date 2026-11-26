@@ -208,7 +208,8 @@ export class WriteCounter {
   private pending: [string, SqlStorageCursor<any>][] = [];
   record(statement: string, cursor: SqlStorageCursor<any>) {
     this.flush();
-    this.pending.push([statement.replace(/\s+/g, " ").trim().slice(0, 100), cursor]);
+    // Keyed by the complete statement; only the report shortens it.
+    this.pending.push([statement, cursor]);
   }
   flush() {
     for (const [key, cursor] of this.pending) {
@@ -222,8 +223,8 @@ export class WriteCounter {
   report(limit = 60) {
     this.flush();
     const statements = [...this.totals.entries()]
-      .map(([sql, total]) => ({ sql, ...total }))
-      .filter((s) => s.rows_written > 0)
+      .filter(([, total]) => total.rows_written > 0)
+      .map(([sql, total]) => ({ sql: sql.replace(/\s+/g, " ").trim().slice(0, 240), ...total }))
       .sort((a, b) => b.rows_written - a.rows_written);
     return {
       since: new Date(this.since).toISOString(),
