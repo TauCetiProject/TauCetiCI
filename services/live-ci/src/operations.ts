@@ -15,6 +15,7 @@ import {
   guardedSql,
   StorageFullError,
   storageReport,
+  WriteCounter,
   storageStatus,
 } from "./operations-storage";
 import { PUBLIC_POOLS } from "./runner-registry";
@@ -111,13 +112,14 @@ export class Operations {
   private retainedBudget = 15_000_000;
   private uploadWaiters: { lane: string; resolve: () => void }[] = [];
   private lastUploadLane?: string;
+  private writes = new WriteCounter();
   private get env(): Env {
     return bindings as Env;
   }
 
   constructor(private ctx: DurableObjectState) {
     const raw = ctx.storage.sql;
-    this.sql = guardedSql(raw, () => this.storageFull());
+    this.sql = guardedSql(raw, () => this.storageFull(), this.writes);
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS ops_meta(key TEXT PRIMARY KEY,value TEXT);
       CREATE TABLE IF NOT EXISTS ops_sources(id TEXT PRIMARY KEY,epoch INTEGER,sequence INTEGER,
@@ -3178,7 +3180,10 @@ export class Operations {
               .split(",")
               .filter((name) => Object.hasOwn(OPERATIONS_TABLES, name)),
           );
-      return json(storageReport(this.sql, names("exact"), names("bytes")));
+      return json({
+        ...storageReport(this.sql, names("exact"), names("bytes")),
+        writes: this.writes.report(),
+      });
     }
     if (path === "/health") {
       const queuePreparations = this.queuePreparations();

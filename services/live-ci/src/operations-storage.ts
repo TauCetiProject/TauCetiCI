@@ -197,11 +197,54 @@ export class StorageFullError extends Error {
   }
 }
 
-export function guardedSql(raw: SqlStorage, full: () => boolean): SqlStorage {
+/** Rows written by each statement since this isolate started, from SQLite's
+ * own per-cursor count (the figure Cloudflare bills). A cursor's count is
+ * final once it is consumed, so cursors are added at the next statement or
+ * report, by which time they have been read. In memory only: nothing here
+ * writes. */
+export class WriteCounter {
+  readonly since = Date.now();
+  private totals = new Map<string, { calls: number; rows_written: number }>();
+  private pending: [string, SqlStorageCursor<any>][] = [];
+  record(statement: string, cursor: SqlStorageCursor<any>) {
+    this.flush();
+    // Keyed by the complete statement; only the report shortens it.
+    this.pending.push([statement, cursor]);
+  }
+  flush() {
+    for (const [key, cursor] of this.pending) {
+      const total = this.totals.get(key) || { calls: 0, rows_written: 0 };
+      total.calls++;
+      total.rows_written += cursor.rowsWritten || 0;
+      this.totals.set(key, total);
+    }
+    this.pending = [];
+  }
+  report(limit = 60) {
+    this.flush();
+    const statements = [...this.totals.entries()]
+      .filter(([, total]) => total.rows_written > 0)
+      .map(([sql, total]) => ({ sql: sql.replace(/\s+/g, " ").trim().slice(0, 240), ...total }))
+      .sort((a, b) => b.rows_written - a.rows_written);
+    return {
+      since: new Date(this.since).toISOString(),
+      rows_written: statements.reduce((n, s) => n + s.rows_written, 0),
+      statements: statements.slice(0, limit),
+    };
+  }
+}
+
+export function guardedSql(
+  raw: SqlStorage,
+  full: () => boolean,
+  counter?: WriteCounter,
+): SqlStorage {
   return {
     exec(statement: string, ...bindings: any[]) {
       if (!nonAllocating(statement) && full()) throw new StorageFullError();
-      return raw.exec(statement, ...bindings);
+      const cursor = raw.exec(statement, ...bindings);
+      counter?.record(statement, cursor);
+      return cursor;
     },
     get databaseSize() {
       return raw.databaseSize;
