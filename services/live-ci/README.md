@@ -188,7 +188,8 @@ publication resumes, so the two days start when an object stops being reachable.
 up to 5,000 objects (never newer than two days), examining `window` rows (at most
 50,000) of each table after `objects_after`/`keys_after`; pass back the returned
 `cursor`. `links_after`/`links_limit` also delete links whose parent object no
-longer exists.
+longer exists, and `children_after`/`children_limit` delete `ops_children` rows
+whose object no longer exists (left by a release that predates them).
 
 `POST /admin/repair-members` processes up to eight due bors membership repairs.
 `POST /admin/recompute` with `{"repo":"TauCetiProject/TauCeti","day":"2026-10-17"}`

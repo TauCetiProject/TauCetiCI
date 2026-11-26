@@ -102,6 +102,7 @@ export class Operations {
   // is only trusted if no manifest write started or settled during it.
   private manifestGeneration = 0;
   private retireCursor = { objects: 0, keys: 0 };
+  private childrenTable = false;
   private alarmUpdates: Promise<void> = Promise.resolve();
   private publicationPending = new Set<string>();
   private objectWrites = new Map<string, Promise<{ url: string }>>();
@@ -181,6 +182,9 @@ export class Operations {
           this.set("queue_resync", true);
         this.set("eviction_tracking", 1);
       }
+      // Creating a table allocates, so only with headroom; until it exists,
+      // receipts record children as links only.
+      this.sql.exec("CREATE TABLE IF NOT EXISTS ops_children(hash TEXT PRIMARY KEY,children TEXT)");
       // No query uses this index; dropping it saves a row per job fact write.
       if (this.sql.exec("SELECT 1 FROM sqlite_master WHERE type='index' AND name='ops_job_facts_repo'").toArray().length)
         this.sql.exec("DROP INDEX ops_job_facts_repo");
@@ -190,6 +194,46 @@ export class Operations {
         error instanceof Error ? error.message : "",
       );
     }
+    this.childrenTable = !!this.sql
+      .exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ops_children'")
+      .toArray().length;
+  }
+  /** Delete children rows whose object no longer exists (a release that
+   * predates ops_children retires objects without them), scanning at most
+   * `limit` rows after rowid `after`. Returns the next cursor. */
+  sweepChildren(after: number, limit: number) {
+    if (!this.childrenTable) return { scanned: 0, orphans_deleted: 0, next: null };
+    const rows = this.sql
+      .exec<{ id: number; orphan: number }>(
+        `SELECT c.rowid id,NOT EXISTS(SELECT 1 FROM ops_objects o WHERE o.hash=c.hash) orphan
+         FROM ops_children c WHERE c.rowid>? ORDER BY c.rowid LIMIT ?`,
+        after,
+        limit,
+      )
+      .toArray();
+    let orphans = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows)
+        if (row.orphan) {
+          this.sql.exec("DELETE FROM ops_children WHERE rowid=?", row.id);
+          orphans++;
+        }
+    });
+    return {
+      scanned: rows.length,
+      orphans_deleted: orphans,
+      next: rows.length === limit ? rows.at(-1)!.id : null,
+    };
+  }
+  /** Recursive step from live objects to their children: through ops_links,
+   * which earlier receipts wrote, and through ops_children once it exists. */
+  private liveChildren() {
+    return (
+      "UNION SELECT child FROM ops_links JOIN live ON parent=live.hash" +
+      (this.childrenTable
+        ? "\n        UNION SELECT c.value FROM ops_children o JOIN live ON o.hash=live.hash JOIN json_each(o.children) c"
+        : "")
+    );
   }
   private get(key: string): any {
     const row = this.sql
@@ -918,19 +962,36 @@ export class Operations {
         });
         // The upload above is awaited; never write a receipt into a full database.
         if (this.storageFull()) throw new StorageFullError();
+        const children = [
+          ...new Set(
+            Array.from(
+              data.matchAll(
+                /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
+              ),
+              (match) => match[1],
+            ),
+          ),
+        ];
         this.ctx.storage.transactionSync(() => {
           this.sql.exec(
             "INSERT OR IGNORE INTO ops_objects VALUES (?,?)",
             hash,
             now(),
           );
-          for (const match of data.matchAll(
-            /\/v1\/operations\/objects\/([a-f0-9]{64}\/[a-f0-9]{64})\.json/g,
-          ))
+          // One row per parent object lists all of its children.
+          if (children.length && this.childrenTable)
+            this.sql.exec(
+              "INSERT OR IGNORE INTO ops_children VALUES (?,?)",
+              hash,
+              JSON.stringify(children),
+            );
+          // Earlier releases follow only these rows. Keep writing them until
+          // every release that can be rolled back to reads ops_children.
+          for (const child of children)
             this.sql.exec(
               "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
               hash,
-              match[1],
+              child,
             );
         });
       } else {
@@ -2483,6 +2544,8 @@ export class Operations {
         // physical key even if this old delete finishes after an isolate restart.
         this.sql.exec("DELETE FROM ops_object_keys WHERE hash=?", hash);
         this.sql.exec("DELETE FROM ops_objects WHERE hash=?", hash);
+        if (this.childrenTable)
+          this.sql.exec("DELETE FROM ops_children WHERE hash=?", hash);
         this.sql.exec("DELETE FROM ops_links WHERE parent=?", hash);
         retired.push(hash);
       };
@@ -2580,7 +2643,7 @@ export class Operations {
       this.sql.exec(
         `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        ${this.liveChildren()})
         UPDATE ops_objects SET referenced=? WHERE hash IN (SELECT hash FROM live) AND referenced<?`,
         JSON.stringify(roots),
         clock,
@@ -2613,7 +2676,7 @@ export class Operations {
             .exec<{ hash: string }>(
               `WITH RECURSIVE live(hash) AS (
         SELECT hash FROM ops_objects WHERE hash IN (SELECT value FROM json_each(?))
-        UNION SELECT child FROM ops_links JOIN live ON parent=live.hash)
+        ${this.liveChildren()})
         SELECT hash FROM live`,
               JSON.stringify(roots),
             )
@@ -2820,10 +2883,17 @@ export class Operations {
             int(body.links_limit, 1, 20000, 1000),
           )
         : null;
+      const children = body.children_limit
+        ? this.sweepChildren(
+            int(body.children_after, 0, Number.MAX_SAFE_INTEGER, 0),
+            int(body.children_limit, 1, 20000, 1000),
+          )
+        : null;
       return json({
         older_than_days: days,
         ...retired,
         links,
+        children,
         database_bytes_before: before,
         storage: storageStatus(databaseBytes(this.sql)),
       });
