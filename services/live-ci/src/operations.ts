@@ -980,21 +980,21 @@ export class Operations {
             hash,
             now(),
           );
-          // One row per parent object lists all of its children.
+          // One row per parent object lists all of its children. Links are
+          // written only while ops_children does not exist yet.
           if (children.length && this.childrenTable)
             this.sql.exec(
               "INSERT OR IGNORE INTO ops_children VALUES (?,?)",
               hash,
               JSON.stringify(children),
             );
-          // Earlier releases follow only these rows. Keep writing them until
-          // every release that can be rolled back to reads ops_children.
-          for (const child of children)
-            this.sql.exec(
-              "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
-              hash,
-              child,
-            );
+          else if (!this.childrenTable)
+            for (const child of children)
+              this.sql.exec(
+                "INSERT OR IGNORE INTO ops_links VALUES (?,?)",
+                hash,
+                child,
+              );
         });
       } else {
         if (timing) timing.cache_hits++;

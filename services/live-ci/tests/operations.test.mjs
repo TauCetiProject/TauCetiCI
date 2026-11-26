@@ -4255,11 +4255,8 @@ test("objects record their children in one row and liveness follows that row alo
   assert.ok(children.length > 0);
   // Leaves have no children row.
   assert.ok(countRows(r, "ops_children") < countRows(r, "ops_objects"));
-  // Links are still written alongside it for rollback.
-  assert.equal(
-    r.database.prepare("SELECT COUNT(*) n FROM ops_links WHERE parent=?").get(root).n,
-    children.length,
-  );
+  // New receipts write no per-child link rows.
+  assert.equal(countRows(r, "ops_links"), 0);
   // Without any links the children rows alone protect every descendant.
   r.database.exec("DELETE FROM ops_links");
   const old = Math.floor(Date.now() / 1000) - 9 * 86400;
