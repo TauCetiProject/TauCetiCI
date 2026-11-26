@@ -4331,4 +4331,17 @@ test("the children sweep deletes rows whose object was retired by an earlier rel
   const sweep = await (await r.request("/prune", { older_than_days: 7, limit: 1, children_limit: 100000 })).json();
   assert.equal(sweep.children.orphans_deleted, 1);
   assert.equal(countRows(r, "ops_children"), kept);
+test("the storage report counts rows written per statement since start", async (t) => {
+  const r = runtime(t);
+  await r.send(seed);
+  await r.flush();
+  const report = await (await r.request("/storage")).json();
+  assert.ok(report.writes.rows_written > 0);
+  assert.equal(
+    report.writes.rows_written,
+    report.writes.statements.reduce((n, s) => n + s.rows_written, 0),
+  );
+  const meta = report.writes.statements.find((s) => s.sql.startsWith("INSERT INTO ops_meta"));
+  assert.ok(meta.calls >= 1 && meta.rows_written >= 1);
+  assert.ok(!report.writes.statements.some((s) => s.sql.startsWith("SELECT")));
 });
